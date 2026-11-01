@@ -2,6 +2,9 @@
 
 Date: 2026-06-09
 Status: Accepted
+<!-- Naming note: ADR-031 renames the atom "skill" → "tool" (`tool_registry` →
+     `tool_registry`, manifests `tool.json`). The install/enable lifecycle model
+     in this ADR is unchanged; only the atom vocabulary is superseded. -->
 
 ## Context
 
@@ -31,7 +34,7 @@ The goal is a lifecycle model with four observable states:
 
 ## Decision
 
-Two new tables — `skill_registry` and `agent_registry` — gate skill and agent loading.
+Two new tables — `tool_registry` and `agent_registry` — gate skill and agent loading.
 Only items with an `enabled = true` row are registered at startup. State is derived from
 the on-disk × row cross-reference.
 
@@ -42,11 +45,31 @@ overriding a row an admin has already set. The defaults live in the repo, not in
 individual manifests — so an uploaded skill cannot self-enable by declaring itself a
 default. Only items in the trusted in-repo file can self-enrol on startup.
 
+> **Amended (#1974): bundle expansion.** Reconciliation also enrolls every member tool of
+> every *enabled* skill bundle that has no row yet. A bundle's membership is declared once,
+> in its SKILL.md `tools:` list, and `registry-defaults.yaml` `tools:` holds standalone
+> tools only — keeping membership in two lists let new members (e.g. `doc-place`) silently
+> miss enrollment. The trust root for a member tool is therefore the SKILL.md of a bundle
+> that is either in the trusted defaults file or was enabled by an admin; a bundle an
+> admin disabled is never expanded, and existing rows are never changed — which is why
+> uninstalling (deleting the row of) a member tool is refused while its bundle is enabled:
+> the next boot would enroll it again, so disable is the lasting choice. Credential-
+> dependent members are held back by gates they declare, not by omission from the defaults
+> file: `install.requires_secrets` (the same vault check an admin enable runs), or a
+> declared capability whose integration this boot did not build (`nylasCalendarClient`
+> for the calendar tools, whose Nylas key resolves from three sources, so a vault-key name
+> would be the wrong test). A member whose `tool.json` fails to parse is refused too. A
+> held-back member gets no row, and the first boot after its gate clears enrolls it. This
+> relies on there being no upload path that writes SKILL.md or tool manifests — every
+> on-disk item comes from the repo or the operator's deploy layer. An upload feature would
+> need to revisit it, since an uploaded tool named like a missing member of an enabled
+> bundle would enroll itself.
+
 **Enforcement is restart-based.** State changes (enable/disable) take effect on the next
 process restart. No hot-reload in this PR; hot-reload is a larger change with ordering
 and dependency concerns and is explicitly deferred.
 
-**`install`/`uninstall` manifest blocks are parsed but inert in PR1.** `skill.json` and
+**`install`/`uninstall` manifest blocks are parsed but inert in PR1.** `tool.json` and
 agent YAML gain optional `install`/`uninstall` blocks (schema reserved for PR2: secrets
 registration, and PR3: config schema). Parsers accept them now so existing manifests
 compile unchanged; the execution layer ignores them until the follow-up PRs wire the

@@ -2,7 +2,7 @@
 
 Agents are the LLM-powered workers in Curia. Each agent is defined by a YAML config file in `agents/`. Most agents require only a YAML file; complex agents can optionally add a TypeScript handler for custom lifecycle logic.
 
-See [Adding a Skill](adding-a-skill.md) if you want to add a capability rather than a new agent. Skills are available to all agents.
+See [Adding a Skill](adding-a-tool.md) if you want to add a capability rather than a new agent. Skills are available to all agents.
 
 ---
 
@@ -11,7 +11,7 @@ See [Adding a Skill](adding-a-skill.md) if you want to add a capability rather t
 1. Create `agents/<name>.yaml` with the required fields (see below)
 2. If using a custom handler: create `agents/<name>.handler.ts`
 3. Restart Curia — agent YAML files are loaded and schema-validated at startup
-4. Pin the skills the agent needs (see the [skills directory](../specs/03-skills-and-execution.md#built-in-skills) and browse `skills/` for available options)
+4. Pin the skills the agent needs (see the [skills directory](../specs/03-tools-and-execution.md#built-in-skills) and browse `skills/` for available options)
 
 > **New agents start disabled in the registry.** Like skills, agents are tracked in a registry (`agent_registry`) with an install/enable lifecycle. A newly added agent is registered at startup but **not enabled** by default — enable it (via the registry HTTP API or admin UI) before it participates in routing. Enable state is **restart-based**: only enabled agents are loaded and registered on the next restart. See [Configuration → registry](configuration.md#skill-agent-and-channel-registry).
 
@@ -29,6 +29,9 @@ See [Adding a Skill](adding-a-skill.md) if you want to add a capability rather t
 name: expense-tracker          # unique identifier; used in logs, delegation, audit trail
 description: |                 # human-readable purpose; shown in the admin UI and audit log
   Tracks and categorizes expenses from receipts and emails.
+delegate_when: >-              # optional. The agent's line in the specialist roster; defaults to description
+  Receipts, expense reports and spending questions. Forward the receipt with the request.
+display_name: expense team     # optional. What a model might call this agent; failure replies reject drafts that use it. Not persona.display_name.
 
 # ------------------------------------------------------------------
 # Model (required)
@@ -48,7 +51,7 @@ model:
 # ------------------------------------------------------------------
 
 system_prompt: |
-  You are an expense tracking assistant for a CEO.
+  You are an expense tracking assistant for the principal.
   Extract amounts, vendors, categories, and dates from receipts.
   Return structured data — never guess at missing fields.
 
@@ -56,28 +59,20 @@ system_prompt: |
 # Skills (optional but almost always needed)
 # ------------------------------------------------------------------
 
-pinned_skills:                 # skills always available in the agent's tool list
-  - web-fetch                  # see skills/ directory for all options
+pinned_skills:                 # skill bundles always available (expanded to member tools)
+  - web-fetch                  # singleton skills still use the tool name
+  - tasks                      # heartbeat + task-* + Task Management instructions
+  - documents                  # doc-* + Document Workspace instructions
   - scheduler-create
-  - scheduler-list
-  - scheduler-cancel
 
-allow_discovery: true          # if true, agent can search the skill registry at runtime
-                               # and request skills not in pinned_skills
-                               # "normal" sensitivity skills auto-approve; "elevated" ones
-                               # require one-time human approval per agent-skill pair
+pinned_context:                # documents and settings shown on every turn (see below)
+  docs: /shared/expenses/rules.md
+  configs: expenses/currency
 
-enable_task_management: false  # if true, auto-pins the task-* skills, injects the
-                               # task-management discipline block, and makes the agent
-                               # heartbeat-eligible (see the field reference below)
-
-# ------------------------------------------------------------------
-# Memory (optional)
-# ------------------------------------------------------------------
-
-memory:
-  scopes: [expenses, vendors]  # which memory namespaces this agent can read/write
-                               # scopes are isolated — an agent only sees its declared scopes
+allow_discovery: true          # if true, agent can search tools at runtime
+                               # and request tools not in pinned_skills
+                               # "normal" sensitivity tools auto-approve; "elevated" ones
+                               # require one-time human approval per agent-tool pair
 
 # ------------------------------------------------------------------
 # Scheduled Tasks (optional)
@@ -85,7 +80,7 @@ memory:
 
 schedule:
   - cron: "0 9 * * 1"         # standard cron expression (UTC unless agent sets timezone)
-    task: "Generate weekly expense summary and email to CEO"
+    task: "Generate weekly expense summary and email to the principal"
 
 # ------------------------------------------------------------------
 # Error Budget (optional)
@@ -94,7 +89,7 @@ schedule:
 error_budget:
   max_turns: 20               # max LLM round-trips per task execution
   max_cost_usd: 1.00          # max LLM spend per task (across all turns)
-                              # exceeded tasks are halted and the CEO is notified
+                              # exceeded tasks are halted and the principal is notified
 
 # ------------------------------------------------------------------
 # Custom Handler (optional — escape hatch for complex logic)
@@ -119,12 +114,20 @@ Use lowercase kebab-case. Must be unique across all agents in the deployment.
 
 ### `description` (required)
 
-Plain-language description of what the agent does. This is:
+Plain-language description of what the agent does, for people. This is:
 - Shown in the admin dashboard
 - Included in audit log metadata
-- Used by the Coordinator to decide which specialist to delegate to
+- The agent's line in the specialist roster when it has no `delegate_when`
 
-Write it from the perspective of "what tasks should be routed here." One or two sentences is enough.
+One or two sentences is enough.
+
+### `delegate_when` (optional)
+
+When to delegate to this agent, for the model. It is the agent's line in the coordinator's `## Available Specialists` roster and in `${available_specialists}`, so the coordinator reads it on every turn. Say which requests go here and, when it matters, how to brief the agent and who replies. Leave how the agent works to its own `system_prompt`.
+
+Keep it to two or three sentences. `tests/unit/agents/prompt-budget.test.ts` holds the roster over the core agents to a budget. Without this field the roster shows `description`.
+
+A roster line suits a specialist the coordinator uses rarely or for one narrow job, such as setup-wizard, diagnostics or meeting-debrief. Routing the coordinator applies on most turns, such as the principal's calendar and inbox, belongs in the coordinator's own prompt: moved into roster lines, those routes changed what it did on everyday requests (#1954, lesson 11 in [Changing an agent's prompt](#changing-an-agents-prompt)). Add a scenario case for the route when you add the line.
 
 ### `model` (required)
 
@@ -143,43 +146,56 @@ The LLM instructions for this agent. Written in plain text. Key points:
 
 - The runtime injects additional context automatically (current date/time, autonomy band, memory context) — you do not need to add boilerplate for these
 - The Coordinator's system prompt uses `${office_identity_block}` to receive the compiled identity (name, tone, constraints, etc.) from `OfficeIdentityService`. Specialist agents do not need this — identity is a Coordinator concern.
-- Write for a single-turn task frame. For deferred or multi-step work, use the task system (`enable_task_management`, see below and [spec 19](../specs/19-tasks-and-backlog.md)) — `task-create` for CEO-visible work, `scheduler-create` for operational sweeps. When a task wakes the agent, its `intent_anchor`, title, and progress are supplied as context so the agent resumes where it left off.
+- Write for a single-turn task frame. For deferred or multi-step work, use the task system (pin `tasks` + usually `documents`, see below and [spec 19](../specs/19-tasks-and-backlog.md)) — `task-create` for principal-visible work, `scheduler-create` for operational sweeps. When a task wakes the agent, its `intent_anchor`, title, and progress are supplied as context so the agent resumes where it left off.
+- Call the person Curia serves **the principal**. Do not hardcode a job title such as CEO. See [Principal vocabulary](#principal-vocabulary) below.
+
+### Principal vocabulary
+
+Agent prompts, schedule `task` text, skill `SKILL.md` bodies, and `tool.json` descriptions are all shown to the model. Core uses **the principal** for the person the deployment serves. A president, chair, founder, or executive director is still the principal.
+
+Write overlay agents and tools the same way. A prompt that says "email the CEO" while the injected Principal Contact Details block says "the principal" is how a model invents an address that was never on file. Ask for the principal, then use an address from that block. The list is complete: an identifier that is not listed is not the principal's. The email the block lists under "Primary email" is `contacts.primary_email`. To send to the principal, pass the alias `principal` to a send skill rather than copying an address (ADR-047).
+
+Do not rename identifiers to match the prose. Agent names (`ceo-inbox`), secret names, and schema values such as task `owner: "ceo"` stay as they are.
+
+When a human-facing sentence genuinely needs the principal's job title, read `contacts.title` on the principal contact. Do not hardcode one.
 
 ### `pinned_skills` (optional)
 
-List of skill names always included in this agent's tool list. These are the skills the agent can call without discovery.
+List of **skill (bundle) names** always included for this agent. Bootstrap expands each pin to its member tools and injects any SKILL.md instruction body.
 
-**Choosing which skills to pin:**
+**Choosing what to pin:**
 
-Browse the `skills/` directory for available skills. As a heuristic:
-- Pin skills the agent needs on *every* task (e.g., `web-fetch` for a research agent)
-- Don't pin skills that are rarely needed — use `allow_discovery: true` instead so they're available on demand without cluttering the tool list
+Browse `skills/*/SKILL.md` (bundles) and flat `skills/<tool>/` (singleton skills). As a heuristic:
+- Pin skills the agent needs on *every* task (e.g., `web-fetch` for a research agent, `tasks` for heartbeat-eligible work)
+- Don't pin skills that are rarely needed — use `allow_discovery: true` instead
 - The Coordinator should pin a broad set since it handles all inbound routing
 
-**`allowed_callers` and custom skills:** If a custom skill in your deploy repo has `allowed_callers` set and your new agent needs to use it, add your agent's name to that skill's `allowed_callers` list. This only applies to custom skills in the same deploy repo — core skills should never restrict by deployment-specific agent name. See [Adding a Skill — `allowed_callers`](adding-a-skill.md#allowed_callers-optional) for the full pattern.
+Unresolved pins are skipped at bootstrap (warn). For **scheduled** agents, unresolved pins are also logged at **error** so monitoring can catch a reduced toolset (#1501) — schedules still load and the agent may try to run; the error is the signal to investigate.
 
-Current built-in skills include (see `skills/` for the full list):
+**`allowed_callers` and custom tools:** If a custom tool in your deploy repo has `allowed_callers` set and your new agent needs to use it, add your agent's name to that tool's `allowed_callers` list. This only applies to custom tools in the same deploy repo — core tools should never restrict by deployment-specific agent name. See [Adding a Tool — `allowed_callers`](adding-a-tool.md#allowed_callers-optional) for the full pattern.
 
-| Category | Skills |
+Current built-in skills/tools include (see `skills/` for the full list):
+
+| Category | Pin |
 |---|---|
-| **Email** | `email-send`, `email-reply` (both accept `attachments`); `drive-download-file` (fetch a Drive file to a `file://` URL for attaching) |
-| **Tasks** | `task-create`, `task-list`, `task-update`, `task-complete` — usually auto-pinned via `enable_task_management` (see below); see [spec 19](../specs/19-tasks-and-backlog.md) |
-| **Calendar** | `calendar-list-events`, `calendar-create-event`, `calendar-update-event`, `calendar-delete-event`, `calendar-find-free-time`, `calendar-check-conflicts`, `calendar-list-calendars`, `calendar-register` |
-| **Contacts** | `contact-lookup`, `contact-create`, `contact-list`, `contact-update` (canonical attributes), `contact-link-identity`, `contact-unlink-identity`, `contact-set-role`, `contact-grant-permission`, `contact-revoke-permission` |
+| **Email** | `email-send`, `email-reply` (atoms / singleton skills); `drive-download-file` |
+| **Tasks** | `tasks` — expands to `task-*`, injects discipline block, heartbeat-eligible; see [spec 19](../specs/19-tasks-and-backlog.md) |
+| **Documents** | `documents` — expands to `doc-*`, injects workspace block |
+| **Calendar** | `calendar` — expands to all `calendar-*` tools (per-tool `action_risk` preserved) |
+| **Contacts** | `contact-lookup`, `contact-create`, `contact-list`, … |
 | **Web** | `web-fetch`, `web-search`, `web-browser` |
 | **Scheduling** | `scheduler-create`, `scheduler-list`, `scheduler-cancel` |
 | **Delegation** | `delegate` |
 | **Autonomy** | `get-autonomy`, `set-autonomy` |
-| **Context** | `entity-context`, `context-for-email`, `held-messages-list`, `held-messages-process` |
-| **Templates** | `template-doc-request` |
-| **Config** | `config-store` — generic key-value agent config; namespace-scoped, KG-backed, permanent decay |
+| **Context** | `entity-context` |
+| **Config** | `config-store` |
 
 This table is hand-maintained — run `ls skills/` for the authoritative current set.
 
 #### Using `config-store` for persistent agent config
 
 If your agent needs to store configuration values that persist across runs — URLs, account
-numbers, preferences, or any other settings the CEO provides once via chat — pin
+numbers, preferences, or any other settings the principal provides once via chat — pin
 `config-store` and use it directly. Do not write a new `knowledge-*` skill.
 
 ```yaml
@@ -190,12 +206,13 @@ pinned_skills:
 **Namespace:** pick a short, stable string owned by your agent (e.g. `travel` for a travel
 coordinator, `writing_config` for an essay editor). Bake it into your system prompt.
 
-**Store** (coordinator does this when CEO provides a value via chat):
+**Store** (coordinator does this when the principal provides a value via chat):
 ```
 config-store { action: "store", namespace: "writing_config", key: "writing_guide_url", value: "https://..." }
 ```
 
-**Retrieve** (agent does this at the start of each run):
+**Retrieve** (agent does this at the start of each run, unless the key is declared in
+`pinned_context`, below):
 ```
 config-store { action: "retrieve", namespace: "writing_config", key: "writing_guide_url" }
 # → { found: true, value: "https://..." }
@@ -217,6 +234,61 @@ structured findings from your specialist; let the coordinator decide how to pres
 If your specialist runs on a schedule and needs to send output, use `agent_id: coordinator`
 in the schedule block (see the schedule section below).
 
+### `pinned_context` (optional)
+
+Documents and config-store keys that are part of how the agent works. The runtime reads
+each one fresh on every turn and renders it into the system prompt under
+`## Pinned context`, after the YAML body. The agent needs no "load your settings first"
+step, and a console edit applies on its next turn. See
+[ADR-056](../adr/056-pinned-context.md).
+
+```yaml
+pinned_context:
+  docs:                                 # OKF documents under /shared/: a string or a list
+    - /shared/expenses/rules.md
+    - path: /shared/expenses/budgets.md
+      description: Monthly budget per category, agreed with the principal.
+  configs:                              # config-store keys, <namespace>/<key>: a string or a list
+    - expenses/currency
+    - key: expenses/last_statement_id
+      description: ID of the last statement processed. If missing, start from the newest.
+```
+
+Each list item is a string, or a mapping with `path` / `key` and an optional one-line
+`description` (300 characters at most). The description is shown under the item's
+heading whether or not it exists yet, so write what it is for and what a missing value
+means.
+
+- **`docs`** must be `.md` paths under `/shared/`. Declaring it is the permission to write it:
+  `doc-write` refuses a `/shared/` path the calling agent does not declare. Several agents
+  may declare the same document to share it; `expected_version` /
+  `expected_section_version` handle simultaneous edits. `/shared/` documents are durable:
+  never task-owned, never archived with a project. Use one when a setting outgrows
+  config-store's 2000-character cap or the agent edits it a piece at a time. Have the
+  document state its own format in its frontmatter or a short top section, so every
+  declaring agent follows one format and no prompt restates it. Pin `documents` so the
+  agent can write it.
+- **`configs`** each name exactly one key. Whole namespaces are not supported, because they mix
+  principal settings with runtime state. Config entries are shown only; writes still go
+  through `config-store`.
+
+A document or key that does not exist yet renders as not yet created; one that exists but
+is blank renders as blank. A document the principal archived renders as archived, and
+`doc-write` will not recreate it. A failed read
+renders as unavailable and logs a warning; it is never silently left out. An item over
+`documentWorkspace.pinnedContextWarnChars` (default 16000) logs a warning each turn and is
+still injected in full. A malformed entry, a doc outside `/shared/`, or a config without
+exactly one `/` fails the agent's load.
+
+Everything declared here is sent on every turn, so keep it to what the agent needs on most
+turns. Read anything rarer on demand.
+
+### `expected_duration_seconds` (optional)
+
+Expected wall-clock duration of a delegated task, in seconds. The runtime adds bounded headroom (25%, capped at three minutes) and uses that as the coordinator's wait, unless the waking scheduled job already supplied `expectedDurationSeconds`. Omit it and the agent inherits `delegate.defaultTimeoutMs` (450s, sized to the pooled p99 of delegate runs before 2026-09-20).
+
+Omitting the field is valid: the agent inherits the floor, and startup logs its name at info (an inventory, not a warning). Adding a specialist without a hint also means adding its name to the list in `tests/unit/agents/agent-registry.test.ts`. Set a hint when this specialist's measured p99 is above the floor, or when a shorter wait should catch a hang sooner. The computed wait must stay at or under the 895s clamp ([ADR-044](../adr/044-delegate-wait-clamp-ceiling.md)).
+
 ### `allow_discovery` (optional, default: `false`)
 
 When `true`, the agent can call the skill registry at runtime to find and request skills not in its `pinned_skills` list. The runtime handles the approval gate:
@@ -226,38 +298,37 @@ When `true`, the agent can call the skill registry at runtime to find and reques
 
 Turn this on for general-purpose agents (like the Coordinator) that may encounter novel tasks. Keep it `false` for focused specialist agents to prevent scope creep.
 
-### `enable_task_management` (optional, default: `false`)
+### Pinning `tasks` and `documents`
 
-A single declarative capability flag that bundles the platform task system onto an agent.
-When `true`, the runtime:
+Pin these skill bundles to give an agent the platform task system and/or document workspace:
 
-1. **Auto-pins** `task-create`, `task-list`, `task-update`, `task-complete` (merged and
-   deduped with your explicit `pinned_skills` — you do not list them yourself).
-2. **Auto-injects** the shared `task-management` discipline block (the advance-until-blocked
-   loop, the no-dangling-commitment invariant, and the project-decomposition rule) at a
-   fixed slot in the effective system prompt. The block is platform code, so every enabled
-   agent gets the identical, current rules.
-3. **Marks the agent heartbeat-eligible** — the `BacklogHeartbeat` only wakes agents that
-   have this flag set.
+```yaml
+pinned_skills:
+  - tasks
+  - documents
+```
 
-Enable it on agents that uncover deferrable, multi-step work (the Coordinator and
-`ceo-inbox` ship with it on). Leave it `false` for pure act-and-return specialists. An agent
-that needs only read-only `task-list` access can still pin that one skill manually without
-the flag — it just won't be heartbeat-eligible or get the injected block. See
-[spec 19 — Tasks & Backlog](../specs/19-tasks-and-backlog.md) for the full design.
+- **`tasks`** expands to `task-create` / `task-list` / `task-update` / `task-complete`
+  plus the sibling tools `plan` and `checkpoint`,
+  injects the discipline block from `skills/tasks/SKILL.md`, and marks the agent
+  heartbeat-eligible for `BacklogHeartbeat`.
+- **`documents`** expands to `doc-*`, injects the workspace block from
+  `skills/documents/SKILL.md`, and enables the document-workspace runtime surface.
+
+Pin both on agents that uncover deferrable, multi-step work (the Coordinator,
+`ceo-inbox`, and `contacts` ship with both). Pure act-and-return specialists omit them.
+An agent that needs only read-only `task-list` can pin that **tool** name directly
+(polymorphic pins, [ADR-032](../adr/032-polymorphic-pins-and-mcp-as-skill.md)) without
+the bundle — it won't be heartbeat-eligible or get the injected block, and it will
+not receive sibling tools like `plan`/`checkpoint`. See [spec 19 — Tasks & Backlog](../specs/19-tasks-and-backlog.md).
 
 `task-create` accepts an optional `target_agent_id` input that assigns the task (and its
 wake-up) to another registered agent — for example, the Coordinator scheduling a debrief task
 for the `meeting-debrief` specialist. Omit it and the task is assigned to the calling agent.
 
-### `memory` (optional)
+### Memory access
 
-```yaml
-memory:
-  scopes: [expenses, vendors, budgets]
-```
-
-Memory scopes isolate what an agent can read and write in the knowledge graph. An agent only sees entities within its declared scopes. Scopes are freeform strings — coordinate naming conventions across your agent team to avoid fragmentation.
+Agents do not declare memory scopes. All agents read and write a single shared knowledge graph; there is no per-agent memory isolation. Access is governed by capability gating (whether the agent is granted the `entityMemory` / `workingDocs` surfaces at all), data sensitivity tiers (the `max_sensitivity` ceiling on `memory-query`), and source attribution on writes — not by agent identity. See [ADR-028](../adr/028-shared-unbound-agent-memory.md).
 
 ### `schedule` (optional)
 
@@ -275,7 +346,7 @@ Uses standard UNIX cron syntax (5 fields). Times are in UTC unless a timezone is
 
 #### Targeting the coordinator from a schedule
 
-If your specialist runs on a schedule and its output should be communicated to the CEO,
+If your specialist runs on a schedule and its output should be communicated to the principal,
 declare `agent_id: coordinator` in the schedule entry. The coordinator receives the
 task, delegates to your specialist for the actual work, and handles sending in its own
 voice with its persona guardrails intact.
@@ -287,7 +358,7 @@ schedule:
     agent_id: coordinator
     task: >
       The writing scout has run on schedule. Delegate to @writing-scout to research
-      and score 2 high-signal essay ideas for the CEO. Email findings to the CEO.
+      and score 2 high-signal essay ideas for the principal. Email findings to the principal.
 ```
 
 The `agent_id` field defaults to the agent's own name when omitted — existing schedules
@@ -308,7 +379,7 @@ error_budget:
   max_errors: 3        # skill invocation failures before the task is aborted
 ```
 
-All three limits are enforced at task runtime. When any limit is hit, the task is marked as failed, the CEO is notified on the originating channel, and the agent returns to idle.
+All three limits are enforced at task runtime. When any limit is hit, the task is marked as failed, the principal is notified on the originating channel, and the agent returns to idle.
 
 
 ---
@@ -327,9 +398,63 @@ Agent YAML files are validated at startup against a JSON Schema generated from t
 
 ---
 
+## Changing an agent's prompt
+
+Decide *where* a rule goes before writing it: code enforcement, then injection with its trigger, then a tool description, then a lazy playbook, and the always-on prompt last ([ADR-046](../adr/046-agent-behavior-fix-placement.md)). These practices come from the 2026-10 coordinator and specialist prompt trim (#1954, #2025).
+
+### Principles
+
+1. **One rule, one place.** Before adding text anywhere, delete every other statement of it.
+2. **Say what to do.** Write positive instructions. Don't quote examples of unwanted output — `not "I can use the web-fetch tool"` puts the tool name into the context. Drop capitals and labels like "(mandatory)". Pointing the model at a place for a note worked; the prohibition "add no note" did not (#1990).
+3. **One voice.** Address the agent in the second person, the same voice as every code-owned block (identity, security, contact blocks, turn guidance, tool descriptions). First person appears only inside quoted speech: "You speak in the first person singular ('I checked your calendar')". "You" then means the agent everywhere, including in messages people send it.
+4. **Policy in the YAML, personality in the identity block.** Every agent gets the office identity block: the coordinator as who it is, every other agent in "writes-as" mode, which binds whatever it writes for the principal or outsiders (spec 13, "Specialists"). The YAML says who gets what information, keeps internals out, and says whose instructions count. Warmth, formality, length and register belong to the office identity's Tone & style and Detail settings, which the principal edits in the console's Personality settings; how readily Curia acts or asks first is the autonomy level. YAML text that sets any of these overrides the principal's own settings.
+5. **Move text to turn guidance only when it has a trigger.** Turn guidance rides in the uncached user message, so moving text that applies on every turn there costs more, not less.
+6. **Move the test with the rule.** Replace unit tests that pin prompt text with tests of the mechanism that now carries the rule. Guard a deletion with the "does not restate" table in `tests/unit/agents/loader.test.ts`; each row names where the rule now lives.
+7. **Measure a cut on the cases it touches.** Run those cases with `pnpm scenarios --case`/`--tags` at a few runs (see `tests/scenarios/README.md`), and compare them with saved transcripts from `main` where they exist. Runs cost money, so agree the cases, the run count and the estimated cost with the maintainer first. Run a fresh `main` arm only when the maintainer asks for a full A/B, and then on the same day. "A/B" in the lessons below means this targeted comparison; the full suites run only at the release gate. **Lower the budget** in `tests/unit/agents/prompt-budget.test.ts` when the prompt shrinks.
+
+### Lessons
+
+1. **Rules outlive their causes.** `git log -S` a rule's first line and check whether a later code change already handles the cause.
+2. **Prompts and pin comments drift from the toolset.** Cross-check every tool a prompt names against the agent's resolved pins.
+3. **"Enforced in code" means reading the enforcement point.** Where enforcement is partial, keep one clause rather than the paragraph.
+4. **Specs quote prompt text.** Grep `docs/specs/` before deleting.
+5. **One red run is not a regression.** Re-run that case alone a few times, or compare it with a saved baseline, before changing anything. Don't re-run the suite to check.
+6. **Size the verification to the change.** A moved heading or a lazily loaded reference needs the unit tests only. A rewrite of live prompt text needs its own cases run. The full suites wait for the release gate. Stub a case's whole read surface at once, not one tool per failed run.
+7. **Examples are instructions.** Check a prompt's examples against the behavior checks — "I'll check with my research team" was offered as good phrasing and is exactly what scenario 10's `no_team_voice` check fails.
+8. **A clause that reads as redundant can be the anchor at its trigger.** Delete a restatement only when the general rule reaches that trigger, and let the A/B decide.
+9. **When merging lists, keep catch-alls as catch-alls.** Folding "contacts CRUD belongs to the contacts specialist" into a list of named operations left renames and identity links without a route.
+10. **A tighter paragraph can change how the model acts on a result, not just what it decides.** When a rewrite misses, look at the calls after the decision too.
+11. **Core routes stay in the coordinator's prompt; the roster suits narrow specialists.** See [`delegate_when`](#delegate_when-optional).
+12. **Rewrite the prohibition, not the instruction beside it.** The sentence that triggers an action is load-bearing in its exact words; change it only with its own A/B.
+13. **A roster line thinner than the description makes the coordinator do the groundwork.** Say what the specialist loads for itself ("a short brief is enough").
+14. **Where injected guidance sits can matter as much as what it says.** The same words in a block rebuilt before every model call and in a wake message behaved differently. A/B each placement separately.
+15. **On specialists, only removing dead or repeated text was neutral.** Rewrites of live sections changed which tools the model called while pass rates held. Compare tool-call counts across the runs, not only behaviors.
+
+### Measuring an agent's context
+
+`scripts/report-agent-context.ts` is a read-only report of an agent's per-call context and tool usage, from `llm.call` and the call archive. In production, `DATABASE_URL` is already in the app container; don't use `pnpm run`, which expects a `.env`:
+
+```bash
+ssh -p 2222 <host> 'docker exec curia-curia-1 \
+  ./node_modules/.bin/tsx scripts/report-agent-context.ts \
+  --agent coordinator --days 30 --format markdown'
+```
+
+Pass `--since` / `--until` for a window other than the 30 days ending now. What the numbers mean:
+
+- **System-string chars** — every `role=system` message in the archived prompt: the YAML plus the blocks injected on that call. Not the same as the `context.budget` `system_prompt` tier.
+- **Tool-definition bytes** — `octet_length` of the stored `tool_definitions`. Source bytes sum each tool object; json-framing is the array punctuation. Percentiles do not sum across rows.
+- **Source split** — a tool on disk under `skills/**/tool.json` (or a pinned bundle member) is `local`; when the agent pins exactly one MCP server, every other tool is charged to it.
+- **Provider input tokens** — `llm.call` `inputTokens`, p50 and p95.
+- **Context budget tiers** — estimated tokens of each injected block where included, and how often it was dropped.
+- **Pinned tools with zero calls** — expanded pins plus MCP tools offered in the window, minus that agent's `tool.invoke` / `skill.invoke` rows.
+- **Modal tool count** — the most common tool-list size; later calls in a task grow when `skill-activate` adds tools.
+
+---
+
 ## Testing Your Agent
 
-There's no agent unit test runner (agents are inherently integration-heavy). Instead:
+Behavior is tested with the two suites in the release gate: `pnpm scenarios` scores agent decisions against stubbed tools (cases can target a specialist with `agent:`; see `tests/scenarios/README.md`), and `pnpm smoke` runs end-to-end turns against a fixture office (see [smoke-tests.md](smoke-tests.md)). Add a case when you add a route or a behavior. Writing a case is free, but every run bills model calls, so while developing run only the cases you are working on (see "Testing" in the repo's `CLAUDE.md`). For hands-on checks:
 
 1. Start Curia with `docker compose up`
 2. Send a message on the CLI channel: `pnpm cli "your test message"`
@@ -342,10 +467,10 @@ For skill-level testing, write `handler.test.ts` in the skill directory instead.
 
 ## Related Docs
 
-- [Adding a Skill](adding-a-skill.md) — write a new skill for your agent to use
+- [Adding a Skill](adding-a-tool.md) — write a new skill for your agent to use
 
 ### Key Specs
 - [Architecture Overview](../specs/00-overview.md) — five-layer bus model
 - [Agent System Spec](../specs/02-agent-system.md) — agent lifecycle, state model, status API
-- [Skills & Execution](../specs/03-skills-and-execution.md) — how skills work, discovery, approval gate
+- [Skills & Execution](../specs/03-tools-and-execution.md) — how skills work, discovery, approval gate
 - [Audit & Security](../specs/06-audit-and-security.md) — what gets logged and how

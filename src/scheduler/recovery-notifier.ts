@@ -1,6 +1,6 @@
 // src/scheduler/recovery-notifier.ts
 //
-// RecoveryNotifier — system-layer bus subscriber that emails the CEO whenever
+// RecoveryNotifier — system-layer bus subscriber that emails the principal whenever
 // the watchdog auto-recovers a stuck job (resets it from 'running' → 'pending'
 // after exceeding the computed timeout threshold). See #207.
 //
@@ -13,7 +13,7 @@
 //
 // Scope: recovery-without-suspension only. When recoverStuckJobs() suspends a
 // job (consecutive_failures >= 3), it also fires schedule.suspended, so
-// SuspensionNotifier handles that CEO email. This class handles only the
+// SuspensionNotifier handles that principal email. This class handles only the
 // reset-to-pending case to avoid sending two emails for one watchdog event.
 
 import type { EventBus } from '../bus/bus.js';
@@ -21,12 +21,24 @@ import type { Logger } from '../logger.js';
 import type { OutboundGateway } from '../skills/outbound-gateway.js';
 import type { ScheduleRecoveredEvent, BusEvent } from '../bus/events.js';
 import { classifyError } from '../errors/classify.js';
+import type { SchedulerService } from './scheduler-service.js';
+import {
+  loadJobNotificationContext,
+} from './job-notification-context.js';
+import {
+  resolvePrincipalEmail,
+  type PrincipalEmailRef,
+} from '../contacts/types.js';
 
 export interface RecoveryNotifierConfig {
   bus: EventBus;
   outboundGateway: OutboundGateway;
-  ceoEmail: string;
+  schedulerService: SchedulerService;
+  /** Plain string (tests) or live ref so post-boot email binds hot-reload (#1514). */
+  ceoEmail: string | PrincipalEmailRef;
   logger: Logger;
+  appOrigin?: string;
+  httpPort: number;
 }
 
 export class RecoveryNotifier {
@@ -57,7 +69,7 @@ export class RecoveryNotifier {
     const { jobId, agentId, runStartedAt, timeoutSeconds, consecutiveFailures, suspended } = event.payload;
 
     // When recovery leads to suspension, schedule.suspended is also fired and
-    // SuspensionNotifier sends the CEO email. Skip here to avoid a duplicate.
+    // SuspensionNotifier sends the principal email. Skip here to avoid a duplicate.
     if (suspended) return;
 
     // Compute how long the job was stuck. runStartedAt is null for pre-migration
@@ -66,26 +78,49 @@ export class RecoveryNotifier {
       ? formatStuckDuration(event.timestamp, new Date(runStartedAt))
       : `at least ${formatMinutes(timeoutSeconds)} (start time unknown — pre-migration row)`;
 
+    const jobContext = await loadJobNotificationContext(
+      this.config.schedulerService,
+      this.config.appOrigin,
+      this.config.httpPort,
+      jobId,
+      this.log,
+      'recovery-notifier',
+    );
+
     const subject = `Scheduled job recovered from stuck state: ${agentId}`;
+    const outcome = event.payload.rearmed
+      ? 'The task had already chosen a later wake. The job will run at that time, not immediately.'
+      : 'The job has been rescheduled automatically and will run again on its next trigger.';
     const body = [
       'Scheduled job was stuck and has been auto-recovered (reset to pending).',
       '',
-      `Agent:     ${agentId}`,
-      `Stuck for: ${stuckDescription}`,
-      `Timeout:   ${formatMinutes(timeoutSeconds)}`,
-      `Failures:  ${consecutiveFailures} consecutive`,
+      `Agent:      ${agentId}`,
+      `Objective:  ${jobContext.objective}`,
+      `Recurrence: ${jobContext.recurrence}`,
+      `Stuck for:  ${stuckDescription}`,
+      `Timeout:    ${formatMinutes(timeoutSeconds)}`,
+      `Failures:   ${consecutiveFailures} consecutive`,
       '',
-      `Job ID: ${jobId}`,
+      `View job: ${jobContext.consoleUrl}`,
       '',
-      'The job has been rescheduled automatically and will run again on its next trigger.',
+      outcome,
     ].join('\n');
+
+    const ceoEmail = resolvePrincipalEmail(this.config.ceoEmail);
+    if (!ceoEmail) {
+      this.log.warn(
+        { jobId, agentId },
+        'RecoveryNotifier: principal email not bound yet — skipping notification',
+      );
+      return;
+    }
 
     // sendNotification() catches its own errors and returns false on failure —
     // it does not throw. We log at error if it returns false so the anomaly is
     // visible in alerting.
     const sent = await this.config.outboundGateway.sendNotification({
       notificationType: 'schedule_recovered',
-      ceoEmail: this.config.ceoEmail,
+      ceoEmail,
       subject,
       body,
     });

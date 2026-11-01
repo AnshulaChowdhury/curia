@@ -12,7 +12,7 @@ Every channel implements the formal `Channel` contract in `src/channels/channel.
 
 ```typescript
 interface Channel {
-  readonly name: string;          // 'email' | 'signal' | 'http' | 'cli' — matches catalog + registry row
+  readonly name: string;          // 'email' | 'signal' | 'slack' | 'sms' | 'voice' | 'http' | 'cli' — matches catalog + registry row
   readonly isToggleable: boolean; // false for http and cli (always-on safeguard channels)
   start(): Promise<void>;         // connect/listen
   stop(): Promise<void>;          // graceful, idempotent teardown (process shutdown)
@@ -21,7 +21,7 @@ interface Channel {
 
 Each channel:
 - Publishes `inbound.message` (normalized) when a platform message arrives
-- Has its outbound responses delivered via the `OutboundGateway` (channels are no longer responsible for `send()`)
+- Has its outbound text responses delivered via the `OutboundGateway` (channels are no longer responsible for `send()`); voice is the exception because `VoiceRuntime` streams TTS audio directly through the active `AudioTransport` (LiveKit or Signal)
 - Handles its own connection lifecycle, authentication, and reconnection
 
 ### Channel Catalog & Registry
@@ -46,7 +46,7 @@ interface ChannelCredentialField {
 ```
 
 - **Registry table** (`channel_registry`, migration `052_create_channel_registry.sql`): `name` (PK), `enabled`, `is_toggleable`, `installed_at`/`installed_by`, `enabled_at`/`enabled_by`, `updated_at`.
-- **Always-on safeguard:** the `http` and `cli` channels have `isToggleable: false` — they always start and cannot be disabled (operator-lockout protection). `email` and `signal` are toggleable.
+- **Always-on safeguard:** the `http` and `cli` channels have `isToggleable: false` — they always start and cannot be disabled (operator-lockout protection). `email`, `signal`, `slack`, `sms`, and `voice` are toggleable.
 - **Vault key convention:** channel credentials are stored under structured vault keys of the form `channel.<name>.<field>` — e.g. the email channel's Nylas API key lives at `channel.email.nylas_api_key`. A `ChannelCredentialField` may also declare an `envFallback` env var used at bootstrap.
 
 ---
@@ -56,7 +56,9 @@ interface ChannelCredentialField {
 ```typescript
 interface InboundMessage {
   id: string;                  // UUID
-  conversation_id: string;     // deterministic UUID v5 from channel:user_id:thread_id
+  conversation_id: string;     // deterministic, reversible channel-scoped key, e.g. "email:<threadId>",
+                               // "signal:+1555...", "signal:group=<id>", "cli:local:default". NOT a UUID —
+                               // outbound adapters parse it back to recover the reply target. See ADR-025.
   channel_id: string;          // e.g., "email"
   sender_id: string;           // platform-specific user ID
   content: string;             // normalized text content
@@ -78,36 +80,75 @@ interface OutboundMessage {
 
 ## Launch Channels
 
-Channels are not started merely by being configured — like skills and agents, they are tracked in the `channel_registry` with an install/enable lifecycle (restart-based). The `http` and `cli` channels are non-toggleable and always start; `email` and `signal` must be enabled in the registry.
+Channels are not started merely by being configured — like skills and agents, they are tracked in the `channel_registry` with an install/enable lifecycle (restart-based). The `http` and `cli` channels are non-toggleable and always start; `email`, `signal`, `slack`, `sms`, and `voice` must be installed and enabled in the registry (via **Settings → Channels**). Seeding channel credentials alone does not enroll a toggleable channel. Inbound adapters and outbound egress both derive from the same registry gate.
 
 ### CLI
 Interactive terminal for local dev and testing. Reads from stdin, writes to stdout. Simplest adapter — useful for testing agent logic without external services. **Non-toggleable** (`isToggleable: false`): always starts, cannot be disabled.
 
 ### Email (via Nylas API)
-- **Inbound:** Polls Nylas Messages API at configurable interval (default: 30s)
-- **Poll high-water mark (resilience):** the adapter persists its `lastSeenTimestamp` high-water mark via `ConfigStore` (namespace `system:email-poll-state`, key `<accountId>.last_seen_at`) so restarts resume where they left off. This watermark is **code-managed, not LLM-managed**.
-- **Poll observability:** a `channel.poll` audit event is emitted once per poll cycle. A watchdog emits a `channel.stalled` audit event (at most once per adapter lifecycle) when no successful poll completes within `5 × pollingIntervalMs`.
+- **Inbound:** Polls Nylas Messages API at configurable interval (default: 30s). The poll fetches, filters, writes each inbound message ahead, and hands it to a bounded runner, then returns; it does not wait for the agent turn (#2254). One turn runs per thread, in message-date order (Nylas lists newest-first; the adapter sorts ascending before the loop). Further threads wait once `channels.email.max_concurrent_turns` (default 4) turns are already in flight. When `dispatch.turnInjection.enabled` is on ([ADR-053](../adr/053-turn-lanes-and-mid-turn-injection.md); on in the shipped config), the next message on that thread is released once the dispatcher has decided the inbound, so a same-contact follow-up can join the turn still running. With the flag off, the thread stays locked until the turn ends. The cap bounds concurrent turns, not the in-memory queue. `stop()` drops mail still queued (each id logged) and waits up to 5s for turns already running; it does not start another turn after it returns. Shutdown stops every email account together, so that wait is one shared 5s. On `start()`, this account's unacknowledged `inbound.message` rows from the last 24 hours are delivered again, oldest first, before the first poll. A row in that window is left out when a later `inbound.message` for the same account and Nylas message id already exists. A turn that died after it had already replied can be delivered again; that is the same at-least-once behaviour as the re-fetch this replay replaces. Older unacknowledged rows are not replayed. Rows that aged out within the last 7 days are counted in a startup warning; older ones are left to the general unacknowledged-row startup scan. Replayed rows get `metadata.receivedAt` back as a `Date`, as on the live event.
+- **Poll high-water mark (resilience):** the adapter persists its `lastSeenTimestamp` high-water mark via `ConfigStore` (namespace `system:email-poll-state`, key `<accountId>.last_seen_at`) so restarts resume where they left off. The mark moves only through messages skipped on purpose — including a write-ahead that has failed three times for a reason other than a database outage — or whose `inbound.message` write-ahead succeeded. A database outage is retried and does not consume that budget. A retryable write-ahead failure rolls the mark back to include that message (same-second neighbours are re-fetched and skipped when this process already wrote them ahead) and stops the batch. Mail dropped because `stop()` raced the poll is left behind the persisted mark and replayed on the next start. This watermark is **code-managed, not LLM-managed**.
+- **Poll observability:** a `channel.poll` audit event is emitted once per poll cycle when the fetch and write-ahead finish, not when the agent turn finishes, and not when the adapter has already stopped. `fetched` is the Nylas result length. `processed` counts messages whose write-ahead succeeded. `skipped.deferred` is mail left for a later poll; `skipped.already_staged` is mail this process already wrote ahead. `fetched = processed + sum(skipped)`. A later delivery failure stays in `processed` and is logged on its own. A watchdog emits a `channel.stalled` audit event (at most once per adapter lifecycle) when no successful poll completes within `5 × pollingIntervalMs`. Email health also fails when queued mail or every in-flight slot stays past 15 minutes, and when three polls in a row end because inbound write-ahead failed, even if Nylas polls are still fresh.
 - **Outbound:** Sends via Nylas Send API
 - **Conversation ID:** derived from Nylas thread ID (`email:<threadId>`)
 - **Participant extraction:** From/To/CC addresses are extracted and auto-create contacts
 - **Attachments (inbound):** parsed and passed through as `Attachment[]`
 - **Attachments (outbound, v0.33):** all five outbound email skills (`email-send`, `email-reply`, `email-draft-save`, `ceo-inbox-draft-compose`, `ceo-inbox-draft-reply`) accept an `attachments` input. Files are read from `file://` URLs backed by `TempFileStore`, validated, and forwarded to Nylas (multipart `FormData` on the CEO-inbox path; `Buffer` content via the Nylas SDK on the Curia-outbound path), capped at 20 MB total / 10 attachments. The `drive-download-file` skill bridges Google Drive → `TempFileStore`, returning a `file://` URL so Drive files can be attached.
-- **CEO inbox drafts (v0.35):** the CEO inbox can now find, read, and edit unsent drafts. `ceo-inbox-list` / `ceo-inbox-search` query Nylas's `/drafts` resource (the DRAFTS folder) when scoped with `folder: 'DRAFTS'`; `ceo-inbox-read` accepts a `draft_id` to return a draft's full body; and the new `ceo-inbox-draft-edit` skill updates a draft's recipients/subject/body. Draft results key on `drafts` (not `messages`) so a genuine "none" is distinguishable from a silent zero, and the inbox poll watermark is not applied to drafts.
-- Secrets: `NYLAS_API_KEY`, `NYLAS_GRANT_ID`, `NYLAS_SELF_EMAIL`
+- **CEO inbox drafts (v0.35):** the CEO inbox can now find, read, and edit unsent drafts. `ceo-inbox-list` / `ceo-inbox-search` query Nylas's `/drafts` resource (the DRAFTS folder) when scoped with `folder: 'DRAFTS'`; `ceo-inbox-read` accepts a `draft_id` to return a draft's full body; and the new `ceo-inbox-draft-edit` skill updates a draft's recipients/subject/body. Since #2053 draft-edit changes recipients one at a time (`add_to`, `add_cc`, `add_to_addresses`, `add_cc_addresses`, `remove`) rather than replacing the lists, and `ceo-inbox-draft-compose` takes contact IDs (or `principal`) in `to`/`cc`. A raw address for someone who is not a contact goes in `to_addresses`/`cc_addresses` (or draft-edit's `add_*_addresses`) and must appear in the principal's mail or a person's message (ADR-047). Draft results key on `drafts` (not `messages`) so a genuine "none" is distinguishable from a silent zero, and the inbox poll watermark is not applied to drafts.
+- **Email accounts (v0.37):** multiple agent-owned mailboxes are managed from the console under **Settings → Channels → Email → Email accounts**. Each account is a row in the `email_accounts` table (migration `064_create_email_accounts.sql`) with its Nylas grant stored in the vault at a per-account key (`channel.email.<name>.nylas_grant_id`). The shared app-level `NYLAS_API_KEY` remains an env-bootstrapped vault secret. The legacy `channel_accounts.email` YAML path and `CEO_PRIMARY_EMAIL` env var are retired.
+- **Vault credential wiring (v0.37):** at startup `applyChannelVaultSecrets()` overlays channel vault credentials (`channel.<name>.<field>`) onto the runtime config before adapters are constructed, so credentials saved via the Channels console take effect on the next restart without any env-var or YAML change.
+- **Sent-mail observation (v0.42, ADR-029):** a scheduled `ceo-inbox-sent-observe` skill polls the CEO's **Sent** folder through the existing `ceo-inbox` Nylas grant (no new credential). Scope is **all sent mail**. Each run is watermarked (`config-store` under the `ceo_inbox` namespace, same high-water pattern as the inbound email poll) and is idempotent on re-run. For each new sent message it (1) correlates to Curia-authored draft snapshots (below) by `thread_id` + recipients + send time and appends `(draft, sent)` pairs to a rolling OKF evidence doc, and (2) correlates to open `owner='ceo'` tasks for completion candidates, queued in `config-store` (`ceo_inbox`, `sent_observe.completion_candidates`) rather than an OKF doc ([spec 19](19-tasks-and-backlog.md)). It emits a `ceo.sent_observed` audit event and advances the watermark. Observe runs as a **separate daily cron** on `agents/ceo-inbox.yaml` with its own Operating Modes task text — never folded into the hourly triage loop.
+- **Draft capture for voice learning (v0.42):** the three CEO-inbox draft skills (`ceo-inbox-draft-reply`, `ceo-inbox-draft-compose`, `ceo-inbox-draft-edit`) snapshot what Curia proposed into an OKF scratch doc at `/scratch/voice-learning/<draft_id>.md` (frontmatter: `draft_id`, `thread_id`, recipients, subject, `created_at`, `linked_task_ids[]`, `agent_version`; body = drafted markdown). Capture failure logs and **must not** block draft creation. Matched `(draft, sent)` diffs accumulate in `/scratch/voice-learning/pending-diffs.md` for the weekly `voice-learn` job ([spec 13](13-office-identity.md)). That job makes a single batched LLM extraction pass over the accumulated diffs to produce an updated `WritingVoice.guide`, proposed in the digest for CEO approval.
+- **OKF evidence retention:** raw draft snapshots and pending-diff evidence are scratch-path docs. Once a pair has been folded into the writing-voice profile (or dismissed), the learning job deletes or TTL-expires the consumed evidence — default scratch TTL applies to unmatched snapshots; consumed evidence must not be retained indefinitely. Shadow drafts for punted mail follow the same scratch path conventions and never surface or send ([spec 14](14-autonomy-engine.md)).
 - Nylas abstracts away provider differences (Gmail, Outlook, IMAP) and handles OAuth
 
 ### Signal (via signal-cli)
 - Uses signal-cli in JSON-RPC mode as a subprocess
 - **Conversation ID:** derived from Signal group or 1:1 conversation ID
 - Handles: text messages, attachments, reactions
-- Secrets: `signal_phone_number`
+- **Voice notes (#1600):** inbound audio attachments (Signal voice notes / `audio/*`) are downloaded via signal-cli `getAttachment` and transcribed through `SpeechMediaService` into ordinary `inbound.message` content tagged `[transcribed-from-audio]`. 1:1 transcription is gated on known senders; downloads are capped at 5 MB. When STT credentials are absent, audio-only messages are ignored (existing text path).
+- **Voice calls (#1672):** anyone can place a native Signal voice call to Curia's number and hold a live spoken conversation through the same `VoiceRuntime` the console uses — see the Voice section below. signal-cli owns the RingRTC leg; Curia only speaks JSON-RPC and PCM.
+- **Reactions:** inbound reaction envelopes publish `inbound.reaction` (`targetMessageId` = stringified Signal target timestamp; `isRemove` in metadata). Outbound `outbound.delivered.messageId` is the signal-cli send timestamp so principal 👍/👎 can resolve approvals (#1479).
+- Secrets: `channel.signal.phone_number` — the canonical namespaced vault key (wired via `applyChannelVaultSecrets`, as above). The legacy flat `signal_phone_number` key was consolidated onto it and backfilled by migration; entering the phone number in the console alone now activates Signal (#1140).
 
-### HTTP API
-- REST endpoints for programmatic access
-- SSE (Server-Sent Events) for real-time response streaming
-- Token-based authentication
-- This is the interface a future web dashboard or mobile app would use
-- **Conversation ID:** provided by the client or generated server-side
+### Slack (via Socket Mode)
+- Toggleable channel: principal creates a **workspace-owned** Slack app (import Curia's app manifest), installs it, and vaults `channel.slack.bot_token` + `channel.slack.app_token`. See ADR-033.
+- **Inbound:** Socket Mode — DMs (`message.im`), `@mentions` (`app_mention`), and **in-thread replies** in channels/groups Curia is already active in (`message.channels` / `message.groups`). Voice notes (audio files, including audio `file_share`) are downloaded from `files.slack.com` with the bot token and transcribed via `SpeechMediaService` into ordinary `inbound.message` content tagged `[transcribed-from-audio]` (#1600). Non-audio file shares are ignored. Reactions normalize to `inbound.reaction`; principal 👍/👎 on an approval message resolves the pending approval via `targetMessageId` (#1479). Ignores edits, bot messages, and channel traffic outside active threads. Own messages ignored by bot user id from `auth.test` (never by a hardcoded `@curia` string). Bot display name / @handle is set in Slack to match office identity. Inbound text has Slack entities decoded; outbound agent Markdown is converted to mrkdwn.
+- **Outbound:** `OutboundGateway` + `slack-send` skill → `chat.postMessage` (mrkdwn). Channel mentions and active-thread replies stay in-thread; proactive 1:1 DMs use a Slack user id `U…` as the channel (Slack opens/uses the IM). Principal checks and Gate C use `U…` via `isPrincipalIdentity('slack', …)`, not conversation ids.
+- **Conversation ID:** DM `slack:D<conversationId>` or `slack:D…:<thread_ts>` when threaded; channel thread `slack:C<channelId>:<thread_ts>` (reversible per ADR-025).
+- **Trust:** `medium`, `unknown_sender: allow`, `threaded: true` (`config/channel-trust.yaml`). Sender `U…` resolves through the unified contact ledger — principal-linked Slack identities get principal-tier override. Optional `channels.slack.allowed_channel_ids` allowlist for @mentions / thread replies.
+- **Identity:** Slack user id (`U…`) as `channel_identifier`, source `slack_participant` (same `contact_channel_identities` table as email/Signal).
+
+### SMS (via Telnyx Messaging)
+- Toggleable channel: operator buys a **new** Telnyx **voice+SMS** DID (never port a consumer/TextNow number), points the Messaging Profile webhook at `POST /api/webhooks/telnyx/sms`, and vaults `channel.sms.api_key` + `channel.sms.from_number` + `channel.sms.webhook_public_key`. Default docs path is US long code + **Low-Volume Mixed** 10DLC; a Canadian DID is a viable alternative (outside 10DLC). See ADR-036.
+- **Inbound:** signed Telnyx webhook (Ed25519). Invalid signatures → 401. Conversation id `sms:<E.164>` (ADR-025). 1:1 text only in v1 (no MMS/groups). Unknown senders auto-create via `ensureChannelContact` with source `sms_participant` (**not** auto-verified — SMS From is spoofable). STOP and other natural-language opt-out text publish as ordinary inbound for the agent.
+- **Outbound:** `OutboundGateway` + `sms-send` skill → Telnyx Messages API. Autonomy, content filter, and blocked-contact apply. Carrier STOP is enforced by Telnyx (error **40300** → clear `blockedReason`); Curia keeps no parallel opt-out ledger — preferences are contact KG facts. Principal Gate C uses a verified **`sms`** channel identity (CRM `phone` remains profile/reach-CEO data).
+- **Trust:** `medium`, `unknown_sender: allow`, `threaded: false` (`config/channel-trust.yaml`).
+- **Voice:** orthogonal to #1414 Phase 1 LiveKit path; prefer the same Telnyx account/DID as Phase 2 PSTN SIP trunk.
+
+### Voice (console WebRTC via LiveKit; Signal RingRTC calls)
+- Toggleable channel: operator runs self-hosted LiveKit, vaults `channel.voice.livekit_url` (browser signaling) + `channel.voice.livekit_api_key` + `channel.voice.livekit_api_secret` + `channel.voice.deepgram_api_key` + `channel.voice.cartesia_api_key` + `channel.voice.cartesia_voice_id`, enables Voice in **Settings → Channels**, then restarts Curia. `channels.voice.model` may override the default fast-tier spoken-turn model. Server-side LiveKit RoomService (room delete on hangup) uses plain YAML `channels.voice.livekit_management_url` (compose default `http://livekit:7880`), not the public signaling URL.
+- **Model preflight (#1553):** the resolved spoken-turn model must declare both `streaming` and `tools` in the `ModelRegistry`. A provider exposing `stream()` is necessary but not sufficient — OpenRouter implements `stream()` for every routed model, including ones that neither stream nor tool-call — so voice boot gates on registry capabilities, not on the provider interface.
+- **Transports:** `VoiceRuntime` is transport-agnostic behind the `AudioTransport` seam and now has two:
+  - **Console (WebRTC/LiveKit):** the console creates a voice session through `POST /api/voice/sessions`, receives a LiveKit room token, and joins over WebRTC. `VoiceRuntime` joins the same room as the agent participant.
+  - **Signal calls (#1672):** `SignalCallBridge` subscribes to signal-cli's `callEvent` stream over the existing JSON-RPC socket (`subscribeCallEvents` — without an active subscription signal-cli silently ignores incoming calls) and drives `acceptCall` / `rejectCall` / `hangupCall`. signal-cli answers by spawning one `signal-call-tunnel` process per call; the call's audio surfaces as per-call PulseAudio virtual devices, which `SignalAudioTransport` moves as 48 kHz mono s16le PCM through `parec` / `pacat` against a shared Pulse socket. `callId` is a signed 64-bit value that exceeds `Number.MAX_SAFE_INTEGER`, so it is `bigint` end-to-end. Everything downstream of the transport — STT, TTS, the turn loop, barge-in, the greeting — is reused unchanged.
+- **Signal call policy (#1672, #1626):** admission follows `channels.signal.unknown_sender` in `config/channel-trust.yaml` (currently `allow` — known contacts and unresolved strangers are answered). A stranger gets `unknown` tier and `liveTurn: false`, so they still fall outside the elevated-skill and outbound-context gates even though the call is answered. Two conditions always reject: a `blocked`-tier contact, and a caller with no E.164 number (uuid-only, nothing stable to resolve or later create a contact from). Flipping Signal's YAML to `ignore` matches the dispatcher gate: it rejects unresolved numbers **and** resolved contacts still at `tier: 'unknown'` (except `kind: 'automated'`). Callers resolve against the **`signal`** channel key — the same key inbound Signal texts use — so principal standing carries over from the text channel. Exactly one call is active at a time; a second concurrent call is rejected as busy. A hard per-call duration cap (`SIGNAL_VOICE_MAX_CALL_SECONDS`, default 600s) hangs the call up. Config-gated off: `SIGNAL_VOICE_CALLS_ENABLED` requires the Signal channel, the fully configured voice channel, and `SIGNAL_PULSE_SOCKET_PATH`; missing prerequisites log a warning and leave the bridge unstarted.
+- **Inbound:** Deepgram STT final transcripts publish ordinary `inbound.message` events with `channel_id: "voice"` and conversation id `voice:<sessionId>`. Session lifecycle publishes `voice.session.started` / `voice.session.ended` for audit and operations.
+- **Opening greeting (#1596):** on an inbound call, a synthetic cue message triggers Curia to speak first — a short greeting appropriate to the time of day, acknowledging active outbound context when present. The cue is hidden from console history and is not used for Curia-initiated outbound calls.
+- **Cross-channel awareness (#1594):** spoken turns read the active outbound-context bridge, so a call placed right after a send knows what was just sent on another channel.
+- **Async off-ramp (#1614):** a heavyweight ask made by voice is not attempted inside the spoken turn. The `async-offramp` tool dispatches it to the async coordinator and the principal is called back when it completes — the voice brain acknowledges and moves on rather than stalling the call. The tool returns once that `agent.task` is durably published (audit write-ahead done); it does not wait for the coordinator to finish (#2265).
+- **Spoken replies:** `VoiceTurnRunner` uses `LLMProvider.stream()` and voice's own tool list (`VOICE_TOOL_NAMES` in `src/channels/voice/voice-tools.ts`: delegate, date-resolve, async-offramp, the task and memory tools — not the coordinator's 73-tool pin set, #1968), chunks assistant text into sentences, and sends audio through Cartesia TTS back to the active transport. `VoiceRuntime` owns TTS egress; voice intentionally does **not** use `OutboundGateway`, `outbound-request.ts`, or `principal-rules.ts` for voice audio. If dispatch emits `outbound.message` for `voice`, delivery no-ops.
+- **Tool audit (#1968):** voice runs its own loop, not `AgentRuntime`, so the tool bridge publishes the `tool.invoke` / `tool.result` pair a text turn does (`src/channels/voice/voice-tool-audit.ts`): agent `coordinator`, the session id as `taskEventId`, the turn's `inbound.message` as parent. A tool whose invoke cannot be recorded does not run. Barge-in and hang-up abort the in-flight stream; that is a cancellation, so it publishes no `llm.error` (only a timeout or real failure does). Barge-in also releases a turn that is waiting on a tool: the call may finish in the background, and a late result is logged and discarded so it does not reach the model or the transcript (#2265). A released tool can overlap the next turn; its side effects still land and are audited.
+- **Shared prompt modules (ADR-038, #1595):** voice and the text coordinator compose the same guardrail modules from `src/agents/prompts/` (the date-resolve guardrail first) rather than maintaining two drifting prompts. Only modules that measurably pay for themselves are composed; the rest stay on hold.
+- **Trust:** `high`, `unknown_sender: ignore`, `threaded: false` (`config/channel-trust.yaml`). Console calls are authenticated as the principal by the bootstrap secret; Signal calls carry the caller's own resolved tier as described above rather than inheriting the channel's `high`.
+- **Health:** three probes cover distinct failure modes — `signal` (Signal messaging RPC socket), `voice` (LiveKit management `listRooms()`), and `signal_voice` (a **connect** to the shared PulseAudio socket, #1760). See [spec 08](08-operations.md#health--monitoring).
+- **Scope:** PSTN/SIP remains a deferred transport that should reuse `VoiceRuntime`.
+
+### HTTP
+
+The always-on Fastify adapter. It serves the console, `GET /api/health`, bearer-gated operator routes such as `GET /api/agents/status`, and the session-authenticated console APIs. It is not itself a chat ingress.
+- Console chat is `POST /api/chat/messages`, `GET /api/chat/stream`, and `GET /api/chat/history`, on the `web` channel. Auth is the session cookie or `x-web-bootstrap-secret`. The sender is the principal.
+- `POST /api/messages` and `GET /api/messages/stream` were removed ([ADR-057](../adr/057-two-http-chat-surfaces.md)). Tests were the only in-repo callers.
 - **Non-toggleable** (`isToggleable: false`): always starts, cannot be disabled — disabling HTTP would lock operators out of the registry API itself.
 
 ---
@@ -138,7 +179,10 @@ Each channel is assigned a trust level that the dispatch layer tags on every inb
 |---|---|---|
 | **CLI** | `high` | Requires SSH/physical access to the host |
 | **Signal** | `high` | Strong identity via phone number + Signal protocol |
-| **HTTP API** | `medium` | Token-authenticated, but tokens can be leaked |
+| **HTTP** | `medium` | Policy remains for a `channelId` of `http`. The bearer message route that published on it was removed (ADR-057). |
+| **Slack** | `medium` | Workspace OAuth / bot token — weaker than Signal (ADR-033) |
+| **SMS** | `medium` | Telnyx office DID — spoofable From, not E2E (ADR-036) |
+| **Voice** | `high` | Console-authenticated principal session; LiveKit media stays off the bus (ADR-037) |
 | **Email** | `low` | From headers are trivially spoofable; relies on SPF/DKIM/DMARC |
 
 Trust levels gate which actions the Coordinator can take based on the originating channel. See [06-audit-and-security.md](06-audit-and-security.md#trust-gated-actions) for policy configuration.
@@ -164,33 +208,15 @@ Each adapter implements reconnection with exponential backoff:
 - On restart: all configured adapters attempt to connect
 - Health endpoint reports adapter status (connected/disconnected/disabled)
 
-**Future note:** Voice/telephony adapters will need a `streaming: true` flag on `OutboundMessage` for real-time TTS. Not included at launch — trivial to add when needed.
+**Streaming note:** Voice Phase 1 does not add `streaming: true` to `OutboundMessage`; real-time TTS is owned by `VoiceRuntime` and LiveKit media stays off the bus. Future Signal/PSTN transports should plug into the same runtime instead of routing PCM through `OutboundGateway`.
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-| Item | Status |
-|---|---|
-| `Channel` interface (`name`, `isToggleable`, `start`, `stop` — no `send`; outbound via `OutboundGateway`) in `src/channels/channel.ts` | Done |
-| Channel catalog (`ChannelDescriptor` + `ChannelCredentialField`) in `src/channels/catalog.ts` | Done |
-| Channel registry — `channel_registry` table, install/enable lifecycle, restart-based; `http`/`cli` non-toggleable | Done |
-| Channel credential vault keys — `channel.<name>.<field>` convention | Done |
-| Email poll high-water mark — `lastSeenTimestamp` persisted via `ConfigStore` (`system:email-poll-state`), code-managed | Done |
-| Email poll observability — `channel.poll` per cycle; `channel.stalled` watchdog at `5 × pollingIntervalMs` | Done |
-| `InboundMessage` type | Done |
-| `OutboundMessage` type | Done |
-| CLI channel adapter | Done |
-| Email channel adapter (Nylas API, polling, participant extraction) | Done |
-| Signal channel adapter (signal-cli JSON-RPC subprocess) | Done |
-| HTTP API channel adapter (REST + SSE) | Done |
-| Trust levels assigned to each channel (`config/channel-trust.yaml`) | Done |
-| Sender allowlists per channel | Not Done — superseded by contact resolver (spec 09); no allowlist config present |
-| Email validation: SPF/DKIM/DMARC header check | Done |
-| Email validation: Reply-To vs From header consistency check | Not Done |
-| Reconnection with exponential backoff | Partial — Signal has full backoff; email uses polling (no reconnect path needed); HTTP/CLI not applicable |
-| After max retries: publish `channel.disconnected` and stop | Not Done — event type not emitted; Signal adapter stops but does not publish this event |
-| Health endpoint reports adapter status (connected/disconnected/disabled) | Not Done — health endpoint only reports DB, agents, and skills |
-| Outbound message queue for disconnected channels (max 100, delivered on reconnect) | Not Done |
-| Email reply quoting — `email-reply` appends the quoted original message body to drafts and sends | Done |
-| Email search — `is:unread` is embedded into the Nylas search string when `unread_only` is set alongside a search query | Done |
+- **Reply-To vs From header consistency check** — not yet implemented.
+- **Reconnection with exponential backoff** — partial; Signal has full backoff, email uses polling (no reconnect path needed), HTTP/CLI not applicable.
+- **`channel.disconnected` event emission** — Signal and Slack publish on socket close; SMS/email publish on adapter stop (#1380). Voice / http / cli omit it (not queueable).
+- **Health endpoint adapter status** — every adapter now has a probe (`signal`, `email`, `slack`, `sms`, `voice`, `signal_voice`), but their depth varies: `signal`/`voice`/`signal_voice` make a real round-trip, while `slack` reads cached socket state and `sms` only asserts the webhook handler is installed. Inbound SMS reachability in particular is unproven by the liveness path and belongs in a canary (#1762).
+
+Outbound messages for channels that opt into `Channel.supportsOutboundQueue` (Signal, Slack, SMS, email) are queued in Postgres while the transport is unavailable (max 100/channel, 24h TTL) and flushed on `channel.reconnect` (#1380). Voice does not opt in — delayed delivery is not meaningful for duplex audio.

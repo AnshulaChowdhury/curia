@@ -1,0 +1,27 @@
+{
+  "name": "extract-relationships",
+  "description": "Extract entity-to-entity relationships from a passage of text and persist them as knowledge graph edges. Self-classifies internally — always safe to call; exits early if no relationships are found.",
+  "version": "1.2.1",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "text": "string (the message or turn text to extract relationships from)",
+    "source": "string (provenance string, e.g. 'agent:coordinator/task:abc123/channel:cli')",
+    "max_stored": "number? (optional cap on relationships persisted in this invocation)"
+  },
+  "outputs": {
+    "extracted": "number (new edges created)",
+    "confirmed": "number (existing edges re-asserted and updated)",
+    "failed": "number (triples dropped by a malformed shape or a persistence error)",
+    "ambiguous": "number (triples dropped because an endpoint label matched several nodes)",
+    "skipped": "boolean (true if the classifier gate determined no relationships were present)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000,
+  "capabilities": [
+    "entityMemory",
+    "infraLlm"
+  ],
+  "allowed_callers": ["system"]
+}

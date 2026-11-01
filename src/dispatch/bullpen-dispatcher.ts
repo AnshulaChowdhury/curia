@@ -1,14 +1,39 @@
 import type { EventBus } from '../bus/bus.js';
 import type { AgentDiscussEvent } from '../bus/events.js';
 import { createAgentTask } from '../bus/events.js';
+import type { AgentRegistry } from '../agents/agent-registry.js';
 import type { Logger } from '../logger.js';
 import type { BullpenService } from '../memory/bullpen.js';
+import { BULLPEN_REPLY_RULE } from '../agents/prompts/bullpen-reply-rule.js';
+import { THREAD_CREATOR_AGENT_ID_KEY } from './delegation-hint.js';
+import {
+  ORIGIN_TURN_OWNS_REPLY_KEY,
+  parseOriginTurnOwnsReply,
+  type OriginTurnOwnsReply,
+  type RunningOriginTurnHit,
+} from './origin-turn-reply.js';
+
+/**
+ * Read-only view of delegations that have not returned. Wired only when late
+ * delivery is on, because that is what writes the `running` claim. Absent
+ * means the wake cannot tell that the originating turn is still open.
+ */
+export interface BullpenOriginTurnLookup {
+  findRunning(
+    targetAgent: string,
+    originAgentIds: readonly string[],
+  ): Promise<readonly RunningOriginTurnHit[]>;
+}
 
 export class BullpenDispatcher {
   constructor(
     private bus: EventBus,
     private logger: Logger,
     private bullpenService: BullpenService,
+    /** Participants absent from this registry are not dispatched. (#1898) */
+    private agentRegistry: AgentRegistry,
+    /** In-flight delegations whose origin turn will answer the principal. (#1917) */
+    private originTurnLookup?: BullpenOriginTurnLookup,
   ) {}
 
   register(): void {
@@ -51,36 +76,52 @@ export class BullpenDispatcher {
       return;
     }
 
-    // A reply with close_after: true closes the thread atomically, then still publishes a
-    // normal agent.discuss event for the concluding message. Creating reply-oriented tasks
-    // for a closed thread is a dead end — any reply is rejected with "Cannot post to closed
-    // thread" — so skip dispatch here, mirroring the message-cap guard above. (#881)
-    if (threadRecord.thread.status === 'closed') {
-      this.logger.info(
-        { threadId },
-        'BullpenDispatcher: thread is closed — skipping task creation (concluding reply needs no follow-up)',
-      );
-      return;
-    }
-
     const { topic, participants } = threadRecord.thread;
+    const threadClosed = event.payload.threadClosed === true;
 
     // Prefer the originator from the discuss event (fast path — already in memory).
     // Fall back to the originator stored on the thread at creation time: this covers
     // the poll-fallback path where the original agent.discuss publish failed, so the
-    // reply event has no originator but the thread row still holds the CEO's identity.
+    // reply event has no originator but the thread row still holds the principal's identity.
     const effectiveOriginator = event.payload.originator ?? threadRecord.thread.originator ?? undefined;
 
     // Create one agent.task per participant, excluding the sender.
-    // Mentioned agents get a reply-expected prompt; others get an FYI.
+    // Mentioned agents get a reply-expected (open) or act-on-conclusion (closed) prompt;
+    // others get FYI. close_after replies with no explicit mentions auto-mention the
+    // thread opener in bullpen-reply so consult hand-offs wake the originator.
     const otherParticipants = participants.filter((id) => id !== senderAgentId);
+    const owners = await this.originTurnsStillOpen(threadId, senderAgentId, otherParticipants);
 
     let dispatched = 0;
+    let skippedUnregistered = 0;
     for (const agentId of otherParticipants) {
+      // A name the registry does not contain must not count as a successful
+      // dispatch. The other participants of the same thread still get tasks.
+      if (!this.agentRegistry.has(agentId)) {
+        skippedUnregistered++;
+        this.logger.error(
+          { threadId, agentId },
+          'BullpenDispatcher: participant is not a registered agent — skipping task',
+        );
+        continue;
+      }
+
       const isMentioned = mentionedAgentIds.includes(agentId);
-      const content = isMentioned
-        ? `You've been mentioned in Bullpen thread "${topic}" (thread_id: ${threadId}) by ${senderAgentId}. Review the injected thread context and reply using the bullpen skill.`
-        : `FYI: New activity in Bullpen thread "${topic}" (thread_id: ${threadId}) from ${senderAgentId}. No response required, but reply if you have something to add.`;
+      const shouldAct = isMentioned;
+      const owner = owners.get(agentId);
+      const content = (threadClosed
+        ? shouldAct
+          ? `Final message in Bullpen thread "${topic}" (thread_id: ${threadId}) from ${senderAgentId} — the thread is now closed. Call bullpen-read to read the full history, act on the conclusion (do not reply in-thread).`
+          : `FYI: Final message in Bullpen thread "${topic}" (thread_id: ${threadId}) from ${senderAgentId}. Call bullpen-read to read the full history if needed, but do not reply in-thread.`
+        : shouldAct
+          ? `You've been mentioned in Bullpen thread "${topic}" (thread_id: ${threadId}) by ${senderAgentId}. Review the injected thread context and reply with bullpen-reply.`
+          : `FYI: New activity in Bullpen thread "${topic}" (thread_id: ${threadId}) from ${senderAgentId}. No response required, but reply if you have something to add.`)
+        + (owner
+          ? ' The turn that delegated this work is still open and will answer the principal. Do not send them a confirmation.'
+          : '')
+        // An open thread may be replied to, so the wake carries the reply rule (#1959). A
+        // closed thread takes no reply, and acting on its conclusion may rightly mean a send.
+        + (threadClosed ? '' : `\n\n${BULLPEN_REPLY_RULE}`);
 
       try {
         const task = createAgentTask({
@@ -95,15 +136,39 @@ export class BullpenDispatcher {
             taskOrigin: 'bullpen',
             threadId,
             mentioned: isMentioned,
-            // Propagate the originator so the receiving agent's task carries the original
-            // TaskOriginator. Without this, a specialist agent involved in a CEO-authorized
-            // bullpen thread cannot invoke elevated skills.
+            threadClosed,
+            // The thread's opener owns the exchange. A send the woken agent makes is a
+            // relay on the opener's behalf, and the outbound-context entry it registers
+            // is attributed to the opener so the principal's reply routes back to it (#1972).
+            [THREAD_CREATOR_AGENT_ID_KEY]: threadRecord.thread.creatorAgentId,
+            // Propagate the originator (LINEAGE) so the receiving agent's task carries the
+            // original TaskOriginator — this drives the autonomy principal-bypass for `normal`
+            // skills at sufficient trust. NOTE (#1126): bullpen is a persisted/async path, so it
+            // intentionally does NOT carry the `liveTurn` signal — a bullpen-dispatched specialist
+            // is NOT a live principal turn and so correctly CANNOT invoke `elevated` skills. Do
+            // not "fix" that by forwarding liveTurn here: it would re-open the self-approval hole.
             ...(effectiveOriginator ? { originator: effectiveOriginator } : {}),
+            // Set only for the agent whose own delegation to the sender has not
+            // returned. The execution layer refuses a human-channel send from
+            // that wake; every other participant is unchanged. (#1917)
+            ...(owner ? { [ORIGIN_TURN_OWNS_REPLY_KEY]: owner } : {}),
           },
           parentEventId: event.id,
         });
         await this.bus.publish('dispatch', task);
         dispatched++;
+        if (owner) {
+          this.logger.info(
+            {
+              agentId,
+              threadId,
+              delegateEventId: owner.delegateEventId,
+              originConversationId: owner.originConversationId,
+              originChannelId: owner.originChannelId,
+            },
+            'BullpenDispatcher: originating turn still open — principal reply stays on that turn (#1917)',
+          );
+        }
         this.logger.debug(
           { agentId, threadId, mentioned: isMentioned },
           'BullpenDispatcher: created agent.task for participant',
@@ -116,12 +181,59 @@ export class BullpenDispatcher {
       }
     }
 
-    // If every dispatch failed, log an aggregated error — the thread will go unanswered.
-    if (dispatched === 0 && otherParticipants.length > 0) {
+    // Publish failures only. An all-unregistered thread already logged one error
+    // per participant; a second "all failed" line would double-count that miss.
+    if (dispatched === 0 && otherParticipants.length > skippedUnregistered) {
       this.logger.error(
         { threadId, expected: otherParticipants.length },
         'BullpenDispatcher: all participant task dispatches failed — thread will receive no replies',
       );
     }
+  }
+
+  /**
+   * Delegations to `senderAgentId` that have not returned, keyed by the agent
+   * whose turn is still open. A lookup error fails open: the wake is still
+   * dispatched, and a duplicate confirmation is preferable to dropping the
+   * thread on a database blip. (#1917)
+   */
+  private async originTurnsStillOpen(
+    threadId: string,
+    senderAgentId: string,
+    originAgentIds: readonly string[],
+  ): Promise<Map<string, OriginTurnOwnsReply>> {
+    const owners = new Map<string, OriginTurnOwnsReply>();
+    if (!this.originTurnLookup || originAgentIds.length === 0) return owners;
+    let hits: readonly RunningOriginTurnHit[];
+    try {
+      hits = await this.originTurnLookup.findRunning(senderAgentId, originAgentIds);
+    } catch (err) {
+      this.logger.error(
+        { err, threadId, senderAgentId },
+        'BullpenDispatcher: origin-turn lookup failed — dispatching without reply ownership stamp',
+      );
+      return owners;
+    }
+    if (!Array.isArray(hits)) {
+      this.logger.error(
+        { threadId, senderAgentId },
+        'BullpenDispatcher: origin-turn lookup returned a non-array — dispatching without reply ownership stamp',
+      );
+      return owners;
+    }
+    for (const hit of hits) {
+      if (typeof hit !== 'object' || hit === null) continue;
+      if (owners.has(hit.originAgentId)) continue;
+      const parsed = parseOriginTurnOwnsReply(hit);
+      if (!parsed) {
+        this.logger.warn(
+          { threadId, originAgentId: hit.originAgentId },
+          'BullpenDispatcher: origin-turn lookup returned an unusable row — not stamping',
+        );
+        continue;
+      }
+      owners.set(hit.originAgentId, parsed);
+    }
+    return owners;
   }
 }

@@ -5,15 +5,16 @@
 //
 // Lives under src/ (not skills/) so the channel adapter — which is bound to
 // rootDir=src — can import it. Skill handlers reach into src/ for shared
-// utilities (same pattern they use for SkillContext / SkillHandler types).
+// utilities (same pattern they use for ToolContext / ToolHandler types).
 
 import { DateTime } from 'luxon';
 import sanitizeHtml from 'sanitize-html';
 import { htmlToText } from '../../channels/email/html-to-text.js';
+import { normalizeCounterparty } from '../../autonomy/disclosure-decisions.js';
 
 /**
  * Minimal message shape required to build a reply quote block.
- * Both NylasMessageFull (CEO client) and NylasMessage (core client)
+ * Both NylasMessageFull (principal client) and NylasMessage (core client)
  * satisfy this interface structurally — no explicit coupling needed.
  */
 export interface QuoteableMessage {
@@ -72,6 +73,12 @@ function formatParticipantHtml(p: { name?: string; email: string }): string {
 // allowedTags covers all structural / inline / table elements that appear in real
 // email HTML. nonTextTags ensures <script>/<style>/<head> content is removed entirely
 // (not just the tags). transformTags strips Outlook/IE-specific CSS from style attributes.
+/**
+ * The element an HTML reply quote opens with (the attribution block). Exported so the test-mode
+ * recording transport can tell the reply's own text from the quote below it (#2312).
+ */
+export const REPLY_QUOTE_HTML_OPEN = '<div style="margin-top:1em;padding-top:0.75em;border-top:1px solid #cccccc;font-size:0.9em;color:#555555;">';
+
 const QUOTE_SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   allowedTags: [
     // Block / sectioning
@@ -181,7 +188,7 @@ export function buildReplyQuote(
     const parts = [
       '',
       '',
-      '<div style="margin-top:1em;padding-top:0.75em;border-top:1px solid #cccccc;font-size:0.9em;color:#555555;">',
+      REPLY_QUOTE_HTML_OPEN,
       `  <p style="margin:0 0 0.25em 0;"><strong>From:</strong> ${fromLine}</p>`,
       `  <p style="margin:0 0 0.25em 0;"><strong>Date:</strong> ${esc(dateLine)}</p>`,
       `  <p style="margin:0 0 0.25em 0;"><strong>To:</strong> ${toLine}</p>`,
@@ -220,4 +227,21 @@ export function buildReplyQuote(
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Everyone on a quoted message, From, To and CC, as the send review compares recipients:
+ * lowercased bare addresses, once each (#2312). Set as `quoteParticipants` beside the
+ * `htmlQuote` built from the same message, so the quote's own details are not ruled a
+ * disclosure to people who already had it.
+ */
+export function quoteParticipants(message: {
+  from: ReadonlyArray<{ email: string }>;
+  to: ReadonlyArray<{ email: string }>;
+  cc?: ReadonlyArray<{ email: string }> | null;
+}): string[] {
+  const all = [...message.from, ...message.to, ...(message.cc ?? [])]
+    .map((p) => normalizeCounterparty(p.email))
+    .filter((e) => e.length > 0);
+  return [...new Set(all)];
 }

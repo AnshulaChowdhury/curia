@@ -23,8 +23,25 @@ import type {
   Draft as NylasDraft,
   CreateDraftRequest,
   CreateAttachmentRequest,
+  ListFolderQueryParams,
+  ListDraftsQueryParams,
 } from 'nylas';
 import type { Logger } from '../../logger.js';
+import { budgetExpired, remainingMs } from '../../util/call-budget.js';
+import type { CallBudget } from '../../util/call-budget.js';
+import { markMessageRequestError, nylasStatus } from './nylas-message-id.js';
+
+/** Per-request SDK options. `timeout` caps one request (see budgetOverrides). */
+interface RequestOverrides {
+  overrides?: { timeout: number };
+}
+
+// How long a folder list is reused. email-label needs one on every call, and
+// folders change rarely. createFolder drops the cache, so a new label is seen
+// at once (#2083).
+const FOLDER_CACHE_TTL_MS = 5 * 60_000;
+// Ceiling for listFolders paging, so a cursor that never ends cannot loop.
+const FOLDER_SCAN_LIMIT = 500;
 
 /**
  * Minimal typed interface for the Nylas SDK instance. We only declare the
@@ -41,7 +58,8 @@ interface NylasLike {
     find(params: {
       identifier: string;
       messageId: string;
-    }): Promise<NylasResponse<NylasSdkMessage>>;
+      queryParams?: { fields?: MessageFields };
+    } & RequestOverrides): Promise<NylasResponse<NylasSdkMessage>>;
 
     send(params: {
       identifier: string;
@@ -53,12 +71,23 @@ interface NylasLike {
       identifier: string;
       messageId: string;
       requestBody: { folders?: string[]; starred?: boolean; unread?: boolean };
-    }): Promise<NylasResponse<NylasSdkMessage>>;
+    } & RequestOverrides): Promise<NylasResponse<NylasSdkMessage>>;
   };
   drafts: {
     create(params: {
       identifier: string;
       requestBody: CreateDraftRequest;
+    }): Promise<NylasResponse<NylasDraft>>;
+
+    /** Drafts live in their own collection: `/messages` never returns them (#2262). */
+    list(params: {
+      identifier: string;
+      queryParams?: ListDraftsQueryParams;
+    }): Promise<NylasListResponse<NylasDraft>>;
+
+    find(params: {
+      identifier: string;
+      draftId: string;
     }): Promise<NylasResponse<NylasDraft>>;
 
     /**
@@ -70,16 +99,23 @@ interface NylasLike {
       identifier: string;
       draftId: string;
     }): Promise<NylasResponse<NylasSdkMessage>>;
+
+    /** Remove a draft. A 404 means it is already gone. */
+    destroy(params: {
+      identifier: string;
+      draftId: string;
+    }): Promise<unknown>;
   };
   folders: {
     list(params: {
       identifier: string;
-    }): Promise<NylasListResponse<NylasSdkFolder>>;
+      queryParams?: ListFolderQueryParams;
+    } & RequestOverrides): Promise<NylasListResponse<NylasSdkFolder>>;
 
     create(params: {
       identifier: string;
       requestBody: CreateFolderRequest;
-    }): Promise<NylasResponse<NylasSdkFolder>>;
+    } & RequestOverrides): Promise<NylasResponse<NylasSdkFolder>>;
   };
   attachments: {
     downloadBytes(params: {
@@ -94,7 +130,7 @@ interface NylasLike {
  * The Nylas default export is a class constructor at runtime.
  * Cast it through unknown so TypeScript treats it as constructable.
  */
-const NylasSDK = NylasDefault as unknown as new (config: { apiKey: string }) => NylasLike;
+const NylasSDK = NylasDefault as unknown as new (config: { apiKey: string; timeout?: number }) => NylasLike;
 
 // ---------------------------------------------------------------------------
 // Our own simplified message shape — normalized from the Nylas SDK's Message
@@ -116,8 +152,9 @@ export interface NylasMessage {
   unread: boolean;
   folders: string[];
   /**
-   * Email headers — only present when listMessages was called with fields: 'include_headers'.
-   * Used by the email adapter to extract Authentication-Results for SPF/DKIM/DMARC validation.
+   * Email headers — only present when the fetch asked for fields: 'include_headers'
+   * (listMessages, or getMessage with includeHeaders). Used to read
+   * Authentication-Results for SPF/DKIM/DMARC validation.
    */
   headers?: Array<{ name: string; value: string }>;
   /** Non-inline file attachments. Empty array when no attachments are present. */
@@ -134,6 +171,8 @@ export interface EmailAttachment {
   contentType: string;
   /** Size in bytes. */
   size: number;
+  /** True when the attachment is a calendar invite payload (ICS / text/calendar). */
+  isCalendarInvite?: boolean;
 }
 
 /**
@@ -143,6 +182,11 @@ export interface EmailAttachment {
 export interface NylasFolder {
   id: string;
   name: string;
+  /**
+   * Provider-neutral system-folder markers from Nylas, e.g. `\Sent` on the Sent folder
+   * whatever its id or name (Gmail `SENT`, Outlook "Sent Items"). Absent on user folders.
+   */
+  attributes?: string[];
 }
 
 /**
@@ -182,14 +226,37 @@ export interface ListMessagesOptions {
   fields?: 'include_headers';
   /** Filter to messages in these folder IDs (maps to Nylas `in` param).
    *  Standard Gmail values: INBOX, DRAFT, SENT, TRASH, SPAM, STARRED, IMPORTANT.
-   *  Note: Gmail uses DRAFT (singular), not DRAFTS. Providers may have custom labels. */
+   *  DRAFT or DRAFTS alone lists drafts instead (see listMessages). */
   folders?: string[];
   /** Filter to messages from this sender email address */
   from?: string;
+  /** Filter to messages with this address in from, to, cc or bcc (Nylas `any_email`) */
+  anyEmail?: string;
   /** Filter to messages with this exact subject line */
   subject?: string;
   /** Provider-native search query (Gmail search syntax, Outlook KQL, etc.) */
   searchQueryNative?: string;
+}
+
+/**
+ * A drafts listing asked for a filter the drafts query has no equivalent for. Drafts
+ * are all from the mailbox owner and have no received date, so `from` and
+ * `receivedAfter` cannot be applied; `fields` (headers) is a messages-only option.
+ */
+export class UnsupportedDraftsFilterError extends Error {
+  constructor(readonly filters: readonly string[]) {
+    super(
+      `Listing drafts cannot filter by ${filters.join(', ')}: drafts are all from this mailbox and have no ` +
+      'received date. Drop that filter, or filter by subject.',
+    );
+    this.name = 'UnsupportedDraftsFilterError';
+  }
+}
+
+/** True for the folder names callers use for drafts: Gmail's DRAFT, or DRAFTS. */
+export function isDraftsFolder(folder: string): boolean {
+  const name = folder.trim().toUpperCase();
+  return name === 'DRAFT' || name === 'DRAFTS';
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +268,18 @@ export class NylasClient {
   private readonly nylas: NylasLike;
   private readonly grantId: string;
   private readonly log: Logger;
+  // This client is long-lived and bound to one grant, so the cache is per grant.
+  private folderCache: { folders: NylasFolder[]; expiresAt: number } | undefined;
 
-  constructor(apiKey: string, grantId: string, logger: Logger) {
-    this.nylas = new NylasSDK({ apiKey });
+  /**
+   * `timeoutMs` caps every request this client makes (the SDK default is 90s). The SDK
+   * config takes seconds. Leave it unset for the long-lived channel clients.
+   */
+  constructor(apiKey: string, grantId: string, logger: Logger, timeoutMs?: number) {
+    this.nylas = new NylasSDK({
+      apiKey,
+      ...(timeoutMs === undefined ? {} : { timeout: timeoutMs / 1000 }),
+    });
     this.grantId = grantId;
     this.log = logger.child({ component: 'nylas-client' });
   }
@@ -216,6 +292,27 @@ export class NylasClient {
    * thread (e.g. email-adapter's sendOutboundReply) depend on this guarantee.
    */
   async listMessages(options?: ListMessagesOptions): Promise<NylasMessage[]> {
+    // Gmail rejects `in=DRAFTS` (its label is DRAFT), and `/messages` has no drafts
+    // under either name, so a drafts-only folder filter reads `/drafts` (#2262).
+    const folders = options?.folders;
+    if (folders && folders.length > 0 && folders.every(isDraftsFolder)) {
+      if (options?.searchQueryNative === undefined) {
+        // A filter the drafts query cannot apply is refused: an unfiltered page
+        // returned as the filtered set is worse than an error.
+        const unsupported = (['from', 'receivedAfter', 'fields'] as const).filter((key) => options?.[key] !== undefined);
+        if (unsupported.length > 0) throw new UnsupportedDraftsFilterError(unsupported);
+        return this.listDrafts({
+          limit: options?.limit,
+          threadId: options?.threadId,
+          subject: options?.subject,
+          unread: options?.unread,
+          anyEmail: options?.anyEmail,
+        });
+      }
+      // A native search runs on /messages and drops folders (below), so it never lists drafts.
+      this.log.warn('nylas: listMessages — drafts folder ignored because searchQueryNative is set; this searches messages, not drafts');
+    }
+
     const queryParams: ListMessagesQueryParams = {};
 
     if (options?.limit !== undefined) {
@@ -240,11 +337,12 @@ export class NylasClient {
       if (options.unread !== undefined) suppressed.unread = options.unread;
       if (options.receivedAfter !== undefined) suppressed.receivedAfter = options.receivedAfter;
       if (options.from !== undefined) suppressed.from = options.from;
+      if (options.anyEmail !== undefined) suppressed.anyEmail = options.anyEmail;
       if (options.subject !== undefined) suppressed.subject = options.subject;
       if (Object.keys(suppressed).length > 0) {
         this.log.warn(
           { suppressed },
-          'nylas: listMessages — folders/unread/receivedAfter/from/subject ignored because searchQueryNative is set (Nylas v3 limitation)',
+          'nylas: listMessages — folders/unread/receivedAfter/from/anyEmail/subject ignored because searchQueryNative is set (Nylas v3 limitation)',
         );
       }
       queryParams.searchQueryNative = options.searchQueryNative;
@@ -262,6 +360,9 @@ export class NylasClient {
       if (options?.from !== undefined) {
         // Nylas expects `from` as an array of email strings.
         queryParams.from = [options.from];
+      }
+      if (options?.anyEmail !== undefined) {
+        queryParams.anyEmail = [options.anyEmail];
       }
       if (options?.subject !== undefined) {
         queryParams.subject = options.subject;
@@ -284,21 +385,65 @@ export class NylasClient {
     }
   }
 
+  /** List unsent drafts, newest first (first page only, like listMessages). */
+  async listDrafts(
+    options?: { limit?: number; threadId?: string; subject?: string; unread?: boolean; anyEmail?: string },
+  ): Promise<NylasMessage[]> {
+    const queryParams: ListDraftsQueryParams = {};
+    if (options?.limit !== undefined) queryParams.limit = options.limit;
+    if (options?.threadId !== undefined) queryParams.threadId = options.threadId;
+    if (options?.subject !== undefined) queryParams.subject = options.subject;
+    if (options?.unread !== undefined) queryParams.unread = options.unread;
+    // The drafts query has any_email too, so the address filter carries over (#2268 review).
+    if (options?.anyEmail !== undefined) queryParams.anyEmail = [options.anyEmail];
+
+    try {
+      const response = await this.nylas.drafts.list({ identifier: this.grantId, queryParams });
+      // Draft and Message share BaseMessage, as in createDraft.
+      return response.data.map((draft) => this.normalizeMessage(draft as unknown as NylasSdkMessage));
+    } catch (err) {
+      this.log.error({ err, grantId: this.grantId, queryParams }, 'Nylas listDrafts failed');
+      throw err;
+    }
+  }
+
+  /** Fetch one draft by ID, or null when this mailbox has no such draft. */
+  async getDraft(draftId: string): Promise<NylasMessage | null> {
+    try {
+      const response = await this.nylas.drafts.find({ identifier: this.grantId, draftId });
+      return this.normalizeMessage(response.data as unknown as NylasSdkMessage);
+    } catch (err) {
+      if (nylasStatus(err) === 404) {
+        this.log.debug({ grantId: this.grantId, draftId }, 'Nylas getDraft: no such draft');
+        return null;
+      }
+      this.log.error({ err, grantId: this.grantId, draftId }, 'Nylas getDraft failed');
+      throw err;
+    }
+  }
+
   /**
    * Fetch a single message by its Nylas message ID.
+   * `includeHeaders` asks Nylas for Authentication-Results. The gateway's
+   * getEmailMessage always sets it so a cached fetch still carries them (#2071).
    */
-  async getMessage(messageId: string): Promise<NylasMessage> {
-    this.log.debug({ messageId }, 'fetching message');
+  async getMessage(
+    messageId: string,
+    options?: { includeHeaders?: boolean; budget?: CallBudget },
+  ): Promise<NylasMessage> {
+    this.log.debug({ messageId, includeHeaders: options?.includeHeaders }, 'fetching message');
 
     try {
       const response = await this.nylas.messages.find({
         identifier: this.grantId,
         messageId,
+        ...(options?.includeHeaders ? { queryParams: { fields: 'include_headers' as MessageFields } } : {}),
+        ...this.budgetOverrides(options?.budget, 'getMessage'),
       });
       return this.normalizeMessage(response.data);
     } catch (err) {
       this.log.error({ err, grantId: this.grantId, messageId }, 'Nylas getMessage failed');
-      throw err;
+      throw markMessageRequestError(err);
     }
   }
 
@@ -346,7 +491,7 @@ export class NylasClient {
    * Draft and Message share the same BaseMessage shape in the Nylas SDK, so the
    * response can be normalised with the same helper as a sent message.
    *
-   * Drafts are created silently — no per-draft notification is sent. The CEO discovers
+   * Drafts are created silently — no per-draft notification is sent. The principal discovers
    * pending drafts via the end-of-day Signal digest and reviews them in Gmail (#403, #278).
    */
   async createDraft(options: SendEmailOptions): Promise<NylasMessage> {
@@ -392,7 +537,7 @@ export class NylasClient {
    *   2. Removes the draft from the DRAFTS folder
    *   3. Honours any `replyToMessageId` embedded in the draft for correct threading
    *
-   * Used by the send-draft skill when the CEO authorizes sending an existing draft.
+   * Used by the send-draft skill when the principal authorizes sending an existing draft.
    */
   async sendDraft(draftId: string): Promise<NylasMessage> {
     this.log.debug({ draftId }, 'sending draft');
@@ -410,6 +555,23 @@ export class NylasClient {
   }
 
   /**
+   * Delete a mailbox draft. A 404 is success: the draft is already gone, so a
+   * discarded approval cannot send it. Any other failure is rethrown.
+   */
+  async deleteDraft(draftId: string): Promise<void> {
+    try {
+      await this.nylas.drafts.destroy({ identifier: this.grantId, draftId });
+    } catch (err) {
+      if (nylasStatus(err) === 404) {
+        this.log.info({ draftId }, 'Nylas deleteDraft: draft already gone');
+        return;
+      }
+      this.log.error({ err, grantId: this.grantId, draftId }, 'Nylas deleteDraft failed');
+      throw err;
+    }
+  }
+
+  /**
    * Archive a message by removing it from the INBOX folder.
    *
    * For Gmail (via Nylas), removing INBOX moves the message to "All Mail" —
@@ -420,7 +582,7 @@ export class NylasClient {
    * preserves non-INBOX labels (STARRED, IMPORTANT, custom labels) that
    * would be lost if we blindly set folders: [].
    */
-  async archiveMessage(messageId: string): Promise<void> {
+  async archiveMessage(messageId: string, budget?: CallBudget): Promise<void> {
     this.log.debug({ messageId }, 'archiving message');
 
     // Split into two try blocks so log messages accurately identify which API call failed.
@@ -429,7 +591,7 @@ export class NylasClient {
     let currentFolders: string[];
     let hadInbox: boolean;
     try {
-      const current = await this.getMessage(messageId);
+      const current = await this.getMessage(messageId, { budget });
       // Filter by uppercase so we catch 'inbox', 'Inbox', 'INBOX' consistently
       currentFolders = current.folders.filter((f) => f.toUpperCase() !== 'INBOX');
       // True if the filter actually removed something — avoids a no-op API call
@@ -449,18 +611,19 @@ export class NylasClient {
         identifier: this.grantId,
         messageId,
         requestBody: { folders: currentFolders },
+        ...this.budgetOverrides(budget, 'archiveMessage'),
       });
       this.log.info({ messageId, updatedFolders: currentFolders }, 'message archived successfully');
     } catch (err) {
       this.log.error({ err, grantId: this.grantId, messageId }, 'Nylas messages.update failed during archive');
-      throw err;
+      throw markMessageRequestError(err);
     }
   }
 
   /**
    * Mark a message as read by setting its unread flag to false.
    */
-  async markAsRead(messageId: string): Promise<void> {
+  async markAsRead(messageId: string, budget?: CallBudget): Promise<void> {
     this.log.debug({ messageId }, 'marking message as read');
 
     try {
@@ -468,43 +631,74 @@ export class NylasClient {
         identifier: this.grantId,
         messageId,
         requestBody: { unread: false },
+        ...this.budgetOverrides(budget, 'markAsRead'),
       });
       this.log.info({ messageId }, 'message marked as read');
     } catch (err) {
       this.log.error({ err, grantId: this.grantId, messageId }, 'Nylas markAsRead failed');
-      throw err;
+      throw markMessageRequestError(err);
     }
   }
 
   /**
    * List all folders/labels in the email account.
    * For Gmail, this returns both system folders (INBOX, SENT, etc.) and user-created labels.
+   *
+   * Follows `next_cursor` to the last page: a label past page 1 used to be
+   * missed, and email-label then created a duplicate (#2083). Cached for
+   * FOLDER_CACHE_TTL_MS; returns a copy so a caller cannot edit the cache.
    */
-  async listFolders(): Promise<NylasFolder[]> {
+  async listFolders(budget?: CallBudget): Promise<NylasFolder[]> {
+    if (this.folderCache && this.folderCache.expiresAt > Date.now()) {
+      return [...this.folderCache.folders];
+    }
     this.log.debug('listing folders');
 
+    const folders: NylasFolder[] = [];
+    let pageToken: string | undefined;
     try {
-      const response = await this.nylas.folders.list({
-        identifier: this.grantId,
-      });
-      return response.data.map((f) => ({ id: f.id, name: f.name }));
+      for (;;) {
+        const response = await this.nylas.folders.list({
+          identifier: this.grantId,
+          ...(pageToken ? { queryParams: { pageToken } } : {}),
+          ...this.budgetOverrides(budget, 'listFolders'),
+        });
+        folders.push(...response.data.map((f) => ({
+          id: f.id,
+          name: f.name,
+          ...(f.attributes?.length ? { attributes: f.attributes } : {}),
+        })));
+
+        // An empty page with a cursor would otherwise spin forever.
+        if (response.data.length === 0 || !response.nextCursor) break;
+        if (folders.length >= FOLDER_SCAN_LIMIT) {
+          this.log.warn({ cap: FOLDER_SCAN_LIMIT }, 'nylas: listFolders hit the scan cap with more pages remaining');
+          break;
+        }
+        pageToken = response.nextCursor;
+      }
     } catch (err) {
       this.log.error({ err, grantId: this.grantId }, 'Nylas listFolders failed');
       throw err;
     }
+
+    this.folderCache = { folders, expiresAt: Date.now() + FOLDER_CACHE_TTL_MS };
+    return [...folders];
   }
 
   /**
    * Create a new folder/label. For Gmail, this creates a user label.
    */
-  async createFolder(name: string): Promise<NylasFolder> {
+  async createFolder(name: string, budget?: CallBudget): Promise<NylasFolder> {
     this.log.debug({ name }, 'creating folder');
 
     try {
       const response = await this.nylas.folders.create({
         identifier: this.grantId,
         requestBody: { name },
+        ...this.budgetOverrides(budget, 'createFolder'),
       });
+      this.folderCache = undefined;
       this.log.info({ folderId: response.data.id, name }, 'folder created');
       return { id: response.data.id, name: response.data.name };
     } catch (err) {
@@ -520,7 +714,7 @@ export class NylasClient {
    * existing folders they want to keep. See OutboundGateway.labelEmailMessage()
    * for the higher-level label-resolution-and-merge workflow.
    */
-  async updateMessageFolders(messageId: string, folders: string[]): Promise<NylasMessage> {
+  async updateMessageFolders(messageId: string, folders: string[], budget?: CallBudget): Promise<NylasMessage> {
     this.log.debug({ messageId, folders }, 'updating message folders');
 
     try {
@@ -528,18 +722,37 @@ export class NylasClient {
         identifier: this.grantId,
         messageId,
         requestBody: { folders },
+        ...this.budgetOverrides(budget, 'updateMessageFolders'),
       });
       this.log.info({ messageId, folders }, 'message folders updated');
       return this.normalizeMessage(response.data);
     } catch (err) {
       this.log.error({ err, grantId: this.grantId, messageId }, 'Nylas updateMessageFolders failed');
-      throw err;
+      throw markMessageRequestError(err);
     }
   }
 
   // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * SDK request options for a call made inside a tool call's budget (#2083).
+   *
+   * Throws once the budget is spent, so a timed-out tool call sends no further
+   * request. Otherwise caps the SDK's own request timeout at the time left, which
+   * aborts the request when the tool call times out (SDK 8.4 takes no external
+   * AbortSignal). The SDK reads a timeout of 1000 or more as milliseconds and a
+   * smaller one as seconds, so a sub-second remainder is passed in seconds.
+   */
+  private budgetOverrides(budget: CallBudget | undefined, operation: string): RequestOverrides {
+    if (budgetExpired(budget)) {
+      throw new Error(`Nylas ${operation}: cancelled because the tool call timed out`);
+    }
+    const leftMs = remainingMs(budget);
+    if (!Number.isFinite(leftMs)) return {};
+    return { overrides: { timeout: leftMs >= 1000 ? leftMs : leftMs / 1000 } };
+  }
 
   /**
    * Convert the SDK's Message type (with many optional fields) into our
@@ -580,6 +793,7 @@ export class NylasClient {
             filename: a.filename ?? 'unnamed',
             contentType: a.contentType ?? 'application/octet-stream',
             size: a.size ?? 0,
+            ...(isCalendarInviteAttachment(a.filename, a.contentType) ? { isCalendarInvite: true } : {}),
           }));
         if (allAttachments.length > attachments.length) {
           this.log.debug(
@@ -611,4 +825,13 @@ export class NylasClient {
       throw err;
     }
   }
+}
+
+function isCalendarInviteAttachment(filename: string | undefined, contentType: string | undefined): boolean {
+  const lowerType = (contentType?.split(';', 1)[0] ?? '').trim().toLowerCase();
+  const lowerName = filename?.toLowerCase() ?? '';
+  return lowerType === 'text/calendar' ||
+    lowerType === 'application/ics' ||
+    lowerType === 'text/x-vcalendar' ||
+    lowerName.endsWith('.ics');
 }

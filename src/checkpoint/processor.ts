@@ -3,11 +3,19 @@ import type { ExecutionLayer } from '../skills/execution.js';
 import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 import type { ConversationCheckpointEvent } from '../bus/events.js';
-import type { SkillResult } from '../skills/types.js';
+import { createCheckpointExtractionSkipped } from '../bus/events.js';
+import type { ToolResult } from '../skills/types.js';
+import type { ChannelPolicyConfig } from '../contacts/types.js';
+import type { VerificationRuntime } from '../verification/index.js';
+import {
+  loadFirstExternalOriginator,
+  resolveChannelTrust,
+  shouldSkipCheckpointKgExtraction,
+} from './trust-gate.js';
 
 // Skills invoked at every checkpoint, in addition to any future skills.
 // Add new checkpoint skills here — no changes to Dispatch or the runtime required.
-const CHECKPOINT_SKILLS: Array<{ name: string }> = [
+const CHECKPOINT_TOOLS: Array<{ name: string }> = [
   { name: 'extract-relationships' },
   { name: 'extract-facts' },
 ];
@@ -18,6 +26,10 @@ export class ConversationCheckpointProcessor {
     private executionLayer: ExecutionLayer,
     private pool: DbPool,
     private logger: Logger,
+    private channelPolicies?: Record<string, ChannelPolicyConfig>,
+    // Delegated sign-in verification (#2017): tracked codes are scrubbed from the
+    // transcript before extraction. Unset (tests) leaves the transcript as is.
+    private verification?: VerificationRuntime,
   ) {}
 
   register(): void {
@@ -31,9 +43,54 @@ export class ConversationCheckpointProcessor {
 
     if (turns.length === 0) return;
 
-    const transcript = turns
+    const channelTrust = resolveChannelTrust(channelId, this.channelPolicies);
+    // One audit read serves two consumers: the trust gate needs the tier, and
+    // extract-facts needs the contact id as a subject tiebreaker (#1694).
+    const firstExternal = await loadFirstExternalOriginator(this.pool, conversationId);
+    const firstExternalTier = firstExternal === 'none' ? 'none' : firstExternal.tier;
+    const skipKgExtraction = shouldSkipCheckpointKgExtraction(channelTrust, firstExternalTier);
+
+    if (skipKgExtraction) {
+      const toolNames = CHECKPOINT_TOOLS.map(s => s.name);
+      this.logger.info(
+        {
+          conversationId,
+          agentId,
+          channelId,
+          channelTrust,
+          firstExternalTier: firstExternalTier === 'none' ? null : firstExternalTier,
+          skills: toolNames,
+        },
+        'Checkpoint KG extraction skipped — untrusted external originator on low-trust channel (#1290)',
+      );
+      try {
+        await this.bus.publish(
+          'system',
+          createCheckpointExtractionSkipped({
+            conversationId,
+            agentId,
+            channelId,
+            channelTrust,
+            firstExternalTier: firstExternalTier === 'none' ? null : firstExternalTier,
+            skills: toolNames,
+            reason: 'untrusted_sender',
+          }),
+        );
+      } catch (err) {
+        this.logger.error(
+          { err, conversationId, agentId },
+          'Failed to publish checkpoint.extraction_skipped audit event — watermark will still advance',
+        );
+      }
+      await this.advanceWatermark(event, conversationId, agentId, turns.length);
+      return;
+    }
+
+    const rawTranscript = turns
       .map(t => `${t.role === 'user' ? 'User' : 'Curia'}: ${t.content}`)
       .join('\n\n');
+    // A sign-in code must not become a fact or relationship (#2017).
+    const transcript = this.verification ? this.verification.tracker.scrubText(rawTranscript) : rawTranscript;
 
     const source = `system:checkpoint/conversation:${conversationId}/agent:${agentId}/channel:${channelId}`;
 
@@ -49,30 +106,56 @@ export class ConversationCheckpointProcessor {
     // others or prevent the watermark from advancing — hence Promise.allSettled.
     // Check both rejected promises (thrown errors) and resolved { success: false }
     // results — ExecutionLayer never throws, so the latter is the normal failure path.
+    // The conversation's external counterpart, passed to extract-facts so an ambiguous
+    // subject name ("Seth Berman", when two contacts share it) can be resolved to this
+    // contact's own node instead of being dropped. It is a tiebreaker, not an assertion
+    // that every fact in the transcript is about them — extract-facts only applies it
+    // when one of the ambiguous candidates IS this contact's node (#1694 / ADR-040).
+    // Undefined for principal/system/agent-originated conversations, which have no
+    // external counterpart to disambiguate against.
+    const subjectContactId = firstExternal === 'none' ? undefined : firstExternal.contactId ?? undefined;
+
     const results = await Promise.allSettled(
-      CHECKPOINT_SKILLS.map(skill =>
-        this.executionLayer.invoke(skill.name, { text: transcript, source }, callerContext),
+      CHECKPOINT_TOOLS.map(skill =>
+        this.executionLayer.invoke(
+          skill.name,
+          // Only extract-facts accepts the hint; extract-relationships has no single
+          // subject to disambiguate, so it keeps the original input shape.
+          skill.name === 'extract-facts' && subjectContactId !== undefined
+            ? { text: transcript, source, subject_contact_id: subjectContactId }
+            : { text: transcript, source },
+          callerContext,
+        ),
       ),
     );
 
     results.forEach((result, index) => {
-      const skillName = CHECKPOINT_SKILLS[index]!.name;
+      const toolName = CHECKPOINT_TOOLS[index]!.name;
       if (result.status === 'rejected') {
         this.logger.error(
-          { err: result.reason as Error, skill: skillName, conversationId },
+          { err: result.reason as Error, skill: toolName, conversationId },
           'checkpoint skill threw unexpectedly — watermark will still advance',
         );
         return;
       }
-      const skillResult = result.value as SkillResult;
+      const skillResult = result.value as ToolResult;
       if (!skillResult.success) {
         this.logger.error(
-          { skill: skillName, conversationId, error: skillResult.error },
+          { skill: toolName, conversationId, error: skillResult.error },
           'checkpoint skill returned failure — watermark will still advance',
         );
       }
     });
 
+    await this.advanceWatermark(event, conversationId, agentId, turns.length);
+  }
+
+  private async advanceWatermark(
+    event: ConversationCheckpointEvent,
+    conversationId: string,
+    agentId: string,
+    turnCount: number,
+  ): Promise<void> {
     // Advance the watermark to the batch's upper-bound timestamp (not now()).
     // Using now() would advance the watermark past any turns that arrived between
     // the Dispatcher's DB read and this upsert, causing those turns to be silently
@@ -100,7 +183,7 @@ export class ConversationCheckpointProcessor {
     }
 
     this.logger.info(
-      { conversationId, agentId, turnCount: turns.length },
+      { conversationId, agentId, turnCount },
       'Conversation checkpoint complete',
     );
   }

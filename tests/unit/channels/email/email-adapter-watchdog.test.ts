@@ -42,9 +42,10 @@ function makeAdapterConfig(
     contactService: makeContactService(),
     pollingIntervalMs: 100,
     selfEmail: 'curia@example.com',
-    excludedSenderEmails: [],
+    suppressedSenderEmails: [],
     contactCreationMaxPerMessage: 10,
     contactCreationMaxPerHour: 100,
+    maxConcurrentTurns: 4,
     timezone: 'UTC',
     // no configStore — watermark persistence not under test here
   };

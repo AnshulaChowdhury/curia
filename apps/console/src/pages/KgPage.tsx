@@ -1,260 +1,52 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useSearch } from '@tanstack/react-router';
-import cytoscape from 'cytoscape';
-import fcose from 'cytoscape-fcose';
+import { Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, applyNodeChanges, useReactFlow } from '@xyflow/react';
+import type { FitViewOptions, NodeChange, NodeMouseHandler, OnNodeDrag } from '@xyflow/react';
+import '@xyflow/react/dist/base.css';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
 import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
+import { AnimatedMoonrayMark } from '../components/Icons.js';
 import { useTheme } from '../hooks/useTheme.js';
+import {
+  emptyFilter, filterOptions, isFilterActive, matchesFilter, normalizeSensitivity, toggleFilterValue,
+} from './kg-filters.js';
+import type { KgFilter, KgFilterAxis, KgFilterable } from './kg-filters.js';
+import { TYPE_BADGE, SENS_BADGE } from './kg-types.js';
+import type { ApiKgNode } from './kg-types.js';
+import { MergeNodesDialog } from './MergeNodesDialog.js';
+import type { NodeMergeResult } from './kg-merge-types.js';
+import {
+  applyMergeToNodeList, mergeAvailability, mergedIntoFrom, mergedIntoNotice, mergeResultNotes, mergeSuccessMessage,
+} from './kg-merge-utils.js';
+import {
+  addToModel, applyPositions, buildFlow, closedNeighborhood, drawerNode, emptyFlowCache, emptyModel, facets,
+  graphStatus, layoutRequest, liveEdges, modelFrom, removeNode, swatchClass,
+} from './kg-graph-model.js';
+import type { ApiKgEdge, ColorMode, KgFlowEdge, KgFlowNode } from './kg-graph-model.js';
+import { KG_EDGE_TYPES, KG_NODE_TYPES, ZoomLevelClass } from './kg-graph-view.js';
+import { createLayoutClient } from './kg-layout-client.js';
+import type { LayoutClient } from './kg-layout-client.js';
 
-// Register fcose layout plugin once at module scope.
-cytoscape.use(fcose);
+// The graph is drawn with xyflow; layout runs in a Web Worker (ADR-058).
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface ApiKgNode {
-  id: string;
-  label: string;
-  type: string;
-  confidence: number;
-  decayClass: string;
-  sensitivity: string;
-  properties: Record<string, unknown>;
-  source: string;
-  createdAt: string;
-  lastConfirmedAt: string;
+/** The page banner after a merge or a merged-node redirect. */
+interface KgBanner {
+  text: string;
+  /** Follow-up notes (post-commit merge warnings); the banner turns amber when present. */
+  notes?: string[];
 }
 
-interface ApiKgEdge {
-  id: string;
-  sourceNodeId: string;
-  targetNodeId: string;
-  type: string;
-  confidence: number;
-}
+/** A single click waits this long so a double-click (zoom to the node) does not also expand it. */
+const DOUBLE_CLICK_MS = 250;
 
-type ColorMode = 'type' | 'sensitivity' | 'decay';
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const SENS_COLORS: Record<string, string> = {
-  public:       '#5E9E6B',
-  internal:     '#4174C8',
-  confidential: '#C9874A',
-  restricted:   '#E86040',
-};
-
-const DECAY_COLORS: Record<string, string> = {
-  permanent:  '#5E9E6B',
-  slow_decay: '#4174C8',
-  fast_decay: '#E86040',
-};
-
-// Badge CSS classes for node type in the detail drawer.
-const TYPE_BADGE: Record<string, string> = {
-  person:       'badge badge-kg-person',
-  organization: 'badge badge-kg-organization',
-  project:      'badge badge-kg-project',
-  decision:     'badge badge-kg-decision',
-  event:        'badge badge-kg-event',
-  concept:      'badge badge-kg-concept',
-  fact:         'badge badge-kg-fact',
-};
-
-// Badge CSS classes for sensitivity level in the detail drawer.
-const SENS_BADGE: Record<string, string> = {
-  public:       'badge badge-kg-public',
-  internal:     'badge badge-kg-internal',
-  confidential: 'badge badge-kg-confidential',
-  restricted:   'badge badge-kg-restricted',
-};
-
-// Edge types that represent close structural relationships — their pairs should
-// sit visually adjacent in the layout.
-const STRONG_EDGES = new Set([
-  'spouse', 'parent', 'child', 'sibling',
-  'reports_to', 'manages', 'member_of', 'founded', 'invested_in', 'advises',
-]);
-
-// Weighting factors for edge elasticity based on how quickly connected nodes
-// go stale. Permanent facts create tight springs; fast-decaying info goes soft.
-const DECAY_SCORE: Record<string, number> = {
-  permanent:  1.0,
-  slow_decay: 0.7,
-  fast_decay: 0.4,
-};
-
-// ── fCoSE physics callbacks ───────────────────────────────────────────────────
-
-// Fact nodes are children of entities; low repulsion keeps them clustered
-// nearby. High-traffic entity types need more space to avoid crowding.
-function nodeRepulsionFn(node: cytoscape.NodeSingular): number {
-  const type = node.data('type') as string;
-  if (type === 'fact') return 1_000;
-  if (type === 'person' || type === 'organization' || type === 'event') return 7_500;
-  return 4_500; // project, decision, concept — fCoSE default
-}
-
-// Fact edges stay short so attributes cluster against their parent entity.
-// Strong relationship pairs sit visually adjacent; generic edges settle at 80px.
-function idealEdgeLengthFn(edge: cytoscape.EdgeSingular): number {
-  const srcType = edge.source().data('type') as string;
-  const tgtType = edge.target().data('type') as string;
-  if (srcType === 'fact' || tgtType === 'fact') return 40;
-  if (STRONG_EDGES.has(edge.data('label') as string)) return 60;
-  return 80;
-}
-
-// Strong relationships attract hard (0.9). For others: weight by confidence
-// and the weaker decay score of the two endpoints — stale or uncertain edges
-// produce soft springs so those nodes drift outward naturally.
-function edgeElasticityFn(edge: cytoscape.EdgeSingular): number {
-  if (STRONG_EDGES.has(edge.data('label') as string)) return 0.9;
-  const conf = (edge.data('confidence') as number | undefined | null) ?? 0.5;
-  const srcScore = DECAY_SCORE[edge.source().data('decayClass') as string] ?? 0.7;
-  const tgtScore = DECAY_SCORE[edge.target().data('decayClass') as string] ?? 0.7;
-  return Math.max(0.1, conf * Math.min(srcScore, tgtScore) * 0.7);
-}
-
-// fcose layout options per the issue spec.
-const FCOSE_FULL = {
-  name: 'fcose',
-  animate: false,
-  fit: true,
-  nodeSeparation: 80,
-  randomize: true,
-  idealEdgeLength: idealEdgeLengthFn,
-  nodeRepulsion: nodeRepulsionFn,
-  edgeElasticity: edgeElasticityFn,
-};
-
-const FCOSE_EXPAND = {
-  name: 'fcose',
-  animate: true,
-  fit: false,
-  nodeSeparation: 80,
-  randomize: false,
-  animationDuration: 400,
-  idealEdgeLength: idealEdgeLengthFn,
-  nodeRepulsion: nodeRepulsionFn,
-  edgeElasticity: edgeElasticityFn,
-};
-
-// Cytoscape's TS types don't model mapData() string expressions (the library
-// supports them at runtime but types them as numbers). Cast to satisfy the compiler.
-const CY_STYLE = [
-  {
-    selector: 'node',
-    style: {
-      label: 'data(label)',
-      'background-color': '#4174C8',
-      color: '#FAFAFA',
-      'text-valign': 'bottom',
-      'text-halign': 'center',
-      'text-margin-y': 5,
-      'text-outline-color': '#111827',
-      'text-outline-width': 2,
-      'text-wrap': 'ellipsis',
-      'text-max-width': '90px',
-      'font-size': 10,
-      'font-family': 'Manrope, system-ui, sans-serif',
-      // Degree-based size: updated by updateDegrees() after every cy.add().
-      // Wider range than before so hub nodes stand out more dramatically.
-      width: 'mapData(degree, 0, 15, 20, 80)',
-      height: 'mapData(degree, 0, 15, 20, 80)',
-      // Confidence-based opacity.
-      opacity: 'mapData(confidence, 0, 1, 0.15, 1.0)',
-    },
-  },
-  // Type colour overrides.
-  { selector: 'node[type="person"]',       style: { 'background-color': '#478189' } },
-  { selector: 'node[type="organization"]', style: { 'background-color': '#6BAED6' } },
-  { selector: 'node[type="project"]',      style: { 'background-color': '#7E6BA8' } },
-  { selector: 'node[type="decision"]',     style: { 'background-color': '#C9874A' } },
-  { selector: 'node[type="event"]',        style: { 'background-color': '#5E9E6B' } },
-  { selector: 'node[type="concept"]',      style: { 'background-color': '#888888' } },
-  // Facts are decorations, not hubs — fixed small size regardless of degree.
-  { selector: 'node[type="fact"]',         style: { 'background-color': '#444444', width: 10, height: 10 } },
-  // Facts: hide label at default size; reveal on select.
-  { selector: 'node[type="fact"]',         style: { 'font-size': 0 } },
-  { selector: 'node[type="fact"]:selected', style: { 'font-size': 9 } },
-  // Focal node: white border on the most recently tapped node.
-  { selector: 'node.focal', style: { 'border-width': 3, 'border-color': '#FAFAFA', 'border-opacity': 0.9 } },
-  {
-    selector: 'edge',
-    style: {
-      width: 'mapData(confidence, 0, 1, 1, 3.5)',
-      opacity: 'mapData(confidence, 0, 1, 0.15, 0.7)',
-      'line-color': 'rgba(255,255,255,0.6)',
-      'curve-style': 'bezier',
-      'target-arrow-shape': 'triangle',
-      'target-arrow-color': 'rgba(255,255,255,0.6)',
-      label: 'data(label)',
-      'font-size': 8,
-      'font-family': 'Manrope, system-ui, sans-serif',
-      color: '#ADADAD',
-      'text-outline-color': '#111827',
-      'text-outline-width': 1,
-    },
-  },
-];
+/** Automatic fits stop here, so a small graph is not blown up to fill the canvas. */
+const FIT_MAX_ZOOM = 1.25;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function nodeToElement(n: ApiKgNode): cytoscape.ElementDefinition {
-  return {
-    data: {
-      id: n.id,
-      label: n.label,
-      type: n.type,
-      confidence: n.confidence ?? 0.5,
-      decayClass: n.decayClass || 'permanent',
-      sensitivity: n.sensitivity || 'internal',
-      properties: n.properties ?? {},
-      source: n.source ?? '',
-      createdAt: n.createdAt ?? '',
-      lastConfirmedAt: n.lastConfirmedAt ?? '',
-      degree: 0, // updated by updateDegrees()
-    },
-  };
-}
-
-function edgeToElement(e: ApiKgEdge): cytoscape.ElementDefinition {
-  return {
-    data: {
-      id: e.id,
-      source: e.sourceNodeId,
-      target: e.targetNodeId,
-      label: e.type,
-      confidence: e.confidence ?? 0.5,
-    },
-  };
-}
-
-// Recalculate edge-count per node and store as data so the stylesheet
-// mapData(degree, ...) rule can size nodes correctly. Must run after every cy.add().
-function updateDegrees(cy: cytoscape.Core) {
-  cy.nodes().forEach(node => { node.data('degree', node.degree()); });
-}
-
-// Apply a colour-mode override to all nodes. In 'type' mode, removes any
-// element-level style overrides so the stylesheet selectors take effect again.
-function applyColorMode(cy: cytoscape.Core, mode: ColorMode) {
-  if (mode === 'sensitivity') {
-    cy.nodes().forEach(node => {
-      const color = SENS_COLORS[node.data('sensitivity') as string] ?? '#888888';
-      node.style('background-color', color);
-    });
-  } else if (mode === 'decay') {
-    cy.nodes().forEach(node => {
-      const color = DECAY_COLORS[node.data('decayClass') as string] ?? '#888888';
-      node.style('background-color', color);
-    });
-  } else {
-    cy.nodes().removeStyle('background-color');
-  }
-}
 
 async function errorMessage(res: Response): Promise<string> {
   const ct = res.headers.get('content-type') ?? '';
@@ -269,6 +61,28 @@ async function errorMessage(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
+// A /api/kg/graph 404 body: the message to show, and the survivor when the node
+// was merged away (`code: 'node_merged'`, design §10.4).
+async function notFoundInfo(res: Response): Promise<{ message: string; merged: ReturnType<typeof mergedIntoFrom> }> {
+  const ct = res.headers.get('content-type') ?? '';
+  if (ct.includes('application/json')) {
+    try {
+      const d = await res.json() as { error?: unknown };
+      return {
+        message: typeof d.error === 'string' && d.error ? d.error : `HTTP ${res.status}`,
+        merged: mergedIntoFrom(d),
+      };
+    } catch (err) {
+      console.error('[notFoundInfo] failed to parse JSON error body:', err);
+    }
+  }
+  return { message: `HTTP ${res.status}`, merged: null };
+}
+
+// How many merged-into redirects a single load follows before giving up — a
+// guard against a (corrupt) merged_into cycle.
+const MAX_MERGE_REDIRECTS = 3;
+
 function fmtDate(iso: string): string {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -281,12 +95,14 @@ function fmtDate(iso: string): string {
 interface NodeDetailDrawerProps {
   node: ApiKgNode;
   onClose: () => void;
+  onMerge: () => void;
 }
 
-function NodeDetailDrawer({ node, onClose }: NodeDetailDrawerProps) {
+function NodeDetailDrawer({ node, onClose, onMerge }: NodeDetailDrawerProps) {
   const typeBadgeClass = TYPE_BADGE[node.type] ?? 'badge badge-kg-fact';
   const sensBadgeClass = SENS_BADGE[node.sensitivity] ?? 'badge badge-kg-internal';
   const propEntries = Object.entries(node.properties ?? {});
+  const merge = mergeAvailability(node);
 
   return (
     <div className="kg-detail-drawer">
@@ -358,6 +174,19 @@ function NodeDetailDrawer({ node, onClose }: NodeDetailDrawerProps) {
           </div>
         )}
       </div>
+
+      {merge.visible && (
+        <div className="drawer-footer">
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={onMerge}
+            disabled={merge.disabled}
+            title={merge.reason ?? 'Merge this node with a duplicate'}
+          >
+            Merge…
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -365,9 +194,19 @@ function NodeDetailDrawer({ node, onClose }: NodeDetailDrawerProps) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function KgPage() {
+  // useReactFlow (fitView) needs the provider above the component that calls it.
+  return (
+    <ReactFlowProvider>
+      <KgPageInner />
+    </ReactFlowProvider>
+  );
+}
+
+function KgPageInner() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const navigate = useNavigate();
+  const { fitView } = useReactFlow<KgFlowNode, KgFlowEdge>();
 
   // Read initial search params — used to restore state on refresh/back-nav.
   const { q: initialQ, node: initialNode } = useSearch({ strict: false }) as {
@@ -375,24 +214,46 @@ export default function KgPage() {
     node?: string;
   };
 
-  // Graph canvas
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const cyRef = useRef<cytoscape.Core | null>(null);
+  // Graph canvas. The model is what is on the canvas; rfNodes/rfEdges are rebuilt from it
+  // whenever it (graphVersion) or how it is shown (colour, filter, focal, selection) changes.
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const modelRef = useRef(emptyModel());
+  const flowCacheRef = useRef(emptyFlowCache());
+  const [graphVersion, setGraphVersion] = useState(0);
+  const [rfNodes, setRfNodes] = useState<KgFlowNode[]>([]);
+  const [rfEdges, setRfEdges] = useState<KgFlowEdge[]>([]);
+  const [focalId, setFocalId] = useState<string | null>(null);
+  // Layout: one request per render/expansion; a newer request makes older answers stale.
+  const layoutRef = useRef<LayoutClient | null>(null);
+  const layoutSeqRef = useRef(0);
+  // Viewport fit to apply once the nodes from the latest layout are on the canvas.
+  const pendingFitRef = useRef<FitViewOptions<KgFlowNode> | null>(null);
+  const tapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Moonray loader while the canvas waits on the server or the layout. Each wait gets a
+  // sequence number so an older one finishing late does not hide a newer one's loader.
+  const busySeqRef = useRef(0);
+  const [busy, setBusy] = useState<{ seq: number; kind: 'load' | 'expand' } | null>(null);
+  const [sidebarLoading, setSidebarLoading] = useState(false);
 
   // UI state
   const [sidebarNodes, setSidebarNodes] = useState<ApiKgNode[]>([]);
   const [search, setSearch] = useState(initialQ ?? '');
   const [selectedNode, setSelectedNode] = useState<ApiKgNode | null>(null);
   const [colorMode, setColorMode] = useState<ColorMode>('type');
+  const [filter, setFilter] = useState<KgFilter>(emptyFilter);
+  // type/sensitivity of every node on the canvas — feeds the filter checklists.
+  const [canvasFacets, setCanvasFacets] = useState<KgFilterable[]>([]);
   const [status, setStatus] = useState('');
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Node merge (#2233): the node the dialog was opened from, and the page banner
+  // shown after a merge or a merged-node redirect.
+  const [mergeFrom, setMergeFrom] = useState<ApiKgNode | null>(null);
+  const [banner, setBanner] = useState<KgBanner | null>(null);
 
-  // Track color mode in a ref so the cytoscape event handlers can read the
-  // latest value without capturing a stale closure.
-  const colorModeRef = useRef<ColorMode>('type');
+  // The filter in a ref so async loads apply the current filter to the status line.
+  const filterRef = useRef<KgFilter>(emptyFilter());
 
-  // Mirror search state in a ref so the single-mount Cytoscape tap handler
-  // can always read the current value without a stale closure.
+  // Mirror search state in a ref so async handlers read the current value.
   const searchRef = useRef(initialQ ?? '');
 
   // Aborts the previous neighborhood fetch when a new one starts, preventing
@@ -402,6 +263,38 @@ export default function KgPage() {
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
   }, [mobileOpen]);
+
+  // Layout worker for the page's lifetime; in-flight work is dropped on unmount.
+  useEffect(() => {
+    const client = createLayoutClient();
+    layoutRef.current = client;
+    return () => {
+      client.dispose();
+      layoutRef.current = null;
+      neighborhoodAbortRef.current?.abort();
+      if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
+    };
+  }, []);
+
+  // Rebuild what xyflow draws. Unchanged nodes keep their object (flow cache), so their
+  // memoised components skip re-rendering.
+  const selectedId = selectedNode?.id ?? null;
+  useEffect(() => {
+    const { nodes, edges } = buildFlow(
+      modelRef.current, { colorMode, filter, focalId, selectedId }, flowCacheRef.current,
+    );
+    setRfNodes(nodes);
+    setRfEdges(edges);
+  }, [graphVersion, colorMode, filter, focalId, selectedId]);
+
+  // Apply a queued viewport fit once the new nodes are drawn (xyflow queues the fit
+  // itself until they are measured).
+  useEffect(() => {
+    const fit = pendingFitRef.current;
+    if (!fit) return;
+    pendingFitRef.current = null;
+    void fitView(fit);
+  }, [rfNodes, fitView]);
 
   // Sync URL search params on search/node changes.
   function syncUrl(q: string, nodeId: string | undefined) {
@@ -414,10 +307,43 @@ export default function KgPage() {
     });
   }
 
+  /** Shows the loader; call the returned function when the wait is over. */
+  function beginBusy(kind: 'load' | 'expand'): () => void {
+    const seq = ++busySeqRef.current;
+    setBusy({ seq, kind });
+    return () => setBusy(b => (b && b.seq === seq ? null : b));
+  }
+
+  function syncFacets() {
+    setCanvasFacets(facets(modelRef.current));
+  }
+
+  /**
+   * Lays out the model and redraws. Resolves false when a newer layout superseded this one
+   * or the layout failed (the status line says so); the model itself is kept either way.
+   */
+  async function runLayout(mode: 'full' | 'expand', opts: { anchorId?: string; fit?: () => FitViewOptions<KgFlowNode> } = {}): Promise<boolean> {
+    const client = layoutRef.current;
+    if (!client) return false;
+    const seq = ++layoutSeqRef.current;
+    const res = await client.run(layoutRequest(modelRef.current, seq, mode, opts.anchorId));
+    if (seq !== layoutSeqRef.current) return false;
+    if (!res.ok) {
+      console.error('[KgPage] layout failed:', res.error);
+      setStatus(`Layout failed: ${res.error}`);
+      return false;
+    }
+    applyPositions(modelRef.current, res.positions);
+    if (opts.fit) pendingFitRef.current = opts.fit();
+    setGraphVersion(v => v + 1);
+    return true;
+  }
+
   // ── Sidebar node search ────────────────────────────────────────────────────
 
   const loadSidebarNodes = useCallback(async (q: string) => {
     setLoadError(null);
+    setSidebarLoading(true);
     try {
       const url = q
         ? `/api/kg/nodes?query=${encodeURIComponent(q)}&limit=100`
@@ -429,178 +355,245 @@ export default function KgPage() {
     } catch (err) {
       console.error('[KgPage] sidebar load failed:', err);
       setLoadError(err instanceof Error ? err.message : 'Failed to load nodes');
-    }
-  }, []);
-
-  // ── Hero graph (default view when canvas is empty) ─────────────────────────
-
-  const loadHeroGraph = useCallback(async () => {
-    const cy = cyRef.current;
-    if (!cy || cy.elements().length > 0) return;
-    neighborhoodAbortRef.current?.abort();
-    const controller = new AbortController();
-    neighborhoodAbortRef.current = controller;
-    setStatus('Loading…');
-    try {
-      const res = await apiFetch('/api/kg/graph?limit=20', { signal: controller.signal });
-      if (!res.ok) throw new Error(await errorMessage(res));
-      const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
-      if (cy.destroyed()) return;
-      renderGraph(cy, data);
-      setStatus(`${data.nodes.length} nodes · ${data.edges.length} edges`);
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      console.error('[KgPage] hero graph load failed:', err);
-      setStatus(`Failed to load graph: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setSidebarLoading(false);
     }
   }, []);
 
   // ── Full graph replacement ─────────────────────────────────────────────────
 
-  function renderGraph(cy: cytoscape.Core, payload: { nodes: ApiKgNode[]; edges: ApiKgEdge[] }) {
-    const elements = [
-      ...payload.nodes.map(nodeToElement),
-      ...payload.edges.map(edgeToElement),
-    ];
-    cy.elements().remove();
-    cy.add(elements);
-    updateDegrees(cy);
-    cy.resize();
-    cy.layout(FCOSE_FULL as unknown as cytoscape.LayoutOptions).run();
-    applyColorMode(cy, colorModeRef.current);
+  /**
+   * Replaces the canvas. With `focusId`, the view then fits that node and its neighbours;
+   * otherwise it fits the whole graph.
+   */
+  async function renderGraph(payload: { nodes: ApiKgNode[]; edges: ApiKgEdge[] }, focusId?: string): Promise<boolean> {
+    modelRef.current = modelFrom(payload);
+    syncFacets();
+    return runLayout('full', {
+      fit: () => {
+        const m = modelRef.current;
+        if (focusId && m.nodes.has(focusId)) {
+          return { nodes: closedNeighborhood(m, focusId).map(id => ({ id })), padding: '110px', duration: 300, maxZoom: FIT_MAX_ZOOM };
+        }
+        return { padding: 0.1, maxZoom: FIT_MAX_ZOOM };
+      },
+    });
   }
 
-  // ── Load a node's neighborhood and replace canvas ─────────────────────────
+  // ── Hero graph (default view when canvas is empty) ─────────────────────────
 
-  async function loadNeighborhood(nodeId: string) {
-    const cy = cyRef.current;
-    if (!cy) {
-      console.error('[KgPage] loadNeighborhood called before Cytoscape was initialized');
-      setStatus('Graph not ready — please refresh');
-      return;
-    }
+  async function loadHeroGraph() {
+    if (modelRef.current.nodes.size > 0) return;
     neighborhoodAbortRef.current?.abort();
     const controller = new AbortController();
     neighborhoodAbortRef.current = controller;
     setStatus('Loading…');
+    const done = beginBusy('load');
+    try {
+      const res = await apiFetch('/api/kg/graph?limit=20', { signal: controller.signal });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
+      if (controller.signal.aborted) return;
+      await renderGraph(data);
+      if (controller.signal.aborted) return;
+      setStatus(graphStatus(modelRef.current, filterRef.current));
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      console.error('[KgPage] hero graph load failed:', err);
+      setStatus(`Failed to load graph: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      done();
+    }
+  }
+
+  // ── Load a node's neighborhood and replace canvas ─────────────────────────
+
+  type NeighborhoodLoadResult =
+    | { ok: true }
+    | { ok: false; aborted: true }
+    | { ok: false; aborted?: false; notFoundMessage?: string };
+
+  /**
+   * Returns ok:false when the node was not found (or the load failed before render).
+   * A node that was merged away is followed to its survivor (§10.4).
+   */
+  async function loadNeighborhood(nodeId: string, redirects = 0): Promise<NeighborhoodLoadResult> {
+    neighborhoodAbortRef.current?.abort();
+    const controller = new AbortController();
+    neighborhoodAbortRef.current = controller;
+    setStatus('Loading…');
+    const done = beginBusy('load');
     try {
       const res = await apiFetch(
         `/api/kg/graph?node_id=${encodeURIComponent(nodeId)}&depth=2`,
         { signal: controller.signal },
       );
+      if (res.status === 404) {
+        // Drop the dead deep-link so refresh does not re-hit the same 404 (#1881).
+        const { message: notFoundMessage, merged } = await notFoundInfo(res);
+        // Body read can lose a race with a newer click that aborted this controller.
+        if (controller.signal.aborted) return { ok: false, aborted: true };
+        if (merged && merged.mergedInto !== nodeId && redirects < MAX_MERGE_REDIRECTS) {
+          // Name the node the user opened, not an intermediate hop of a chain
+          // (expandNeighborhood sets its own notice before redirecting).
+          if (redirects === 0) {
+            const label = merged.label ?? modelRef.current.nodes.get(nodeId)?.label ?? null;
+            setBanner({ text: mergedIntoNotice(label) });
+          }
+          return loadNeighborhood(merged.mergedInto, redirects + 1);
+        }
+        setSelectedNode(null);
+        syncUrl(searchRef.current, undefined);
+        setStatus(notFoundMessage);
+        return { ok: false, notFoundMessage };
+      }
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
-      if (cy.destroyed()) return;
-      renderGraph(cy, data);
-      // Animate the viewport to center on the focal node after the layout settles.
-      const focalEl = cy.getElementById(nodeId);
-      if (focalEl.length) {
-        cy.animate(
-          { fit: { eles: focalEl.closedNeighborhood(), padding: 80 } },
-          { duration: 300 },
-        );
-      }
-      // Sync selection + URL so refresh and back-nav restore this view.
+      if (controller.signal.aborted) return { ok: false, aborted: true };
+      // Sync selection + URL so refresh and back-nav restore this view. Selecting first opens
+      // the detail drawer before the view is fitted, so the fit uses the narrower canvas and
+      // nothing ends up hidden under the drawer.
       const focused = data.nodes.find(n => n.id === nodeId) ?? null;
       setSelectedNode(focused);
       syncUrl(searchRef.current, focused?.id);
-      cy.elements().removeClass('focal');
-      if (focused) cy.getElementById(focused.id).addClass('focal');
-      setStatus(`${data.nodes.length} nodes · ${data.edges.length} edges`);
+      setFocalId(focused?.id ?? null);
+      // Draws the neighbourhood, then fits the view to the focal node and its neighbours.
+      await renderGraph(data, nodeId);
+      if (controller.signal.aborted) return { ok: false, aborted: true };
+      setStatus(graphStatus(modelRef.current, filterRef.current));
+      return { ok: true };
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
+      // Another load took over neighborhoodAbortRef — do not hero-fallback (#1881 review).
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return { ok: false, aborted: true };
+      }
       console.error('[KgPage] neighborhood load failed:', err);
       setStatus(`Failed to load: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      return { ok: false };
+    } finally {
+      done();
     }
   }
 
-  // ── In-place expansion (single-tap on canvas node) ─────────────────────────
+  // ── In-place expansion (single click on a canvas node) ─────────────────────
 
   async function expandNeighborhood(nodeId: string) {
-    const cy = cyRef.current;
-    if (!cy) return;
     neighborhoodAbortRef.current?.abort();
     const controller = new AbortController();
     neighborhoodAbortRef.current = controller;
     setStatus('Expanding…');
+    const done = beginBusy('expand');
     try {
       const res = await apiFetch(
         `/api/kg/graph?node_id=${encodeURIComponent(nodeId)}&depth=1`,
         { signal: controller.signal },
       );
+      if (res.status === 404) {
+        // The click already selected this node and wrote ?node= — clear the stale
+        // node, selection, and URL so the user cannot re-click the same dead id (#1881).
+        const { message: notFoundMessage, merged } = await notFoundInfo(res);
+        if (controller.signal.aborted) return;
+        const m = modelRef.current;
+        const staleLabel = m.nodes.get(nodeId)?.label ?? null;
+        removeNode(m, nodeId);
+        syncFacets();
+        setGraphVersion(v => v + 1);
+        if (merged && merged.mergedInto !== nodeId) {
+          // Merged since the canvas loaded: follow it to the survivor.
+          setBanner({ text: mergedIntoNotice(merged.label ?? staleLabel) });
+          void loadNeighborhood(merged.mergedInto, 1);
+          return;
+        }
+        setSelectedNode(null);
+        syncUrl(searchRef.current, undefined);
+        setStatus(notFoundMessage);
+        return;
+      }
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { nodes: ApiKgNode[]; edges: ApiKgEdge[] };
+      if (controller.signal.aborted) return;
 
-      const newNodes = data.nodes.filter(n => !cy.getElementById(n.id).length);
-      const newEdges = data.edges.filter(e => !cy.getElementById(e.id).length);
-      const newElements = [...newNodes.map(nodeToElement), ...newEdges.map(edgeToElement)];
-
-      if (cy.destroyed()) return;
-
-      if (newElements.length > 0) {
-        cy.add(newElements);
-        updateDegrees(cy);
-        applyColorMode(cy, colorModeRef.current);
-        // randomize: false warms fCoSE from current positions without hard-pinning
-        // existing nodes, so the graph re-settles globally instead of squeezing
-        // new nodes into whatever gaps remain.
-        cy.layout(FCOSE_EXPAND as unknown as cytoscape.LayoutOptions).run();
+      setFocalId(nodeId);
+      const added = addToModel(modelRef.current, data);
+      if (added.nodes + added.edges > 0) {
+        syncFacets();
+        // Warm start: existing nodes start where they are and the graph re-settles
+        // around them; new nodes start next to the node that was expanded.
+        await runLayout('expand', { anchorId: nodeId });
       }
-
-      cy.elements().removeClass('focal');
-      cy.getElementById(nodeId).addClass('focal');
-
-      setStatus(`${cy.nodes().length} nodes · ${cy.edges().length} edges`);
+      if (controller.signal.aborted) return;
+      setStatus(graphStatus(modelRef.current, filterRef.current));
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       console.error('[KgPage] expand failed:', err);
       setStatus(`Failed to expand: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      done();
     }
   }
 
-  // ── Cytoscape initialization ───────────────────────────────────────────────
+  // ── Canvas events ──────────────────────────────────────────────────────────
 
-  useEffect(() => {
-    if (!containerRef.current || cyRef.current) return;
+  function handleNodeTap(nodeId: string) {
+    const n = modelRef.current.nodes.get(nodeId);
+    if (!n) return;
+    // A merge/redirect notice describes the node it was shown for — drop it when the
+    // user opens another one. A redirect from this click sets its own notice afterwards.
+    setBanner(null);
+    void expandNeighborhood(nodeId);
+    setSelectedNode(drawerNode(n));
+    syncUrl(searchRef.current, nodeId);
+  }
 
-    const cy = cytoscape({
-      container: containerRef.current,
-      elements: [],
-      style: CY_STYLE as unknown as cytoscape.StylesheetStyle[],
-      layout: { name: 'fcose', animate: false } as cytoscape.LayoutOptions,
-    });
+  // A single click expands the node, after a short wait so a double-click (zoom to the
+  // node and its neighbours) does not also expand it.
+  const onNodeClick: NodeMouseHandler<KgFlowNode> = (_e, node) => {
+    if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
+    tapTimerRef.current = setTimeout(() => {
+      tapTimerRef.current = null;
+      handleNodeTap(node.id);
+    }, DOUBLE_CLICK_MS);
+  };
 
-    cyRef.current = cy;
+  const onNodeDoubleClick: NodeMouseHandler<KgFlowNode> = (_e, node) => {
+    if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
+    tapTimerRef.current = null;
+    const ids = closedNeighborhood(modelRef.current, node.id);
+    void fitView({ nodes: ids.map(id => ({ id })), padding: '60px', duration: 300, maxZoom: FIT_MAX_ZOOM });
+  };
 
-    cy.on('onetap', 'node', evt => {
-      const nodeData = evt.target.data() as ApiKgNode;
-      void expandNeighborhood(evt.target.id());
-      setSelectedNode(nodeData);
-      // Use searchRef.current — this handler is registered once at mount and
-      // would otherwise capture a permanently stale `search` state value.
-      syncUrl(searchRef.current, nodeData.id);
-    });
+  // Hover: keep the node, its neighbours and their edges bright and dim the rest. Done with
+  // classes on the existing DOM (no React re-render), so it stays cheap on large canvases.
+  function highlight(nodeId: string | null) {
+    const root = canvasRef.current;
+    if (!root) return;
+    root.querySelectorAll('.kg-hl').forEach(el => el.classList.remove('kg-hl'));
+    if (!nodeId) { root.classList.remove('is-hovering'); return; }
+    const m = modelRef.current;
+    for (const id of closedNeighborhood(m, nodeId)) {
+      root.querySelector(`.react-flow__node[data-id="${CSS.escape(id)}"]`)?.classList.add('kg-hl');
+    }
+    for (const e of liveEdges(m)) {
+      if (e.sourceNodeId !== nodeId && e.targetNodeId !== nodeId) continue;
+      root.querySelector(`.react-flow__edge[data-id="${CSS.escape(e.id)}"]`)?.classList.add('kg-hl');
+    }
+    root.classList.add('is-hovering');
+  }
+  const onNodeMouseEnter: NodeMouseHandler<KgFlowNode> = (_e, node) => highlight(node.id);
+  const onNodeMouseLeave: NodeMouseHandler<KgFlowNode> = () => highlight(null);
 
-    cy.on('dbltap', 'node', evt => {
-      cy.animate(
-        { fit: { eles: evt.target.closedNeighborhood(), padding: 60 } },
-        { duration: 300 },
-      );
-    });
-
-    // After Cytoscape is initialized, ensure the container has been painted
-    // before measuring dimensions — avoids blank canvas on first mount.
-    requestAnimationFrame(() => {
-      cy.resize();
-      cy.fit();
-    });
-
-    return () => {
-      cy.destroy();
-      cyRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // xyflow reports drags and measurements; selection is driven by the page, not by xyflow.
+  const onNodesChange = useCallback((changes: NodeChange<KgFlowNode>[]) => {
+    const relevant = changes.filter(c => c.type === 'position' || c.type === 'dimensions');
+    if (relevant.length > 0) setRfNodes(ns => applyNodeChanges(relevant, ns));
   }, []);
+
+  // Keep dragged positions so later redraws and expansions start from them.
+  const onNodeDragStop: OnNodeDrag<KgFlowNode> = (_e, _node, dragged) => {
+    for (const n of dragged) {
+      modelRef.current.pos.set(n.id, { x: n.position.x + n.data.size / 2, y: n.position.y + n.data.size / 2 });
+    }
+  };
 
   // ── On mount: load sidebar + hero graph, restore ?node= if present ─────────
 
@@ -609,15 +602,25 @@ export default function KgPage() {
 
     if (initialNode) {
       // Restore ?node= from URL via loadNeighborhood, which handles render,
-      // focal class, viewport centering, and URL sync in one shot.
-      void loadNeighborhood(initialNode);
+      // focal node, viewport centering, and URL sync in one shot. On 404 the
+      // dead id is cleared from the URL; fall back to the hero graph so the
+      // user sees a graph with the not-found status rather than a blank canvas (#1881).
+      // Skip fallback when this load was aborted by a newer click (do not steal the canvas).
+      void (async () => {
+        const result = await loadNeighborhood(initialNode);
+        if (!result.ok && !result.aborted && result.notFoundMessage) {
+          await loadHeroGraph();
+          // loadHeroGraph overwrites status — restore the actionable not-found message.
+          setStatus(result.notFoundMessage);
+        }
+      })();
     } else {
       // Default view: focus on the principal's KG node so the graph opens on
       // a meaningful starting point. Falls back to the hero graph if the
       // principal has no linked KG node or the contacts fetch fails.
       void (async () => {
         try {
-          const res = await apiFetch('/api/kg/contacts');
+          const res = await apiFetch('/api/contacts');
           if (res.ok) {
             const { contacts } = await res.json() as { contacts: Array<{
               systemRole: string | null;
@@ -625,8 +628,9 @@ export default function KgPage() {
             }> };
             const principal = contacts.find(c => c.systemRole === 'principal');
             if (principal?.kgNodeId) {
-              await loadNeighborhood(principal.kgNodeId);
-              return;
+              const result = await loadNeighborhood(principal.kgNodeId);
+              // Success, or aborted because the user already started another load — leave it.
+              if (result.ok || result.aborted) return;
             }
           } else {
             console.error('[KgPage] principal node lookup: contacts fetch failed with status', res.status);
@@ -645,9 +649,41 @@ export default function KgPage() {
 
   function handleColorMode(mode: ColorMode) {
     setColorMode(mode);
-    colorModeRef.current = mode;
-    const cy = cyRef.current;
-    if (cy) applyColorMode(cy, mode);
+  }
+
+  // ── Filter panel ───────────────────────────────────────────────────────────
+
+  function updateFilter(next: KgFilter) {
+    setFilter(next);
+    filterRef.current = next;
+    setStatus(graphStatus(modelRef.current, next));
+  }
+
+  const options = filterOptions(canvasFacets, filter);
+  const filterActive = isFilterActive(filter);
+  // Search results respect the filter too, so the list never offers a node
+  // the canvas would hide.
+  const visibleSidebarNodes = sidebarNodes.filter(n =>
+    matchesFilter({ type: n.type, sensitivity: normalizeSensitivity(n.sensitivity) }, filter));
+
+  function renderFilterAxis(axis: KgFilterAxis, legend: string, opts: typeof options.types) {
+    return (
+      <fieldset className="kg-filter-axis">
+        <legend>{legend}</legend>
+        {opts.map(opt => (
+          <label key={opt.value} className="kg-filter-option">
+            <input
+              type="checkbox"
+              checked={filter[axis].has(opt.value)}
+              onChange={() => updateFilter(toggleFilterValue(filterRef.current, axis, opt.value))}
+            />
+            <span className={`kg-swatch ${swatchClass(axis, opt.value)}`} aria-hidden="true" />
+            <span className="kg-filter-option-name">{opt.value}</span>
+            <span className="kg-filter-option-count">{opt.count}</span>
+          </label>
+        ))}
+      </fieldset>
+    );
   }
 
   // ── Sidebar search ─────────────────────────────────────────────────────────
@@ -662,15 +698,46 @@ export default function KgPage() {
     void loadSidebarNodes(search);
   }
 
+  // ── Node merge (#2233) ─────────────────────────────────────────────────────
+
+  async function handleMerged(result: NodeMergeResult, labels: { absorbed: string; survivor: string }) {
+    setMergeFrom(null);
+    setSidebarNodes(prev => applyMergeToNodeList(prev, result));
+    const notes = mergeResultNotes(result.warnings);
+    setBanner({ text: mergeSuccessMessage(labels.absorbed, labels.survivor), ...(notes.length > 0 ? { notes } : {}) });
+    // Take the archived node off the canvas now (its edges go with it), so it
+    // is gone even if the reload below fails.
+    const m = modelRef.current;
+    removeNode(m, result.absorbedId);
+    const survivor = m.nodes.get(result.survivorId);
+    if (survivor) m.nodes.set(result.survivorId, { ...survivor, label: result.node.label });
+    syncFacets();
+    setGraphVersion(v => v + 1);
+    setStatus(graphStatus(m, filterRef.current));
+    // Re-render around the survivor; this also selects it and syncs ?node=.
+    const loaded = await loadNeighborhood(result.survivorId);
+    if (!loaded.ok && !loaded.aborted) {
+      // The merge committed even if the reload failed — still show the survivor.
+      setSelectedNode(result.node);
+      syncUrl(searchRef.current, result.survivorId);
+    }
+  }
+
+  // The apply request may or may not have committed (network or gateway
+  // error). Refresh the list and the canvas so the user can see which: if it
+  // did, the reload follows the absorbed node's redirect to the survivor.
+  function handleMergeOutcomeUnknown() {
+    void loadSidebarNodes(searchRef.current);
+    const focusId = selectedNode?.id ?? mergeFrom?.id;
+    if (focusId) void loadNeighborhood(focusId);
+  }
+
   // ── Drawer close ───────────────────────────────────────────────────────────
 
   function handleDrawerClose() {
+    // xyflow re-measures the wider canvas itself.
     setSelectedNode(null);
     syncUrl(search, undefined);
-    // Defer so the browser paints the wider layout before Cytoscape re-measures.
-    requestAnimationFrame(() => {
-      cyRef.current?.resize();
-    });
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -722,25 +789,47 @@ export default function KgPage() {
                   />
                   <button onClick={submitSearch}>Search</button>
                 </div>
+                <details className="kg-filters" open>
+                  <summary>
+                    Filters{filterActive ? ` (${filter.types.size + filter.sensitivities.size})` : ''}
+                    {filterActive && (
+                      <button
+                        className="kg-filters-clear"
+                        onClick={e => { e.preventDefault(); updateFilter(emptyFilter()); }}
+                      >
+                        Clear filters
+                      </button>
+                    )}
+                  </summary>
+                  {renderFilterAxis('types', 'Type', options.types)}
+                  {renderFilterAxis('sensitivities', 'Sensitivity', options.sensitivities)}
+                </details>
                 <div className="kg-sidebar-list">
+                  {sidebarLoading && (
+                    <div className="kg-loader-inline" role="status">
+                      <AnimatedMoonrayMark size={18} aria-hidden="true" role="presentation" />
+                      <span>Searching</span>
+                    </div>
+                  )}
                   {loadError ? (
                     <p style={{ fontSize: 12, color: 'var(--app-destructive)', margin: 0 }}>
                       {loadError}
                     </p>
-                  ) : sidebarNodes.length === 0 ? (
+                  ) : visibleSidebarNodes.length === 0 ? (
                     <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: 0 }}>
-                      No matching nodes.
+                      {sidebarNodes.length > 0 ? 'No nodes match the active filters.' : 'No matching nodes.'}
                     </p>
                   ) : (
-                    sidebarNodes.map(node => (
+                    visibleSidebarNodes.map(node => (
                       <button
                         key={node.id}
                         className="kg-node-card"
-                        onClick={() => void loadNeighborhood(node.id)}
+                        onClick={() => { setBanner(null); void loadNeighborhood(node.id); }}
                         title={`Load ${node.label}'s neighborhood`}
                       >
                         <div className="kg-node-card-label">{node.label}</div>
                         <div className="kg-node-card-meta">
+                          <span className={`kg-swatch ${swatchClass('types', node.type)}`} aria-hidden="true" />
                           {node.type} · {node.confidence != null ? node.confidence.toFixed(2) : '—'}
                         </div>
                       </button>
@@ -776,7 +865,64 @@ export default function KgPage() {
                   </button>
                   {status && <span className="kg-status">{status}</span>}
                 </div>
-                <div className="kg-canvas" ref={containerRef} />
+                {banner && (
+                  <div className={`kg-merge-banner${banner.notes?.length ? ' is-warn' : ''}`} role="status">
+                    <div className="kg-merge-banner-body">
+                      <span>{banner.text}</span>
+                      {banner.notes && banner.notes.length > 0 && (
+                        <ul className="kg-merge-banner-notes">
+                          {banner.notes.map(n => <li key={n}>{n}</li>)}
+                        </ul>
+                      )}
+                    </div>
+                    <button
+                      className="kg-merge-banner-close"
+                      onClick={() => setBanner(null)}
+                      aria-label="Dismiss"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                        <line x1="6" y1="6" x2="18" y2="18" />
+                        <line x1="18" y1="6" x2="6" y2="18" />
+                      </svg>
+                    </button>
+                  </div>
+                )}
+                <div className="kg-canvas" ref={canvasRef}>
+                  <ReactFlow<KgFlowNode, KgFlowEdge>
+                    nodes={rfNodes}
+                    edges={rfEdges}
+                    nodeTypes={KG_NODE_TYPES}
+                    edgeTypes={KG_EDGE_TYPES}
+                    onNodesChange={onNodesChange}
+                    onNodeClick={onNodeClick}
+                    onNodeDoubleClick={onNodeDoubleClick}
+                    onNodeDragStop={onNodeDragStop}
+                    onNodeMouseEnter={onNodeMouseEnter}
+                    onNodeMouseLeave={onNodeMouseLeave}
+                    onMoveStart={() => highlight(null)}
+                    nodesConnectable={false}
+                    elementsSelectable={false}
+                    edgesFocusable={false}
+                    deleteKeyCode={null}
+                    zoomOnDoubleClick={false}
+                    minZoom={0.05}
+                    maxZoom={4}
+                  >
+                    <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} color="var(--kg-grid)" />
+                    <Controls
+                      position="bottom-left"
+                      showInteractive={false}
+                      fitViewOptions={{ padding: 0.15, duration: 300, maxZoom: FIT_MAX_ZOOM }}
+                    />
+                    <ZoomLevelClass target={canvasRef} />
+                  </ReactFlow>
+                  {busy && (
+                    <div key={busy.seq} className={`kg-loader kg-loader--${busy.kind}`} role="status" aria-live="polite">
+                      <AnimatedMoonrayMark size={busy.kind === 'load' ? 64 : 22} aria-hidden="true" role="presentation" />
+                      <span className="kg-loader-label">{busy.kind === 'load' ? 'Loading graph' : 'Expanding'}</span>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Right: node detail drawer (conditional) */}
@@ -785,6 +931,16 @@ export default function KgPage() {
                   key={selectedNode.id}
                   node={selectedNode}
                   onClose={handleDrawerClose}
+                  onMerge={() => setMergeFrom(selectedNode)}
+                />
+              )}
+              {mergeFrom && (
+                <MergeNodesDialog
+                  key={mergeFrom.id}
+                  node={mergeFrom}
+                  onClose={() => setMergeFrom(null)}
+                  onMerged={(result, labels) => void handleMerged(result, labels)}
+                  onOutcomeUnknown={handleMergeOutcomeUnknown}
                 />
               )}
             </div>

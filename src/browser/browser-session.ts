@@ -7,6 +7,11 @@
 import type { BrowserContext, Page } from 'playwright';
 import { redactValues } from '../skills/sanitize.js';
 
+/** How many page error messages a session keeps, and the longest each may be. */
+const MAX_CONSOLE_ERRORS = 20;
+// Long enough that the handler redacts before it cuts to its own, shorter, return length.
+const MAX_CONSOLE_ERROR_LENGTH = 2_000;
+
 /** HTML-entity-escape the characters a browser escapes when reflecting input into DOM text.
  *  `&` must be replaced first so the entity ampersands it introduces aren't re-escaped. */
 function htmlEscape(value: string): string {
@@ -23,6 +28,21 @@ export class BrowserSession {
   readonly page: Page;
   /** Epoch ms of last access — updated by BrowserService.getOrCreateSession() on reuse. */
   lastUsedAt: number;
+  /** Epoch ms the session was created — the anchor for the absolute-age cap that bounds
+   *  even a keep-warm session's lifetime, so a forgotten pinned tab can't leak forever. */
+  readonly createdAt: number;
+
+  /**
+   * Keep-warm pin (opt-in, per task). A parked long-running browser task sets this so its
+   * session survives the idle TTL between wakes that may be far apart — the woken task
+   * reattaches to the same live, logged-in page instead of a cold tab. Pinning only exempts
+   * the session from the *idle* TTL; the absolute-age cap (see isExpired) still applies, and
+   * a process restart still loses the live page (the persistent PROFILE — cookies/history —
+   * survives on disk, so re-navigation resumes). Concurrent tasks each pin their own session
+   * (a separate page in the shared profile), so they never clobber one another. Default false
+   * (throwaway-per-flow, as before). See ADR-030.
+   */
+  keepWarm = false;
 
   /**
    * Literal secret VALUES injected into this session by reference (#973), e.g. a
@@ -42,11 +62,65 @@ export class BrowserSession {
    */
   private readonly ownedContext: BrowserContext | null;
 
+  /**
+   * Count of consecutive FAILED interaction actions (click/type/select/hover/wait_for) on this
+   * session, for the handler's circuit-breaker. A stale-ref or occluded click still costs
+   * seconds, so a stuck agent that keeps retrying would otherwise drain its whole budget into a
+   * futile loop (the 16personalities incident). The handler increments this only on a failed
+   * gated interaction, and resets it to 0 on ANY success — so re-reading the page (a successful
+   * get_content) re-enables interaction. This curbs, but does not hard-bound, an agent that
+   * oscillates trip→re-read→trip; fail-fast on stale refs does most of the budget savings.
+   */
+  consecutiveFailures = 0;
+
+  /**
+   * The page's most recent error messages (#2244): browser-reported console errors (a
+   * failed resource load, a blocked script, a CSP violation) and uncaught page errors where
+   * the browser reports them. Patchright disables the Console API to close a detection
+   * leak, so a page script's own console.error() calls never arrive here. Returned with a
+   * blank or unsettled page so one that never paints can be diagnosed. Untrusted page
+   * text, capped in count and length.
+   */
+  private readonly consoleErrors: Array<{ at: number; text: string }> = [];
+
+  /** Record one page error message (see consoleErrors). */
+  recordConsoleError(text: string): void {
+    const trimmed = text.replace(/\s+/g, ' ').trim();
+    if (!trimmed) return;
+    this.consoleErrors.push({
+      at: Date.now(),
+      text: trimmed.length > MAX_CONSOLE_ERROR_LENGTH ? `${trimmed.slice(0, MAX_CONSOLE_ERROR_LENGTH)}…` : trimmed,
+    });
+    if (this.consoleErrors.length > MAX_CONSOLE_ERRORS) this.consoleErrors.shift();
+  }
+
+  /** Error messages recorded at or after `sinceMs`, oldest first, at most `limit`. */
+  recentConsoleErrors(sinceMs: number, limit = 10): string[] {
+    return this.consoleErrors.filter((e) => e.at >= sinceMs).slice(-limit).map((e) => e.text);
+  }
+
+  /** Record a failed action (circuit-breaker input). */
+  recordFailure(): void {
+    this.consecutiveFailures++;
+  }
+
+  /** Record a successful action — clears the failure streak. */
+  recordSuccess(): void {
+    this.consecutiveFailures = 0;
+  }
+
+  /** True once consecutive failures reach `threshold` (circuit-breaker tripped). */
+  isTripped(threshold: number): boolean {
+    return this.consecutiveFailures >= threshold;
+  }
+
   constructor(context: BrowserContext, page: Page, ownedContext: BrowserContext | null = null) {
     this.context = context;
     this.page = page;
     this.ownedContext = ownedContext;
-    this.lastUsedAt = Date.now();
+    const now = Date.now();
+    this.lastUsedAt = now;
+    this.createdAt = now;
   }
 
   /**
@@ -85,8 +159,20 @@ export class BrowserSession {
     return redactValues(text, variants);
   }
 
-  /** Returns true if the session has been idle longer than ttlMs. */
-  isExpired(ttlMs: number): boolean {
+  /**
+   * Returns true if the session should be evicted.
+   *
+   * - A KEEP-WARM (pinned) session is exempt from the idle TTL — a parked task can resume it
+   *   after a long gap between wakes — but is bounded by the absolute-age cap `maxAgeMs` (since
+   *   creation) so a forgotten pinned tab can't leak forever. The cap applies ONLY to pinned
+   *   sessions: a normal session that is still being actively used is already bounded by the
+   *   idle TTL and must not be force-evicted mid-use just for living a long time.
+   * - A normal session expires after being idle longer than `ttlMs` (unchanged).
+   */
+  isExpired(ttlMs: number, maxAgeMs?: number): boolean {
+    if (this.keepWarm) {
+      return maxAgeMs !== undefined && Date.now() - this.createdAt > maxAgeMs;
+    }
     return Date.now() - this.lastUsedAt > ttlMs;
   }
 

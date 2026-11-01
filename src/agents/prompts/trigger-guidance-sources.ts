@@ -1,0 +1,52 @@
+// Every piece of trigger guidance the platform injects outside the system prompt (#1959).
+//
+// Outbound prompt-exfiltration markers used to come only from the coordinator's
+// `system_prompt`. Text moved out of it into injected blocks and tool results would stop
+// being scanned, so a model echoing it to an outside sender would go undetected. Add any
+// new trigger guidance here, and to the source list in
+// tests/unit/agents/prompts/trigger-guidance.test.ts, which checks each one yields markers.
+
+import { BACKLOG_INSTRUCTION_LINES, PRINCIPAL_TASK_ANSWER_LINES } from './backlog-line.js';
+import { AWAITING_ANSWER_HEADER, AWAITING_ANSWER_LINES } from './awaiting-answers.js';
+import { BULLPEN_REPLY_RULE } from './bullpen-reply-rule.js';
+import { CEO_INBOX_WAKE_GUIDANCE } from './ceo-inbox-wake-guidance.js';
+import { NO_MATCHING_TOOL_NEXT_STEP_LINES, WEB_FETCH_NOT_FOUND_LINES } from './dead-end-guidance.js';
+import { DAILY_DEBRIEF_RECAP_LINES, WEEKLY_DEBRIEF_RECAP_LINES } from './debrief-recap-instruction.js';
+import {
+  CLARIFICATION_NEXT_STEP_LINES,
+  DELEGATE_FAILURE_NEXT_STEP_LINES,
+  DRAFT_EMAIL_NEXT_STEP_LINES,
+  NOTHING_SENT_NEXT_STEP_LINES,
+  PAUSED_NEXT_STEP_LINES,
+} from './delegate-result-guidance.js';
+import { TURN_GUIDANCE_TEXTS } from './turn-guidance.js';
+import { HONESTY_LINE, REGISTER_LINE, WRITES_AS_SCOPE_LINES } from '../../identity/service.js';
+import { CONTENT_LINE, LENGTH_EXCEPTION, TURN_LENGTH_REMINDER_TEXTS } from '../../identity/length.js';
+
+/** Newline-joined guidance texts, one marker per line once extracted. */
+export const TRIGGER_GUIDANCE_MARKER_SOURCES: readonly string[] = [
+  ...TURN_GUIDANCE_TEXTS,
+  BACKLOG_INSTRUCTION_LINES.join('\n'),
+  PRINCIPAL_TASK_ANSWER_LINES.join('\n'),
+  AWAITING_ANSWER_HEADER,
+  AWAITING_ANSWER_LINES.join('\n'),
+  CLARIFICATION_NEXT_STEP_LINES.join('\n'),
+  PAUSED_NEXT_STEP_LINES.join('\n'),
+  DRAFT_EMAIL_NEXT_STEP_LINES.join('\n'),
+  NOTHING_SENT_NEXT_STEP_LINES.join('\n'),
+  ...Object.values(DELEGATE_FAILURE_NEXT_STEP_LINES).map(lines => lines.join('\n')),
+  BULLPEN_REPLY_RULE,
+  DAILY_DEBRIEF_RECAP_LINES.join('\n'),
+  WEEKLY_DEBRIEF_RECAP_LINES.join('\n'),
+  // ceo-inbox's task-wake steps (#2025).
+  ...Object.values(CEO_INBOX_WAKE_GUIDANCE),
+  // Empty-handed lookups: tool-registry's next_step and web-fetch's 404 (#2149).
+  NO_MATCHING_TOOL_NEXT_STEP_LINES.join('\n'),
+  WEB_FETCH_NOT_FOUND_LINES.join('\n'),
+  // The identity block's fixed lines, and the per-turn length reminders (#2143). The block
+  // is injected at runtime, so its text is not in any agent's prompt template. The
+  // operator's tone.style is deliberately not a source: it holds example lines Curia is
+  // meant to imitate. Band texts shorter than the marker floor are skipped by extraction.
+  [REGISTER_LINE, HONESTY_LINE, LENGTH_EXCEPTION, CONTENT_LINE, ...WRITES_AS_SCOPE_LINES].join('\n'),
+  ...TURN_LENGTH_REMINDER_TEXTS,
+];

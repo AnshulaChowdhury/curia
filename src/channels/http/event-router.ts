@@ -5,7 +5,8 @@
 // the EventRouter registers ONE subscriber per event type at startup and
 // dispatches to registered handlers via Maps and Sets.
 //
-// POST /api/messages registers a pending resolver keyed by conversationId.
+// A synchronous waiter (waitForResponse) is keyed by conversationId. Console
+// chat does not wait: POST /api/chat/messages acks 202 and the reply is SSE.
 // SSE connections register a writer function in a Set.
 // Both are cleaned up when the request completes or the client disconnects.
 
@@ -13,7 +14,9 @@ import type { EventBus } from '../../bus/bus.js';
 import type { BusEvent } from '../../bus/events.js';
 import type { Logger } from '../../logger.js';
 import type { ServerResponse } from 'node:http';
-import { markdownToHtml } from '../../utils/markdown-to-html.js';
+import type { SceneDirective } from '@curia/shared-types';
+import { busEventToAuditRow, interpretEvent } from '../../antfarm/interpreter.js';
+import { markdownToHtml } from '../../format/markdown-to-html.js';
 
 /**
  * Thrown by the event router when the dispatcher rejects a message. Typed
@@ -66,8 +69,8 @@ export type WaitResult =
 
 /**
  * Canonical client-facing messages for the non-error WaitResult outcomes.
- * Defined here (next to WaitResult) so both the /api/messages and /api/kg/chat
- * handlers map a given `kind` to identical wording — they used to be free-floating
+ * Defined here (next to WaitResult) so every waiter maps a given `kind` to the
+ * same wording — they used to be free-floating
  * strings on the Error objects and risked drifting apart once moved to the routes.
  */
 export const WAIT_TIMEOUT_MESSAGE = 'Response timeout — the agent did not respond in time';
@@ -75,9 +78,9 @@ export const WAIT_SUPERSEDED_MESSAGE = 'Superseded by a newer request for the sa
 
 /**
  * Map a non-ok {@link WaitResult} to its HTTP status code and client-facing
- * message. Shared by the /api/messages and /api/kg/chat/messages handlers so the
- * status contract can't drift between them — it already did once (rate-limit
- * rejections returned 403 instead of 429 on the KG route). The `never` guard
+ * message. Shared so the status contract can't drift between waiters. It
+ * already did once: rate-limit rejections returned 403 instead of 429 on the
+ * KG route. The `never` guard
  * forces any new WaitResult variant to be handled here at compile time.
  *
  * Mapping: too-large → 413, rate-limited → 429, other policy rejection → 403,
@@ -113,6 +116,36 @@ export interface SseClient {
   conversationId?: string; // Optional filter
 }
 
+/** Event types forwarded to Ant Farm live stream (interpreter catalog superset). */
+export const ANT_FARM_EVENT_TYPES = [
+  'schedule.fired',
+  'agent.task',
+  'tool.invoke',
+  'tool.result',
+  'agent.discuss',
+  'inbound.message',
+  'outbound.message',
+  'outbound.delivered',
+  'task.created',
+  'task.completed',
+  'agent.error',
+  'human.decision',
+  'autonomy.tool_blocked',
+  'autonomy.send_blocked',
+] as const;
+
+/** Per-client pending SSE frames before a slow consumer is dropped. */
+export const ANT_FARM_MAX_CLIENT_BUFFER = 50;
+/** Max interpreted directives delivered to one client per second (coalesce guard). */
+export const ANT_FARM_MAX_DIRECTIVES_PER_SECOND = 60;
+
+export interface AntfarmClient {
+  res: ServerResponse;
+  pendingWrites: number;
+  directivesThisSecond: number;
+  secondWindowStart: number;
+}
+
 /**
  * EventRouter registers shared bus subscribers and dispatches to HTTP clients.
  * Call setupSubscriptions() once at startup, then use the add/remove methods
@@ -120,10 +153,13 @@ export interface SseClient {
  */
 export class EventRouter {
   private logger: Logger;
-  /** Pending POST /api/messages responses, keyed by conversationId */
+  /** Pending synchronous HTTP responses, keyed by conversationId. No production
+   *  route registers one after /api/messages was removed (ADR-057). */
   private pendingResponses = new Map<string, PendingResponse>();
   /** Active SSE connections */
   private sseClients = new Set<SseClient>();
+  /** Ant Farm live-stream clients — separate from console chat SSE (no cross-talk). */
+  private antfarmClients = new Set<AntfarmClient>();
 
   constructor(logger: Logger) {
     this.logger = logger;
@@ -132,21 +168,16 @@ export class EventRouter {
   /**
    * Register shared subscribers on the bus. Called once at startup.
    * Uses 'channel' layer for outbound.message (proper permission model)
-   * and 'system' layer for observability events (skill.invoke, skill.result).
+   * and 'system' layer for observability events (tool.invoke, tool.result).
    */
   setupSubscriptions(bus: EventBus): void {
     // outbound.message — dispatches to pending POST resolvers and SSE clients
     bus.subscribe('outbound.message', 'channel', (event: BusEvent) => {
       if (event.type !== 'outbound.message') return;
-      // Handle messages for channels that use synchronous POST/wait (http and web).
-      // Other channels (email, telegram) process replies asynchronously and have no
-      // pending promise waiting here.
+      // http: Gate C still publishes a pending-approval outbound for that channel.
+      // web: console chat. Other channels deliver on their own adapters.
       if (event.payload.channelId !== 'http' && event.payload.channelId !== 'web') return;
-      // @TODO: The sseClients Set is shared across all SSE endpoints. A client connected
-      // to /api/messages/stream with no conversationId filter will receive web-channel
-      // events after this change. Both endpoints require the same bootstrap-secret auth
-      // (contained for now), but the clean fix is to tag SseClient with channelId and
-      // filter in broadcastToSseClients. Track as a follow-up improvement.
+      // Only /api/chat/stream registers clients (ADR-057). /api/messages/stream is gone.
 
       const convId = event.payload.conversationId;
 
@@ -190,26 +221,26 @@ export class EventRouter {
       this.broadcastToSseClients(sseData, convId);
     });
 
-    // skill.invoke — observability stream for SSE clients
-    bus.subscribe('skill.invoke', 'system', (event: BusEvent) => {
-      if (event.type !== 'skill.invoke') return;
+    // tool.invoke — observability stream for SSE clients
+    bus.subscribe('tool.invoke', 'system', (event: BusEvent) => {
+      if (event.type !== 'tool.invoke') return;
       const sseData = JSON.stringify({
-        type: 'skill.invoke',
+        type: 'tool.invoke',
         agent: event.payload.agentId,
-        skill: event.payload.skillName,
+        tool: event.payload.toolName,
         conversation_id: event.payload.conversationId,
         timestamp: event.timestamp,
       });
       this.broadcastToSseClients(sseData, event.payload.conversationId);
     });
 
-    // skill.result — observability stream for SSE clients
-    bus.subscribe('skill.result', 'system', (event: BusEvent) => {
-      if (event.type !== 'skill.result') return;
+    // tool.result — observability stream for SSE clients
+    bus.subscribe('tool.result', 'system', (event: BusEvent) => {
+      if (event.type !== 'tool.result') return;
       const sseData = JSON.stringify({
-        type: 'skill.result',
+        type: 'tool.result',
         agent: event.payload.agentId,
-        skill: event.payload.skillName,
+        tool: event.payload.toolName,
         success: event.payload.result.success,
         duration_ms: event.payload.durationMs,
         conversation_id: event.payload.conversationId,
@@ -227,9 +258,9 @@ export class EventRouter {
 
       const convId = event.payload.conversationId;
 
-      // HTTP and web channel requests both have synchronous POST promises to reject.
-      // Other channels (email, telegram, etc.) produce rejection events for audit
-      // and SSE but have no synchronous caller waiting on a promise.
+      // Settle a synchronous waiter when one was registered. Console chat does not
+      // register one (ADR-057). Other channels produce rejection events for audit
+      // and SSE and have no waiter.
       if (event.payload.channelId === 'http' || event.payload.channelId === 'web') {
         const pending = this.pendingResponses.get(convId);
         if (pending) {
@@ -253,7 +284,7 @@ export class EventRouter {
     });
 
     // agent.discuss — broadcast Bullpen activity to all SSE clients for dashboard observability.
-    // Uses 'system' layer (same privilege as skill.invoke/skill.result) so the HTTP channel
+    // Uses 'system' layer (same privilege as tool.invoke/tool.result) so the HTTP channel
     // can observe agent-layer events without publishing them.
     bus.subscribe('agent.discuss', 'system', (event: BusEvent) => {
       if (event.type !== 'agent.discuss') return;
@@ -270,6 +301,12 @@ export class EventRouter {
       this.broadcastToSseClients(sseData);
     });
 
+    for (const eventType of ANT_FARM_EVENT_TYPES) {
+      bus.subscribe(eventType, 'system', (event: BusEvent) => {
+        if (event.type !== eventType) return;
+        this.broadcastAntfarmFromBusEvent(event);
+      });
+    }
 
     this.logger.info('HTTP event router subscriptions registered');
   }
@@ -351,5 +388,75 @@ export class EventRouter {
       this.sseClients.delete(client);
       this.logger.debug({ conversationId: client.conversationId }, 'SSE client disconnected');
     };
+  }
+
+  /** Register an Ant Farm SSE client. Returns a cleanup function. */
+  addAntfarmClient(client: Pick<AntfarmClient, 'res'>): () => void {
+    const entry: AntfarmClient = {
+      res: client.res,
+      pendingWrites: 0,
+      directivesThisSecond: 0,
+      secondWindowStart: Date.now(),
+    };
+    this.antfarmClients.add(entry);
+    this.logger.debug('Ant Farm SSE client connected');
+    return () => {
+      this.antfarmClients.delete(entry);
+      this.logger.debug('Ant Farm SSE client disconnected');
+    };
+  }
+
+  private broadcastAntfarmFromBusEvent(event: BusEvent): void {
+    if (this.antfarmClients.size === 0) {
+      return;
+    }
+    const mapped = interpretEvent(busEventToAuditRow(event));
+    if (mapped === null) {
+      return;
+    }
+    const directives = Array.isArray(mapped) ? mapped : [mapped];
+    this.broadcastToAntfarm(directives);
+  }
+
+  /**
+   * Deliver interpreted directives to Ant Farm clients. Slow clients with a full
+   * pending-write buffer are dropped so dispatch never blocks on a single consumer.
+   */
+  broadcastToAntfarm(directives: SceneDirective[]): void {
+    if (directives.length === 0 || this.antfarmClients.size === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    for (const client of [...this.antfarmClients]) {
+      for (const directive of directives) {
+        if (client.pendingWrites >= ANT_FARM_MAX_CLIENT_BUFFER) {
+          this.antfarmClients.delete(client);
+          this.logger.warn('Dropped slow Ant Farm SSE client — pending buffer full');
+          break;
+        }
+
+        if (now - client.secondWindowStart >= 1000) {
+          client.secondWindowStart = now;
+          client.directivesThisSecond = 0;
+        }
+        if (client.directivesThisSecond >= ANT_FARM_MAX_DIRECTIVES_PER_SECOND) {
+          continue;
+        }
+
+        const envelope = JSON.stringify({ type: 'directive', directive });
+        try {
+          client.pendingWrites += 1;
+          client.res.write(`data: ${envelope}\n\n`, () => {
+            client.pendingWrites = Math.max(0, client.pendingWrites - 1);
+          });
+          client.directivesThisSecond += 1;
+        } catch (err) {
+          this.antfarmClients.delete(client);
+          this.logger.debug({ err }, 'Removed dead Ant Farm SSE client');
+          break;
+        }
+      }
+    }
   }
 }

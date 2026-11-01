@@ -1,27 +1,36 @@
 import { describe, it, expect, vi } from 'vitest';
-import { EmailSendHandler } from '../../../skills/email-send/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { EmailSendHandler } from '../../../skills/email/tools/email-send/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
+
+const ALICE_ID = '11111111-1111-4111-8111-111111111111';
+const resolveRecipientReference = vi.fn().mockResolvedValue({
+  ok: true, kind: 'contact', contactId: ALICE_ID, identifier: 'alice@example.com',
+  displayName: 'Alice', identityName: 'primary', identityId: 'id-alice',
+});
 
 function makeCtx(
   input: Record<string, unknown>,
   gateway?: Partial<{
     send: (...args: unknown[]) => unknown;
     getEmailMessage: (...args: unknown[]) => unknown;
+    resolveRecipientReference: (...args: unknown[]) => unknown;
   }>,
   opts?: { timezone?: string; agentId?: string },
-): SkillContext {
+): ToolContext {
   return {
+    toolName: 'email-send',
+    toolVersion: '1.2.2',
     input,
     secret: () => { throw new Error('no secrets'); },
     log: logger,
-    outboundGateway: gateway as never,
+    outboundGateway: (gateway && { resolveRecipientReference, ...gateway }) as never,
     outboundContext: undefined,
     timezone: opts?.timezone,
     agentId: opts?.agentId,
-  } as SkillContext;
+  } as ToolContext;
 }
 
 const originalMessage = {
@@ -41,13 +50,13 @@ describe('EmailSendHandler — reply quote', () => {
       getEmailMessage: vi.fn().mockResolvedValue(originalMessage),
     };
     const result = await handler.execute(makeCtx(
-      { to: 'alice@example.com', subject: 'Re: Q2 planning', body: 'Sounds good!', reply_to_message_id: 'msg-orig' },
+      { to: ALICE_ID, subject: 'Re: Q2 planning', body: 'Sounds good!', reply_to_message_id: 'msg-orig' },
       gateway,
       { timezone: 'America/Toronto' },
     ));
 
     expect(result.success).toBe(true);
-    expect(gateway.getEmailMessage).toHaveBeenCalledWith('msg-orig');
+    expect(gateway.getEmailMessage).toHaveBeenCalledWith('msg-orig', undefined);
 
     const sendArg = gateway.send.mock.calls[0]![0] as { body: string; htmlQuote?: string; replyToMessageId?: string };
     // Reply body stays as markdown; gateway converts it to HTML
@@ -57,6 +66,8 @@ describe('EmailSendHandler — reply quote', () => {
     expect(sendArg.htmlQuote).toContain('alice@example.com');
     expect(sendArg.htmlQuote).toContain('Let me know your thoughts.');
     expect(sendArg.replyToMessageId).toBe('msg-orig');
+    // Who was on the quoted message, for the send review (#2312).
+    expect((sendArg as { quoteParticipants?: string[] }).quoteParticipants).toEqual(['alice@example.com', 'ceo@example.com']);
   });
 
   it('does not fetch original or append quote when reply_to_message_id is absent', async () => {
@@ -65,7 +76,7 @@ describe('EmailSendHandler — reply quote', () => {
       getEmailMessage: vi.fn(),
     };
     const result = await handler.execute(makeCtx(
-      { to: 'alice@example.com', subject: 'Hello', body: 'Hi there' },
+      { to: ALICE_ID, subject: 'Hello', body: 'Hi there' },
       gateway,
     ));
 
@@ -84,7 +95,7 @@ describe('EmailSendHandler — reply quote', () => {
     };
     const warnSpy = vi.fn();
     const ctx = makeCtx(
-      { to: 'alice@example.com', subject: 'Re: Q2', body: 'Got it', reply_to_message_id: 'msg-missing' },
+      { to: ALICE_ID, subject: 'Re: Q2', body: 'Got it', reply_to_message_id: 'msg-missing' },
       gateway,
     );
     ctx.log = { ...logger, warn: warnSpy, info: vi.fn(), error: vi.fn(), debug: vi.fn() } as never;

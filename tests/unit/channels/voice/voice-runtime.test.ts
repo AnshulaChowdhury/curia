@@ -1,0 +1,3072 @@
+import { describe, it, expect, vi } from 'vitest';
+import { EventBus } from '../../../../src/bus/bus.js';
+import type { BusEvent } from '../../../../src/bus/events.js';
+import type { OutboundContextRow } from '../../../../src/dispatch/outbound-context.js';
+import { OutboundContextService } from '../../../../src/dispatch/outbound-context.js';
+import { createSilentLogger, type Logger } from '../../../../src/logger.js';
+import type { LLMProvider, LLMResponse, LLMStreamEvent, Message } from '../../../../src/agents/llm/provider.js';
+import { ABORTED_TOOL_RESULT } from '../../../../src/agents/llm/streaming-turn.js';
+import { DATE_RESOLVE_GUARDRAIL } from '../../../../src/agents/prompts/date-resolve-guardrail.js';
+import { VOICE_ASYNC_OFFRAMP_GUIDANCE } from '../../../../src/agents/prompts/voice-async-offramp.js';
+import {
+  historyForLlm,
+  LLM_FAILURE_TURN_CONTENT,
+  LLM_FAILURE_USER_MESSAGE,
+} from '../../../../src/memory/llm-failure-turn.js';
+import { WorkingMemory } from '../../../../src/memory/working-memory.js';
+import type { DbPool } from '../../../../src/db/connection.js';
+import { CONTACT_RECENT_HISTORY_HEADER } from '../../../../src/memory/contact-recent-history.js';
+import {
+  VoiceRuntime,
+  buildVoiceSystemPrompt,
+  buildVoiceAudienceLine,
+  VOICE_SYSTEM_ADDENDUM,
+  VOICE_SPOKEN_STYLE_ADDENDUM,
+  VOICE_TOOL_RESULT_POLICY,
+  VOICE_DELEGATION_GUIDANCE,
+  VOICE_GREETING_INSTRUCTION,
+  VOICE_GREETING_USER_MESSAGE,
+} from '../../../../src/channels/voice/voice-runtime.js';
+import type { VoiceToolBridge } from '../../../../src/channels/voice/voice-runtime.js';
+import { partnerCaller, principalCaller } from '../../../../src/channels/voice/test-fixtures.js';
+import { FakeAudioTransport } from '../../../../src/channels/voice/fake-audio-transport.js';
+import { FakeSttProvider, TtsHttpError } from '../../../../src/speech/index.js';
+import type { PcmFrame, TextToSpeechProvider, TtsSynthesizeOptions } from '../../../../src/speech/index.js';
+import type { VoiceSessionRecord, VoiceSessionStore } from '../../../../src/channels/voice/session-store.js';
+
+/** Slim spoken prompt with no identity/roster/outbound/time — includes shared modules. */
+const SLIM_VOICE_PROMPT = [
+  VOICE_SYSTEM_ADDENDUM,
+  VOICE_TOOL_RESULT_POLICY,
+  DATE_RESOLVE_GUARDRAIL,
+  VOICE_ASYNC_OFFRAMP_GUIDANCE,
+].join('\n\n');
+
+const logger = createSilentLogger();
+const usage = { inputTokens: 1, outputTokens: 1, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 };
+const provenance = { requestedModel: 'fake', actualModel: 'fake', providerRequestId: 'req_1' };
+const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+/** Poll until TTS has published a frame. A fixed sleep flakes when the runner is slow. */
+async function waitForPublishedFrame(
+  transport: { publishedFrames: unknown[] },
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (transport.publishedFrames.length === 0 && Date.now() < deadline) {
+    await delay(10);
+  }
+}
+
+/** turnStats from the session's voice.session.ended event (#2240). */
+function endedTurnStats(events: BusEvent[]): unknown {
+  const ended = events.filter(e => e.type === 'voice.session.ended');
+  expect(ended).toHaveLength(1);
+  return (ended[0] as { payload: { turnStats?: unknown } }).payload.turnStats;
+}
+
+/** Contents of the inbound.message events — one per user turn run. */
+function inboundContents(events: BusEvent[]): string[] {
+  return events
+    .filter(e => e.type === 'inbound.message')
+    .map(e => (e as { payload: { content: string } }).payload.content);
+}
+
+const replyScript = (text: string): LLMStreamEvent[] => [
+  { type: 'text_delta', text: `${text} ` },
+  { type: 'message_end', content: text, usage, provenance },
+];
+
+/** Fake streaming LLM provider driven by scripted event sequences. */
+class FakeStreamProvider implements LLMProvider {
+  readonly id = 'fake-stream';
+  /** Messages passed to each stream() call, for context-assembly assertions. */
+  readonly seenMessages: Message[][] = [];
+  /** Date.now() at the start of each stream() call. */
+  readonly streamStartedAt: number[] = [];
+  constructor(
+    private readonly scripts: LLMStreamEvent[][],
+    private readonly delayMs = 0,
+  ) {}
+  private call = 0;
+  async chat(): Promise<LLMResponse> {
+    return { type: 'text', content: '', usage, provenance };
+  }
+  async *stream(params: { messages?: Message[]; options?: Record<string, unknown> }): AsyncIterable<LLMStreamEvent> {
+    this.streamStartedAt.push(Date.now());
+    this.seenMessages.push(params.messages ?? []);
+    const script = this.scripts[this.call] ?? [];
+    this.call += 1;
+    const signal = params.options?.signal as AbortSignal | undefined;
+    for (const event of script) {
+      if (this.delayMs > 0) await delay(this.delayMs);
+      if (signal?.aborted) return;
+      yield event;
+    }
+  }
+}
+
+/** TTS that yields many frames slowly, so barge-in can interrupt mid-synthesis. */
+class SlowTtsProvider implements TextToSpeechProvider {
+  readonly id = 'slow-tts';
+  readonly requests: TtsSynthesizeOptions[] = [];
+  readonly cancelled = new Set<string>();
+  constructor(private readonly frameCount = 20, private readonly perFrameMs = 5) {}
+  async *synthesize(opts: TtsSynthesizeOptions): AsyncIterable<PcmFrame> {
+    this.requests.push(opts);
+    for (let i = 0; i < this.frameCount; i += 1) {
+      await delay(this.perFrameMs);
+      if (this.cancelled.has(opts.streamId) || opts.signal?.aborted) return;
+      yield { pcm: new Int16Array(160), sampleRate: opts.sampleRate ?? 24000, channels: 1 };
+    }
+  }
+  cancel(streamId: string): void {
+    this.cancelled.add(streamId);
+  }
+}
+
+/** In-memory VoiceSessionStore stand-in. */
+function fakeStore(): { store: VoiceSessionStore; statuses: string[]; ended: string[]; endReasons: string[] } {
+  const statuses: string[] = [];
+  const ended: string[] = [];
+  const endReasons: string[] = [];
+  const rec = (id: string, status: string, endReason: string | null = null): VoiceSessionRecord => ({
+    id,
+    conversationId: `voice:${id}`,
+    livekitRoom: `voice-${id}`,
+    callerContactId: null,
+    status: status as VoiceSessionRecord['status'],
+    startedAt: new Date(Date.now() - 1000),
+    endedAt: status === 'ended' ? new Date() : null,
+    endReason: status === 'ended' ? (endReason ?? 'test') : null,
+    metadata: {},
+  });
+  const store = {
+    async updateStatus(id: string, status: string) {
+      statuses.push(status);
+      return rec(id, status);
+    },
+    async endSession(id: string, reason: string) {
+      if (ended.includes(id)) return null;
+      ended.push(id);
+      endReasons.push(reason);
+      return rec(id, 'ended', reason);
+    },
+  } as unknown as VoiceSessionStore;
+  return { store, statuses, ended, endReasons };
+}
+
+/** TTS that throws on every synthesize() call (persistent provider failure). */
+class FailingTtsProvider implements TextToSpeechProvider {
+  readonly id = 'failing-tts';
+  readonly failures: string[] = [];
+  constructor(private readonly err: Error = new TtsHttpError(500, 'Cartesia TTS request failed with HTTP 500')) {}
+  async *synthesize(opts: TtsSynthesizeOptions): AsyncIterable<PcmFrame> {
+    this.failures.push(opts.text);
+    throw this.err;
+  }
+  cancel(): void {}
+}
+
+/** TTS that fails a fixed number of times, then synthesizes normally. */
+class FlakyThenOkTtsProvider implements TextToSpeechProvider {
+  readonly id = 'flaky-tts';
+  failures = 0;
+  successes = 0;
+  constructor(private readonly failCount: number) {}
+  async *synthesize(opts: TtsSynthesizeOptions): AsyncIterable<PcmFrame> {
+    if (this.failures < this.failCount) {
+      this.failures += 1;
+      throw new TtsHttpError(503, 'Cartesia TTS request failed with HTTP 503');
+    }
+    this.successes += 1;
+    yield { pcm: new Int16Array(160), sampleRate: opts.sampleRate ?? 24000, channels: 1 };
+  }
+  cancel(): void {}
+}
+
+function makeRuntime(overrides: {
+  llm: LLMProvider;
+  tts?: TextToSpeechProvider;
+  transport?: FakeAudioTransport;
+  store?: VoiceSessionStore;
+  invokeTool?: (call: never, ctx?: { conversationId: string; sessionId: string }) => Promise<{ content: string; is_error?: boolean }>;
+  deleteRoom?: (roomName: string) => Promise<void>;
+  workingMemory?: WorkingMemory;
+  timezone?: string;
+  historyReadTimeoutMs?: number;
+  outboundContextService?: OutboundContextService;
+  /** Late-bound coordinator bridge (tools + context providers), applied via configureTools(). */
+  bridge?: VoiceToolBridge;
+  /**
+   * Spy/override for the LiveKit transport factory (#1672 transport-override
+   * tests need to assert it is never called when a session supplies its own
+   * transport). Defaults to the existing `() => transport` fixture behavior.
+   */
+  createTransport?: (opts: { roomName: string; token: string; livekitUrl: string; callerIdentity: string }) => FakeAudioTransport;
+  /** End-of-speech hold (#2240). Defaults to 0 here so a final starts its turn at once. */
+  turnHoldMs?: number;
+  maxUtteranceBytes?: number;
+  logger?: Logger;
+}) {
+  const bus = new EventBus(logger);
+  const events: BusEvent[] = [];
+  bus.subscribe('inbound.message', 'system', async e => {
+    events.push(e);
+  });
+  bus.subscribe('voice.session.ended', 'system', async e => {
+    events.push(e);
+  });
+  const stt = new FakeSttProvider();
+  const transport = overrides.transport ?? new FakeAudioTransport();
+  const tts = overrides.tts ?? new SlowTtsProvider();
+  const store = overrides.store ?? fakeStore().store;
+  const runtime = new VoiceRuntime({
+    bus,
+    logger: overrides.logger ?? logger,
+    sessionStore: store,
+    stt,
+    tts,
+    llm: overrides.llm,
+    model: 'fake',
+    livekitUrl: 'ws://localhost',
+    createTransport: overrides.createTransport ?? (() => transport),
+    invokeTool: overrides.invokeTool as never,
+    deleteRoom: overrides.deleteRoom,
+    workingMemory: overrides.workingMemory,
+    timezone: overrides.timezone,
+    historyReadTimeoutMs: overrides.historyReadTimeoutMs,
+    outboundContextService: overrides.outboundContextService,
+    turnHoldMs: overrides.turnHoldMs ?? 0,
+    maxUtteranceBytes: overrides.maxUtteranceBytes,
+  });
+  if (overrides.bridge) runtime.configureTools(overrides.bridge);
+  return { runtime, bus, events, stt, transport, tts, store };
+}
+
+describe('VoiceRuntime', () => {
+  it('refuses a non-streaming LLM provider', () => {
+    const nonStreaming: LLMProvider = {
+      id: 'no-stream',
+      async chat() {
+        return { type: 'text', content: '', usage, provenance };
+      },
+    };
+    expect(() => makeRuntime({ llm: nonStreaming })).toThrow(/stream/);
+  });
+
+  it('runs a full turn: publishes inbound.message and speaks TTS frames', async () => {
+    const llm = new FakeStreamProvider([
+      [
+        { type: 'text_delta', text: 'Hi there. ' },
+        { type: 'message_end', content: 'Hi there.', usage, provenance },
+      ],
+    ]);
+    const { runtime, events, stt, transport } = makeRuntime({ llm, tts: new SlowTtsProvider(3, 1) });
+
+    await runtime.startSession({
+      sessionId: 's1',
+      conversationId: 'voice:s1',
+      roomName: 'voice-s1',
+      agentToken: 'tok',
+      caller: principalCaller(),
+    });
+
+    stt.emit({ text: 'hello curia', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s1');
+
+    const inbound = events.find(e => e.type === 'inbound.message');
+    expect(inbound).toBeDefined();
+    expect((inbound as { payload: { channelId: string; content: string } }).payload.channelId).toBe('voice');
+    expect((inbound as { payload: { content: string } }).payload.content).toBe('hello curia');
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+  });
+
+  it('barge-in cancels in-flight TTS and aborts the turn', async () => {
+    // Long assistant reply, streamed slowly so we can interrupt.
+    const llm = new FakeStreamProvider(
+      [
+        [
+          { type: 'text_delta', text: 'This is a fairly long spoken answer. ' },
+          { type: 'text_delta', text: 'It keeps going for a while longer. ' },
+          { type: 'message_end', content: 'This is a fairly long spoken answer. It keeps going for a while longer.', usage, provenance },
+        ],
+      ],
+      3,
+    );
+    const tts = new SlowTtsProvider(50, 5);
+    const { runtime, stt, transport } = makeRuntime({ llm, tts });
+
+    await runtime.startSession({
+      sessionId: 's2',
+      conversationId: 'voice:s2',
+      roomName: 'voice-s2',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'tell me a long story', isFinal: true, speechFinal: true });
+
+    // Let the assistant start speaking. Poll: a fixed 40ms sleep misses the first
+    // frame when the runner is busy, and the barge-in assertion then fails closed.
+    await waitForPublishedFrame(transport);
+    const framesBeforeBarge = transport.publishedFrames.length;
+    expect(framesBeforeBarge).toBeGreaterThan(0);
+
+    // Principal interrupts (interim transcript while assistant is talking).
+    // Must clear the confidence/length gate (min 3 chars).
+    stt.emit({ text: 'actually wait', isFinal: false, confidence: 0.9 });
+
+    await runtime.awaitIdle('s2');
+    // TTS was cancelled for the in-flight stream.
+    expect(tts.cancelled.size).toBeGreaterThan(0);
+    const framesAfter = transport.publishedFrames.length;
+
+    // Give any (incorrectly) un-cancelled synthesis time to keep publishing.
+    await delay(60);
+    expect(transport.publishedFrames.length).toBe(framesAfter);
+  });
+
+  it('ignores low-confidence / tiny interim transcripts for barge-in (echo guard)', async () => {
+    const llm = new FakeStreamProvider(
+      [
+        [
+          { type: 'text_delta', text: 'Speaking for a while. ' },
+          { type: 'message_end', content: 'Speaking for a while.', usage, provenance },
+        ],
+      ],
+      2,
+    );
+    const tts = new SlowTtsProvider(40, 8);
+    const { runtime, stt, transport } = makeRuntime({ llm, tts });
+
+    await runtime.startSession({
+      sessionId: 's-echo',
+      conversationId: 'voice:s-echo',
+      roomName: 'voice-s-echo',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'say something', isFinal: true, speechFinal: true });
+    await waitForPublishedFrame(transport);
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+
+    // Tiny + low-confidence interims must NOT cancel the assistant.
+    stt.emit({ text: 'hi', isFinal: false, confidence: 0.9 }); // too short
+    stt.emit({ text: 'hello there', isFinal: false, confidence: 0.1 }); // too low confidence
+    await delay(20);
+    expect(tts.cancelled.size).toBe(0);
+
+    await runtime.awaitIdle('s-echo');
+  });
+
+  it('ends the session when the audio transport closes (ungraceful hangup)', async () => {
+    const llm = new FakeStreamProvider([[{ type: 'message_end', content: 'ok', usage, provenance }]]);
+    const deleteRoom = vi.fn(async () => {});
+    const { runtime, events, transport } = makeRuntime({ llm, deleteRoom });
+
+    await runtime.startSession({
+      sessionId: 's-close',
+      conversationId: 'voice:s-close',
+      roomName: 'voice-s-close',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    expect(runtime.activeSessionCount).toBe(1);
+
+    transport.emitClose('principal_disconnected');
+    // Allow the void endSession to settle.
+    await delay(30);
+
+    expect(runtime.activeSessionCount).toBe(0);
+    expect(transport.disconnectCount).toBe(1);
+    expect(events.filter(e => e.type === 'voice.session.ended')).toHaveLength(1);
+    expect(deleteRoom).toHaveBeenCalledWith('voice-s-close');
+  });
+
+  it('endSession disconnects transport and publishes voice.session.ended once', async () => {
+    const llm = new FakeStreamProvider([[{ type: 'message_end', content: 'ok', usage, provenance }]]);
+    const { runtime, events, transport } = makeRuntime({ llm });
+
+    await runtime.startSession({
+      sessionId: 's3',
+      conversationId: 'voice:s3',
+      roomName: 'voice-s3',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    expect(runtime.activeSessionCount).toBe(1);
+
+    const ended = await runtime.endSession('s3', 'console_hangup');
+    expect(ended).not.toBeNull();
+    expect(transport.disconnectCount).toBe(1);
+    expect(runtime.activeSessionCount).toBe(0);
+    expect(events.filter(e => e.type === 'voice.session.ended').length).toBe(1);
+
+    // Second end is a no-op for the ended event (store returns null).
+    const again = await runtime.endSession('s3', 'console_hangup');
+    expect(again).toBeNull();
+    expect(events.filter(e => e.type === 'voice.session.ended').length).toBe(1);
+  });
+
+  it('endSession resolves (not rejects) when the store write fails', async () => {
+    const llm = new FakeStreamProvider([[{ type: 'message_end', content: 'ok', usage, provenance }]]);
+    // endSession() is fired-and-forgotten (`void this.endSession(...)`) from
+    // stt.onError / transport.onClose, so a throwing store write would surface as
+    // an unhandled rejection and crash the process. It must be swallowed + logged.
+    const store = {
+      async endSession() {
+        throw new Error('db down');
+      },
+    } as unknown as VoiceSessionStore;
+    const { runtime, transport } = makeRuntime({ llm, store });
+
+    await runtime.startSession({
+      sessionId: 's5',
+      conversationId: 'voice:s5',
+      roomName: 'voice-s5',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    await expect(runtime.endSession('s5', 'stt_error')).resolves.toBeNull();
+    // Transport teardown still ran before the failing store write.
+    expect(transport.disconnectCount).toBe(1);
+    expect(runtime.activeSessionCount).toBe(0);
+  });
+
+  it('ends the session with tts_error after repeated TTS synthesis failures (#1556)', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('First reply.'),
+      replyScript('Second reply.'),
+      replyScript('Third reply.'),
+    ]);
+    const tts = new FailingTtsProvider();
+    const { store, endReasons } = fakeStore();
+    const deleteRoom = vi.fn(async () => {});
+    const { runtime, events, stt, transport } = makeRuntime({ llm, tts, store, deleteRoom });
+
+    await runtime.startSession({
+      sessionId: 's-tts-fail',
+      conversationId: 'voice:s-tts-fail',
+      roomName: 'voice-s-tts-fail',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'one', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-tts-fail');
+    expect(runtime.activeSessionCount).toBe(1);
+
+    stt.emit({ text: 'two', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-tts-fail');
+    expect(runtime.activeSessionCount).toBe(1);
+
+    stt.emit({ text: 'three', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-tts-fail');
+    // void endSession from the third failure — let it settle.
+    await delay(30);
+
+    expect(tts.failures.length).toBeGreaterThanOrEqual(3);
+    expect(runtime.activeSessionCount).toBe(0);
+    expect(transport.disconnectCount).toBe(1);
+    expect(endReasons).toEqual(['tts_error']);
+    const ended = events.filter(e => e.type === 'voice.session.ended');
+    expect(ended).toHaveLength(1);
+    expect((ended[0] as { payload: { reason: string } }).payload.reason).toBe('tts_error');
+    expect(deleteRoom).toHaveBeenCalledWith('voice-s-tts-fail');
+  });
+
+  it('does not tear down on a single transient TTS failure (#1556)', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('First reply.'),
+      replyScript('Second reply.'),
+    ]);
+    const tts = new FlakyThenOkTtsProvider(1);
+    const { runtime, events, stt, transport } = makeRuntime({ llm, tts });
+
+    await runtime.startSession({
+      sessionId: 's-tts-blip',
+      conversationId: 'voice:s-tts-blip',
+      roomName: 'voice-s-tts-blip',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'one', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-tts-blip');
+    stt.emit({ text: 'two', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-tts-blip');
+    await delay(20);
+
+    expect(tts.failures).toBe(1);
+    expect(tts.successes).toBe(1);
+    expect(runtime.activeSessionCount).toBe(1);
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+    expect(events.filter(e => e.type === 'voice.session.ended')).toHaveLength(0);
+  });
+
+  it('ends immediately on a hard TTS auth/voice-id failure (#1556)', async () => {
+    const llm = new FakeStreamProvider([replyScript('Hello.')]);
+    const tts = new FailingTtsProvider(new TtsHttpError(401, 'Cartesia TTS request failed with HTTP 401'));
+    const { store, endReasons } = fakeStore();
+    const { runtime, events, stt } = makeRuntime({ llm, tts, store });
+
+    await runtime.startSession({
+      sessionId: 's-tts-hard',
+      conversationId: 'voice:s-tts-hard',
+      roomName: 'voice-s-tts-hard',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'hello', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-tts-hard');
+    await delay(30);
+
+    expect(tts.failures).toHaveLength(1);
+    expect(runtime.activeSessionCount).toBe(0);
+    expect(endReasons).toEqual(['tts_error']);
+    expect(events.filter(e => e.type === 'voice.session.ended')).toHaveLength(1);
+  });
+
+  it('does not count transport publish failures as TTS synthesis failures (#1556)', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('First reply.'),
+      replyScript('Second reply.'),
+      replyScript('Third reply.'),
+    ]);
+    // Healthy TTS — every synthesize succeeds. Transport publish throws every time.
+    class ThrowingPublishTransport extends FakeAudioTransport {
+      override async publishAudio(): Promise<void> {
+        throw new Error('livekit publish failed');
+      }
+    }
+    const transport = new ThrowingPublishTransport();
+    const { store, endReasons } = fakeStore();
+    const { runtime, events, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      transport,
+      store,
+    });
+
+    await runtime.startSession({
+      sessionId: 's-pub-fail',
+      conversationId: 'voice:s-pub-fail',
+      roomName: 'voice-s-pub-fail',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    for (const utter of ['one', 'two', 'three'] as const) {
+      stt.emit({ text: utter, isFinal: true, speechFinal: true });
+      await runtime.awaitIdle('s-pub-fail');
+    }
+    await delay(30);
+
+    // Three publish-failed turns must not escalate to tts_error.
+    expect(runtime.activeSessionCount).toBe(1);
+    expect(endReasons).toEqual([]);
+    expect(events.filter(e => e.type === 'voice.session.ended')).toHaveLength(0);
+  });
+
+  it('invokes tools during a voice turn via the runner tool loop', async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'lookup', input: {} }], usage, provenance }],
+      [{ type: 'text_delta', text: 'Found it. ' }, { type: 'message_end', content: 'Found it.', usage, provenance }],
+    ]);
+    const invokeTool = vi.fn(async () => ({ content: 'result' }));
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), invokeTool });
+
+    await runtime.startSession({
+      sessionId: 's4',
+      conversationId: 'voice:s4',
+      roomName: 'voice-s4',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'look something up', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s4');
+
+    expect(invokeTool).toHaveBeenCalledOnce();
+  });
+
+  it('barge-in during a hung tool unwinds within 100ms and drops the late result (#2265)', async () => {
+    const lateResult = 'LATE_SECRET_RESULT_should_not_leak';
+    let releaseTool: (result: { content: string }) => void = () => {};
+    const gate = new Promise<{ content: string }>((resolve) => {
+      releaseTool = resolve;
+    });
+    let toolSettled = false;
+    const invokeTool = vi.fn(() => gate.then((result) => {
+      toolSettled = true;
+      return result;
+    }));
+    const info = vi.fn();
+    const spyLogger = {
+      debug: vi.fn(),
+      info,
+      warn: vi.fn(),
+      error: vi.fn(),
+      fatal: vi.fn(),
+      trace: vi.fn(),
+      child: () => spyLogger,
+    } as unknown as Logger;
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'lookup', input: {} }], usage, provenance }],
+      replyScript('Moving on.'),
+    ]);
+    const wm = WorkingMemory.createInMemory();
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      invokeTool,
+      workingMemory: wm,
+      logger: spyLogger,
+    });
+
+    await runtime.startSession({
+      sessionId: 'tool-barge',
+      conversationId: 'voice:tool-barge',
+      roomName: 'voice-tool-barge',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'look this up', isFinal: true, speechFinal: true });
+    await vi.waitFor(() => {
+      expect(invokeTool).toHaveBeenCalledOnce();
+    });
+
+    const bargeAt = Date.now();
+    stt.emit({ text: 'never mind the lookup', isFinal: true, speechFinal: true, confidence: 0.95 });
+    await vi.waitFor(() => {
+      const followUp = llm.seenMessages.findIndex((msgs) =>
+        msgs.some((m) => m.content === 'never mind the lookup'),
+      );
+      expect(followUp).toBeGreaterThan(0);
+    });
+    const followUp = llm.seenMessages.findIndex((msgs) =>
+      msgs.some((m) => m.content === 'never mind the lookup'),
+    );
+    // toolSettled staying false is the proof the follow-up did not wait on the
+    // tool. The clock is only a margin under the 15s skill timeout: a loaded
+    // runner can miss a tight bound even when the logic is right (#2265 review).
+    expect(toolSettled).toBe(false);
+    expect(llm.streamStartedAt[followUp]! - bargeAt).toBeLessThan(1_000);
+
+    const idle = await Promise.race([
+      runtime.awaitIdle('tool-barge').then(() => 'idle' as const),
+      delay(1_000).then(() => 'still-waiting' as const),
+    ]);
+    expect(idle).toBe('idle');
+    expect(toolSettled).toBe(false);
+    const streamsBeforeLateResult = llm.streamStartedAt.length;
+    expect(JSON.stringify(llm.seenMessages)).toContain('never mind the lookup');
+
+    releaseTool({ content: lateResult });
+    await vi.waitFor(() => {
+      const discarded = info.mock.calls.filter((call) => call[1] === 'voice tool result discarded after barge-in');
+      expect(discarded).toHaveLength(1);
+      expect(discarded[0]![0]).toMatchObject({ tool: 'lookup', toolCallId: 'c1' });
+    });
+    expect(toolSettled).toBe(true);
+    expect(llm.streamStartedAt).toHaveLength(streamsBeforeLateResult);
+
+    const flat = JSON.stringify(llm.seenMessages);
+    expect(flat).not.toContain(lateResult);
+    expect(flat).not.toContain(ABORTED_TOOL_RESULT);
+    const stored = await wm.getHistory('voice:tool-barge', 'coordinator', { raw: true });
+    const storedFlat = JSON.stringify(stored);
+    expect(storedFlat).not.toContain(lateResult);
+    expect(storedFlat).not.toContain(ABORTED_TOOL_RESULT);
+  });
+
+  it("hands the tool bridge the turn's inbound.message id, the parent of its tool audit (#1968)", async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'lookup', input: {} }], usage, provenance }],
+      [{ type: 'text_delta', text: 'Found it. ' }, { type: 'message_end', content: 'Found it.', usage, provenance }],
+    ]);
+    const invokeTool = vi.fn<VoiceToolBridge['invokeTool']>(async () => ({ content: 'result' }));
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      bridge: { resolveVoiceTools: () => [], invokeTool },
+    });
+
+    await runtime.startSession({
+      sessionId: 's-audit',
+      conversationId: 'voice:s-audit',
+      roomName: 'voice-s-audit',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'look something up', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-audit');
+
+    const inbound = events.find(e => e.type === 'inbound.message');
+    expect(inbound).toBeDefined();
+    expect(invokeTool).toHaveBeenCalledOnce();
+    expect(invokeTool.mock.calls[0]![1].turnEventId).toBe(inbound!.id);
+  });
+
+  it('withholds the inbound.message id when its publish failed, so tool audit never parents on a missing row', async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'lookup', input: {} }], usage, provenance }],
+      [{ type: 'text_delta', text: 'Found it. ' }, { type: 'message_end', content: 'Found it.', usage, provenance }],
+    ]);
+    const invokeTool = vi.fn<VoiceToolBridge['invokeTool']>(async () => ({ content: 'result' }));
+    const { runtime, stt, bus } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      bridge: { resolveVoiceTools: () => [], invokeTool },
+    });
+    // The audit write-ahead failing is the only way publish() rejects here.
+    const publish = bus.publish.bind(bus);
+    vi.spyOn(bus, 'publish').mockImplementation(async (layer, event) => {
+      if (event.type === 'inbound.message') throw new Error('audit write failed');
+      return publish(layer, event);
+    });
+
+    await runtime.startSession({
+      sessionId: 's-audit-fail',
+      conversationId: 'voice:s-audit-fail',
+      roomName: 'voice-s-audit-fail',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'look something up', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-audit-fail');
+
+    expect(invokeTool).toHaveBeenCalledOnce();
+    expect(invokeTool.mock.calls[0]![1].turnEventId).toBeUndefined();
+  });
+});
+
+describe('VoiceRuntime brain/context parity (#1551)', () => {
+  const reply = (text: string): LLMStreamEvent[] => [
+    { type: 'text_delta', text: `${text} ` },
+    { type: 'message_end', content: text, usage, provenance },
+  ];
+
+  /** Plain-string contents of a message list (voice turns never build block-array content here). */
+  const textContents = (msgs: Message[]): string[] =>
+    msgs.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)));
+
+  async function start(runtime: VoiceRuntime, id: string): Promise<void> {
+    await runtime.startSession({
+      sessionId: id,
+      conversationId: `voice:${id}`,
+      roomName: `voice-${id}`,
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+  }
+
+  it('assembles the spoken-turn system prompt: identity, brevity, honesty, delegation + roster, time', async () => {
+    const llm = new FakeStreamProvider([reply('Hello.')]);
+    const bridge: VoiceToolBridge = {
+      resolveVoiceTools: () => [],
+      invokeTool: async () => ({ content: 'ok' }),
+      identityBlock: () => '## Identity & Communication Contract\nYou are Vera, Chief of Staff.',
+      specialistRoster: () => '- @calendar: Manages the calendar\n- @contacts: Contact intelligence',
+    };
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      timezone: 'America/Toronto',
+      bridge,
+    });
+    await start(runtime, 'sp1');
+    stt.emit({ text: 'what is on my calendar tomorrow', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('sp1');
+
+    const messages = llm.seenMessages[0]!;
+    const system = messages[0]!;
+    expect(system.role).toBe('system');
+    const systemText = typeof system.content === 'string' ? system.content : '';
+    // Persona/identity parity with the coordinator preamble.
+    expect(systemText).toContain('You are Vera, Chief of Staff.');
+    // Spoken brevity policy still applies with fuller context enabled.
+    expect(systemText).toContain(VOICE_SYSTEM_ADDENDUM);
+    // Honest-negative policy: failed checks are never narrated as empty results.
+    expect(systemText).toContain(VOICE_TOOL_RESULT_POLICY);
+    // Delegation guidance + roster so specialist domains are reachable from voice.
+    expect(systemText).toContain(VOICE_DELEGATION_GUIDANCE);
+    expect(systemText).toContain('## Available Specialists');
+    expect(systemText).toContain('- @calendar: Manages the calendar');
+    // Same date/timezone grounding the coordinator gets; dynamic block last so
+    // the static prefix stays provider-cacheable.
+    expect(systemText).toContain('## Current Date & Time');
+    expect(systemText).toContain('Timezone: America/Toronto');
+    expect(systemText.indexOf('## Current Date & Time'))
+      .toBeGreaterThan(systemText.indexOf('## Available Specialists'));
+    // The utterance is the final message, exactly once.
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'what is on my calendar tomorrow' });
+    expect(messages.filter(m => m.content === 'what is on my calendar tomorrow')).toHaveLength(1);
+  });
+
+  it('degrades to the slim prompt when no bridge context or timezone is configured', async () => {
+    const llm = new FakeStreamProvider([reply('Hi.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1) });
+    await start(runtime, 'sp2');
+    stt.emit({ text: 'hello', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('sp2');
+
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toBe(SLIM_VOICE_PROMPT);
+  });
+
+  it('omits a throwing identity block and still runs the turn', async () => {
+    const llm = new FakeStreamProvider([reply('Still here.')]);
+    const bridge: VoiceToolBridge = {
+      resolveVoiceTools: () => [],
+      invokeTool: async () => ({ content: 'ok' }),
+      identityBlock: () => {
+        throw new Error('identity compile failed');
+      },
+      specialistRoster: () => '- @calendar: Manages the calendar',
+    };
+    const { runtime, stt, transport } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), bridge });
+    await start(runtime, 'sp3');
+    stt.emit({ text: 'are you there', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('sp3');
+
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toContain(VOICE_SYSTEM_ADDENDUM);
+    expect(system.content).toContain('## Available Specialists');
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+  });
+
+  it('sources spoken-turn context from working_memory, including turns persisted before this process', async () => {
+    const wm = WorkingMemory.createInMemory();
+    // Turns persisted mid-call by a previous process — must not be silently dropped.
+    await wm.addTurn('voice:wm1', 'coordinator', { role: 'user', content: 'remember the budget is 50k' });
+    await wm.addTurn('voice:wm1', 'coordinator', { role: 'assistant', content: 'Noted: the budget is 50k.' });
+
+    const llm = new FakeStreamProvider([reply('It is 50k.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'wm1');
+    stt.emit({ text: 'what was the budget again', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm1');
+
+    const messages = llm.seenMessages[0]!;
+    const contents = textContents(messages);
+    expect(contents).toContain('remember the budget is 50k');
+    expect(contents).toContain('Noted: the budget is 50k.');
+    // Current utterance appended exactly once, as the last message.
+    expect(messages[messages.length - 1]!.content).toBe('what was the budget again');
+    expect(contents.filter(c => c === 'what was the budget again')).toHaveLength(1);
+  });
+
+  it('keeps console history and spoken-turn context single-sourced across turns', async () => {
+    const wm = WorkingMemory.createInMemory();
+    const llm = new FakeStreamProvider([reply('Hi there.'), reply('Yes, still here.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'wm2');
+
+    stt.emit({ text: 'hello curia', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm2');
+    stt.emit({ text: 'still with me', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm2');
+
+    // Turn 2's LLM context contains turn 1 as reloaded from the store.
+    const second = llm.seenMessages[1]!;
+    const contents = textContents(second);
+    expect(contents).toContain('hello curia');
+    expect(contents).toContain('Hi there.');
+    expect(second[second.length - 1]!.content).toBe('still with me');
+
+    // The store holds exactly what the console history endpoint would read.
+    const history = await wm.getHistory('voice:wm2', 'coordinator');
+    expect(history).toEqual([
+      { role: 'user', content: 'hello curia' },
+      { role: 'assistant', content: 'Hi there.' },
+      { role: 'user', content: 'still with me' },
+      { role: 'assistant', content: 'Yes, still here.' },
+    ]);
+  });
+
+  it('starts the spoken reply without waiting for a hanging summarizer (#2266)', async () => {
+    let releaseSummarizer: (response: LLMResponse) => void = () => {};
+    let summarizerResolved = false;
+    const summarizerHung = new Promise<LLMResponse>(resolve => {
+      releaseSummarizer = resolve;
+    });
+    const summarizer: LLMProvider = {
+      id: 'summarizer',
+      chat: vi.fn(() => summarizerHung.then(response => {
+        summarizerResolved = true;
+        return response;
+      })),
+    };
+
+    const queryHandler = (sql: string): { rows: unknown[] } => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('SELECT COUNT(*)')) return { rows: [{ count: '21' }] };
+      if (normalized.startsWith('SELECT id, role, content, created_at')) {
+        return {
+          rows: [{
+            id: '00000000-0000-0000-0000-000000000001',
+            role: 'user',
+            content: 'earlier turn',
+            created_at: new Date('2026-01-01T12:00:00Z'),
+          }],
+        };
+      }
+      if (normalized.startsWith('SELECT created_at')) {
+        return { rows: [{ created_at: new Date('2026-01-01T12:00:10Z') }] };
+      }
+      return { rows: [] };
+    };
+    const pool = {
+      query: vi.fn().mockImplementation((sql: string) => Promise.resolve(queryHandler(sql))),
+      connect: vi.fn().mockImplementation(() => Promise.resolve({
+        query: vi.fn().mockImplementation((sql: string) => Promise.resolve(queryHandler(sql))),
+        release: vi.fn(),
+      })),
+    } as unknown as DbPool;
+    const memoryLogger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const wm = WorkingMemory.createWithPostgres(
+      pool,
+      memoryLogger as never,
+      { threshold: 20, keepWindow: 10, provider: summarizer, model: 'claude-3-5-haiku-20241022' },
+    );
+
+    const llm = new FakeStreamProvider([reply('On my way.')]);
+    const { runtime, stt, transport } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+    });
+
+    try {
+      await start(runtime, 'sum1');
+      stt.emit({ text: 'what is next', isFinal: true, speechFinal: true });
+
+      const idle = runtime.awaitIdle('sum1');
+      const outcome = await Promise.race([
+        idle.then(() => 'reply' as const),
+        delay(2_000).then(() => 'blocked' as const),
+      ]);
+      expect(outcome).toBe('reply');
+      expect(transport.publishedFrames.length).toBeGreaterThan(0);
+      expect(llm.seenMessages.length).toBeGreaterThan(0);
+      await vi.waitFor(() => expect(summarizer.chat).toHaveBeenCalled());
+      expect(summarizerResolved).toBe(false);
+    } finally {
+      releaseSummarizer({ type: 'text', content: 'summary of earlier turns', usage, provenance });
+      await vi.waitFor(() => {
+        const completes = memoryLogger.info.mock.calls.filter(
+          call => call[1] === 'working_memory: summarization complete',
+        );
+        expect(completes.length).toBeGreaterThan(0);
+      });
+    }
+  });
+
+  it('survives a throwing roster provider and an invalid timezone (slimmer prompt, turn completes)', async () => {
+    const llm = new FakeStreamProvider([reply('Still speaking.')]);
+    const bridge: VoiceToolBridge = {
+      resolveVoiceTools: () => [],
+      invokeTool: async () => ({ content: 'ok' }),
+      identityBlock: () => '## Identity & Communication Contract\nYou are Vera, Chief of Staff.',
+      specialistRoster: () => {
+        throw new Error('registry down');
+      },
+    };
+    const { runtime, stt, transport } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      timezone: 'Not/AZone',
+      bridge,
+    });
+    await start(runtime, 'sp4');
+    stt.emit({ text: 'are you still there', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('sp4');
+
+    const system = llm.seenMessages[0]![0]!;
+    const systemText = typeof system.content === 'string' ? system.content : '';
+    // Healthy blocks still apply; the failing ones are omitted, not fatal.
+    expect(systemText).toContain(VOICE_SYSTEM_ADDENDUM);
+    expect(systemText).toContain('You are Vera, Chief of Staff.');
+    expect(systemText).not.toContain('## Available Specialists');
+    expect(systemText).not.toContain('## Current Date & Time');
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+  });
+
+  it('prefers in-process history when the store reads back empty after failed writes', async () => {
+    // addTurn fails warn-only, so a clean read returns [] while session.history
+    // still holds the conversation — the turn must not go amnesiac.
+    const failingWrites = {
+      addTurn: vi.fn(async () => {
+        throw new Error('insert failed');
+      }),
+      getHistory: vi.fn(async () => []),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([reply('First answer.'), reply('Second answer.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: failingWrites });
+    await start(runtime, 'wm4');
+
+    stt.emit({ text: 'first question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm4');
+    stt.emit({ text: 'second question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm4');
+
+    const second = llm.seenMessages[1]!;
+    const contents = textContents(second);
+    expect(contents).toContain('first question');
+    expect(contents).toContain('First answer.');
+    expect(second[second.length - 1]!.content).toBe('second question');
+  });
+
+  it('falls back to in-process history when the working_memory read exceeds the voice deadline', async () => {
+    const stalled = {
+      addTurn: vi.fn(async () => {}),
+      // Never settles — only the deadline can unblock the turn.
+      getHistory: vi.fn(() => new Promise(() => {})),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([reply('First answer.'), reply('Second answer.')]);
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: stalled,
+      historyReadTimeoutMs: 40,
+    });
+    await start(runtime, 'wm5');
+
+    stt.emit({ text: 'first question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm5');
+    stt.emit({ text: 'second question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm5');
+
+    // Both turns completed despite the stalled store...
+    expect(events.filter(e => e.type === 'inbound.message')).toHaveLength(2);
+    // ...and turn 2 still carried turn 1 via the in-process fallback.
+    const second = llm.seenMessages[1]!;
+    const contents = textContents(second);
+    expect(contents).toContain('first question');
+    expect(contents).toContain('First answer.');
+    expect(second[second.length - 1]!.content).toBe('second question');
+  });
+
+  it('falls back to in-process history when the working_memory read fails', async () => {
+    const failing = {
+      addTurn: vi.fn(async () => {}),
+      getHistory: vi.fn(async () => {
+        throw new Error('db down');
+      }),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([reply('First answer.'), reply('Second answer.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: failing });
+    await start(runtime, 'wm3');
+
+    stt.emit({ text: 'first question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm3');
+    stt.emit({ text: 'second question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('wm3');
+
+    // Both turns completed despite the failing store...
+    expect(events.filter(e => e.type === 'inbound.message')).toHaveLength(2);
+    // ...and turn 2 still carried turn 1 via the in-process fallback.
+    const second = llm.seenMessages[1]!;
+    const contents = textContents(second);
+    expect(contents).toContain('first question');
+    expect(contents).toContain('First answer.');
+    expect(second[second.length - 1]!.content).toBe('second question');
+  });
+
+  it('reaches specialist-delegated domains: calendar-tomorrow flows through the delegate tool', async () => {
+    const calendarEvents = JSON.stringify({
+      events: [
+        { title: 'Board meeting', start: '2026-07-27T09:00:00-04:00' },
+        { title: 'Lunch with Dana', start: '2026-07-27T12:00:00-04:00' },
+      ],
+    });
+    const spoken = 'You have the board meeting at nine and lunch with Dana at noon.';
+    const llm = new FakeStreamProvider([
+      [{
+        type: 'tool_use',
+        toolCalls: [{
+          id: 'c1',
+          name: 'delegate',
+          input: { agent: 'calendar', task: "What is on the principal's calendar tomorrow?" },
+        }],
+        usage,
+        provenance,
+      }],
+      reply(spoken),
+    ]);
+    const invokeTool = vi.fn(async () => ({ content: calendarEvents }));
+    const wm = WorkingMemory.createInMemory();
+    const bridge: VoiceToolBridge = {
+      resolveVoiceTools: () => [{
+        name: 'delegate',
+        description: 'Delegate a task to a specialist agent',
+        input_schema: { type: 'object', properties: {} },
+      }],
+      invokeTool,
+      specialistRoster: () => "- @calendar: Manages the principal's calendar",
+    };
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      timezone: 'America/Toronto',
+      workingMemory: wm,
+      bridge,
+    });
+    await start(runtime, 'cal1');
+    stt.emit({ text: 'what is on my calendar tomorrow', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('cal1');
+
+    // The turn had time grounding for "tomorrow" and the roster to know delegation exists.
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toContain('## Current Date & Time');
+    expect(system.content).toContain("- @calendar: Manages the principal's calendar");
+
+    // The delegate tool was invoked against the calendar specialist.
+    expect(invokeTool).toHaveBeenCalledOnce();
+    const [delegateCall] = invokeTool.mock.calls[0]! as unknown as [
+      { name: string; input: { agent: string } },
+      { conversationId: string; sessionId: string },
+    ];
+    expect(delegateCall.name).toBe('delegate');
+    expect(delegateCall.input.agent).toBe('calendar');
+
+    // The spoken answer reflects the delegated result and lands in the shared history.
+    const history = await wm.getHistory('voice:cal1', 'coordinator');
+    expect(history[history.length - 1]).toEqual({ role: 'assistant', content: spoken });
+  });
+});
+
+describe('VoiceRuntime outbound-context bridge (#1594)', () => {
+  const reply = (text: string): LLMStreamEvent[] => [
+    { type: 'text_delta', text: `${text} ` },
+    { type: 'message_end', content: text, usage, provenance },
+  ];
+
+  const signalAlertEntry: OutboundContextRow = {
+    id: 'entry-signal-alert',
+    conversationId: 'signal:ceo',
+    channelId: 'signal',
+    agentId: 'coordinator',
+    contentPreview: 'Google security alert: new sign-in on your account.',
+    expectedReply: null,
+    delegationHint: null,
+    metadata: { subject: 'security-alert' },
+    createdAt: new Date(Date.now() - 2 * 60 * 1000),
+    expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    released: false,
+    recipientContactIds: null,
+    recipientMessages: [],
+  };
+
+  /**
+   * OutboundContextService stand-in that stubs getActive but uses the real
+   * formatInjectionBlock (pure — pool is unused) so prompt assembly exercises
+   * the same trailing-whitespace shape production does.
+   */
+  function fakeOutboundContext(opts: {
+    entries?: OutboundContextRow[];
+    getActive?: () => Promise<OutboundContextRow[]>;
+  }): OutboundContextService {
+    const entries = opts.entries ?? [];
+    const real = new OutboundContextService(
+      // formatInjectionBlock is pure; getActive is overridden below.
+      { query: async () => ({ rows: [] }) } as never,
+      logger,
+    );
+    real.getActive = opts.getActive ?? (async () => entries);
+    return real;
+  }
+
+  it('buildVoiceSystemPrompt output is byte-identical when agendaBlock is absent or null', () => {
+    const baseline = buildVoiceSystemPrompt({
+      audience: { liveTurn: true },
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+    });
+    expect(buildVoiceSystemPrompt({
+      audience: { liveTurn: true },
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+      agendaBlock: null,
+    })).toBe(baseline);
+    expect(buildVoiceSystemPrompt({
+      audience: { liveTurn: true },
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+    })).toBe(baseline);
+  });
+
+  it('buildVoiceSystemPrompt puts agendaBlock immediately before the time block', () => {
+    const prompt = buildVoiceSystemPrompt({
+      outboundContextBlock: '[ACTIVE OUTBOUND CONTEXT]\nnote',
+      agendaBlock: '## Meeting agendas\nQ3 review',
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+      audience: { liveTurn: true },
+    });
+    const outboundAt = prompt.indexOf('[ACTIVE OUTBOUND CONTEXT');
+    const agendaAt = prompt.indexOf('## Meeting agendas');
+    const timeAt = prompt.indexOf('## Current Date & Time');
+    expect(outboundAt).toBeGreaterThanOrEqual(0);
+    expect(agendaAt).toBeGreaterThan(outboundAt);
+    expect(timeAt).toBeGreaterThan(agendaAt);
+  });
+
+  it('buildVoiceSystemPrompt appends a real formatInjectionBlock before the time block', () => {
+    const real = new OutboundContextService(
+      { query: async () => ({ rows: [] }) } as never,
+      logger,
+    );
+    const preamble = real.formatInjectionBlock([signalAlertEntry], '');
+    expect(preamble).not.toBeNull();
+    // Voice trims the trailing blank line left by originalContent === ''.
+    const outboundContextBlock = preamble!.trimEnd();
+    expect(outboundContextBlock.endsWith('---')).toBe(true);
+    expect(outboundContextBlock).not.toMatch(/\n\n$/);
+
+    const prompt = buildVoiceSystemPrompt({
+      identityBlock: '## Identity\nYou are Vera.',
+      outboundContextBlock,
+      timeContextBlock: '## Current Date & Time\nTimezone: America/Toronto',
+      audience: { liveTurn: true },
+    });
+    expect(prompt).toContain('[ACTIVE OUTBOUND CONTEXT');
+    expect(prompt).toContain('entry_id (for delegate\'s outbound_entry_id or context-bridge-release — NOT a Nylas/email message id): entry-signal-alert');
+    expect(prompt).toContain('via signal');
+    expect(prompt).toContain('Google security alert: new sign-in on your account.');
+    expect(prompt.indexOf('[ACTIVE OUTBOUND CONTEXT'))
+      .toBeLessThan(prompt.indexOf('## Current Date & Time'));
+    // Empty outbound → identical to the slim path without that section (still
+    // includes shared date-resolve + async off-ramp — ADR-038 / #1614).
+    expect(buildVoiceSystemPrompt({ audience: { liveTurn: true } })).toBe(SLIM_VOICE_PROMPT);
+  });
+
+  it('buildVoiceSystemPrompt composes the shared date-resolve guardrail', () => {
+    const prompt = buildVoiceSystemPrompt({ audience: { liveTurn: true } });
+    expect(prompt).toContain('date-resolve to verify');
+    expect(prompt).toContain('### Date & time');
+    expect(prompt.indexOf(VOICE_TOOL_RESULT_POLICY))
+      .toBeLessThan(prompt.indexOf(DATE_RESOLVE_GUARDRAIL));
+  });
+
+  it('buildVoiceSystemPrompt composes the voice async off-ramp guidance (#1614)', () => {
+    const prompt = buildVoiceSystemPrompt({ audience: { liveTurn: true } });
+    expect(prompt).toContain('async-offramp');
+    expect(prompt).toContain('Live-call scope and async off-ramp');
+    expect(prompt.indexOf(DATE_RESOLVE_GUARDRAIL))
+      .toBeLessThan(prompt.indexOf(VOICE_ASYNC_OFFRAMP_GUIDANCE));
+  });
+
+  it('buildVoiceSystemPrompt reflects a non-principal audience (#1598)', () => {
+    const prompt = buildVoiceSystemPrompt({
+      audience: { liveTurn: false, displayName: 'Alex Partner' },
+    });
+    expect(prompt).toContain('You are speaking to Alex Partner in a live voice call.');
+    expect(prompt).toContain('They are not the principal');
+    expect(prompt).not.toContain('You are speaking to the principal');
+    expect(prompt).toContain(VOICE_SPOKEN_STYLE_ADDENDUM);
+  });
+
+  it('buildVoiceAudienceLine omits displayName with U+2028/U+2029 (#1874)', () => {
+    for (const sep of ['\u2028', '\u2029']) {
+      const line = buildVoiceAudienceLine({
+        liveTurn: false,
+        displayName: `Alex${sep}Partner`,
+      });
+      expect(line).toBe(buildVoiceAudienceLine({ liveTurn: false }));
+      expect(line).toContain('a non-principal caller');
+      expect(line).not.toContain(`Alex${sep}Partner`);
+    }
+  });
+
+  it('buildVoiceSystemPrompt keeps the principal audience line for liveTurn callers', () => {
+    const prompt = buildVoiceSystemPrompt({
+      audience: { liveTurn: true, displayName: 'Joseph' },
+    });
+    expect(prompt).toContain(VOICE_SYSTEM_ADDENDUM);
+    expect(prompt).toBe(SLIM_VOICE_PROMPT);
+  });
+
+  it('injects an active Signal outbound-context entry into the spoken-turn system prompt', async () => {
+    const llm = new FakeStreamProvider([reply('Yes, I messaged you on Signal about the Google alert.')]);
+    const outbound = fakeOutboundContext({ entries: [signalAlertEntry] });
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      outboundContextService: outbound,
+    });
+
+    await runtime.startSession({
+      sessionId: 'oc1',
+      conversationId: 'voice:oc1',
+      roomName: 'voice-oc1',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'did you message me', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('oc1');
+
+    const system = llm.seenMessages[0]![0]!;
+    const systemText = typeof system.content === 'string' ? system.content : '';
+    expect(systemText).toContain('[ACTIVE OUTBOUND CONTEXT');
+    expect(systemText).toContain('entry_id (for delegate\'s outbound_entry_id or context-bridge-release — NOT a Nylas/email message id): entry-signal-alert');
+    expect(systemText).toContain('via signal');
+    expect(systemText).toContain('Google security alert: new sign-in on your account.');
+    // Utterance stays a separate user message — not wrapped into the system block.
+    expect(llm.seenMessages[0]![llm.seenMessages[0]!.length - 1]).toEqual({
+      role: 'user',
+      content: 'did you message me',
+    });
+    expect(systemText).not.toContain('did you message me');
+  });
+
+  it('does not inject outbound context for a non-principal (liveTurn=false) caller (#1598)', async () => {
+    const llm = new FakeStreamProvider([reply('Hello.')]);
+    const getActive = vi.fn(async () => [signalAlertEntry]);
+    const outbound = fakeOutboundContext({ getActive });
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      outboundContextService: outbound,
+    });
+
+    await runtime.startSession({
+      sessionId: 'oc-nonprincipal',
+      conversationId: 'voice:oc-nonprincipal',
+      roomName: 'voice-oc-nonprincipal',
+      agentToken: 'tok',
+      openingGreeting: false,
+      caller: partnerCaller(),
+    });
+    stt.emit({ text: 'did you message me', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('oc-nonprincipal');
+
+    expect(getActive).not.toHaveBeenCalled();
+    const system = llm.seenMessages[0]![0]!;
+    const systemText = typeof system.content === 'string' ? system.content : '';
+    expect(systemText).not.toContain('[ACTIVE OUTBOUND CONTEXT');
+    expect(systemText).toContain('You are speaking to Alex Partner');
+    expect(systemText).not.toContain('You are speaking to the principal');
+  });
+
+  it('leaves the system prompt unchanged when getActive returns no entries', async () => {
+    const llm = new FakeStreamProvider([reply('Hi.')]);
+    const getActive = vi.fn(async () => [] as OutboundContextRow[]);
+    const outbound = fakeOutboundContext({ getActive });
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      outboundContextService: outbound,
+    });
+
+    await runtime.startSession({
+      sessionId: 'oc2',
+      conversationId: 'voice:oc2',
+      roomName: 'voice-oc2',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'hello', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('oc2');
+
+    expect(getActive).toHaveBeenCalledOnce();
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toBe(SLIM_VOICE_PROMPT);
+    expect(system.content).not.toContain('[ACTIVE OUTBOUND CONTEXT');
+  });
+
+  it('still completes the turn when getActive throws', async () => {
+    const llm = new FakeStreamProvider([reply('Still here.')]);
+    const outbound = fakeOutboundContext({
+      getActive: async () => {
+        throw new Error('db down');
+      },
+    });
+    const { runtime, stt, transport } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      outboundContextService: outbound,
+    });
+
+    await runtime.startSession({
+      sessionId: 'oc3',
+      conversationId: 'voice:oc3',
+      roomName: 'voice-oc3',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'are you there', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('oc3');
+
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toBe(SLIM_VOICE_PROMPT);
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+  });
+
+  it('skips injection and still speaks when getActive exceeds the voice deadline', async () => {
+    const llm = new FakeStreamProvider([reply('Still speaking.')]);
+    const outbound = fakeOutboundContext({
+      // Never settles — only the deadline can unblock the turn.
+      getActive: () => new Promise(() => {}),
+    });
+    const { runtime, stt, transport } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      outboundContextService: outbound,
+      historyReadTimeoutMs: 40,
+    });
+
+    await runtime.startSession({
+      sessionId: 'oc4',
+      conversationId: 'voice:oc4',
+      roomName: 'voice-oc4',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'did you message me', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('oc4');
+
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toBe(SLIM_VOICE_PROMPT);
+    expect(system.content).not.toContain('[ACTIVE OUTBOUND CONTEXT');
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+  });
+});
+
+describe('VoiceRuntime orphaned-user history sanitization (#1776)', () => {
+  const reply = (text: string): LLMStreamEvent[] => [
+    { type: 'text_delta', text: `${text} ` },
+    { type: 'message_end', content: text, usage, provenance },
+  ];
+
+  function consecutiveUserPairs(msgs: Message[]): number {
+    let n = 0;
+    for (let i = 1; i < msgs.length; i += 1) {
+      if (msgs[i]!.role === 'user' && msgs[i - 1]!.role === 'user') n += 1;
+    }
+    return n;
+  }
+
+  /** LLM that throws on the first stream() then replies — models a failed assistant persist. */
+  class ThrowThenReplyProvider implements LLMProvider {
+    readonly id = 'throw-then-reply';
+    readonly seenMessages: Message[][] = [];
+    private call = 0;
+    constructor(private readonly replyEvents: LLMStreamEvent[]) {}
+    async chat(): Promise<LLMResponse> {
+      return { type: 'text', content: '', usage, provenance };
+    }
+    async *stream(params: { messages?: Message[]; options?: Record<string, unknown> }): AsyncIterable<LLMStreamEvent> {
+      this.seenMessages.push(params.messages ?? []);
+      if (this.call === 0) {
+        this.call += 1;
+        throw new Error('provider validation');
+      }
+      this.call += 1;
+      for (const event of this.replyEvents) yield event;
+    }
+  }
+
+  it('drops a stored trailing user turn so the next utterance is not consecutive-user', async () => {
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('voice:orphan1', 'coordinator', { role: 'user', content: 'remember the budget is 50k' });
+    await wm.addTurn('voice:orphan1', 'coordinator', { role: 'assistant', content: 'Noted: the budget is 50k.' });
+    await wm.addTurn('voice:orphan1', 'coordinator', { role: 'user', content: 'abandoned utterance' });
+
+    const llm = new FakeStreamProvider([reply('It is 50k.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'orphan1',
+      conversationId: 'voice:orphan1',
+      roomName: 'voice-orphan1',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'what was the budget again', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('orphan1');
+
+    const messages = llm.seenMessages[0]!;
+    expect(consecutiveUserPairs(messages)).toBe(0);
+    expect(messages.map(m => m.content)).not.toContain('abandoned utterance');
+    expect(messages[messages.length - 1]).toEqual({
+      role: 'user',
+      content: 'what was the budget again',
+    });
+    expect(messages.map(m => m.content)).toContain('remember the budget is 50k');
+    expect(messages.map(m => m.content)).toContain('Noted: the budget is 50k.');
+  });
+
+  it('greeting cue is not consecutive-user when prior history ends on an orphan', async () => {
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('voice:g-orphan', 'coordinator', { role: 'user', content: 'hung up mid-reply last call' });
+
+    const llm = new FakeStreamProvider([replyScript('Hey boss.')]);
+    const { runtime } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'g-orphan',
+      conversationId: 'voice:g-orphan',
+      roomName: 'voice-g-orphan',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('g-orphan');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    expect(consecutiveUserPairs(messages)).toBe(0);
+    expect(messages.map(m => m.content)).not.toContain('hung up mid-reply last call');
+    expect(messages[messages.length - 1]).toEqual({
+      role: 'user',
+      content: VOICE_GREETING_USER_MESSAGE,
+    });
+  });
+
+  it('never sends a coordinator-bucket failure marker as literal _curia_protocol JSON', async () => {
+    const workingMemory = {
+      addTurn: vi.fn(async () => {}),
+      getHistory: vi.fn(async () => [
+        { role: 'user' as const, content: 'console question' },
+        { role: 'assistant' as const, content: LLM_FAILURE_TURN_CONTENT },
+      ]),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([reply('Still here.')]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory,
+    });
+    await runtime.startSession({
+      sessionId: 'marker1',
+      conversationId: 'voice:marker1',
+      roomName: 'voice-marker1',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'are you there', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('marker1');
+
+    const messages = llm.seenMessages[0]!;
+    const contents = messages.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)));
+    expect(contents.some(c => c.includes('_curia_protocol'))).toBe(false);
+    expect(contents).toContain(LLM_FAILURE_USER_MESSAGE);
+    expect(contents).toContain('console question');
+    expect(consecutiveUserPairs(messages)).toBe(0);
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'are you there' });
+  });
+
+  it('pairs an aborted barge-in turn so the next utterance keeps its referent', async () => {
+    const wm = WorkingMemory.createInMemory();
+    const llm = new FakeStreamProvider(
+      [
+        [
+          { type: 'text_delta', text: 'Booking a flight to Tokyo next Tuesday. ' },
+          { type: 'message_end', content: 'Booking a flight to Tokyo next Tuesday.', usage, provenance },
+        ],
+        reply('Business class to Tokyo next Tuesday — noted.'),
+      ],
+      3,
+    );
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(50, 5),
+      workingMemory: wm,
+    });
+    await runtime.startSession({
+      sessionId: 'barge-ref',
+      conversationId: 'voice:barge-ref',
+      roomName: 'voice-barge-ref',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'book me a flight to Tokyo next Tuesday', isFinal: true, speechFinal: true });
+    await delay(40);
+    stt.emit({ text: 'wait, make it business class', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('barge-ref');
+
+    expect(llm.seenMessages.length).toBeGreaterThanOrEqual(2);
+    const second = llm.seenMessages[1]!;
+    expect(consecutiveUserPairs(second)).toBe(0);
+    expect(second.map(m => m.content)).toContain('book me a flight to Tokyo next Tuesday');
+    expect(second.map(m => m.content)).toContain('Booking a flight to Tokyo next Tuesday.');
+    expect(second.map(m => m.content)).not.toContain(LLM_FAILURE_USER_MESSAGE);
+    expect(second.map(m => m.content).some(c => typeof c === 'string' && c.includes('_curia_protocol'))).toBe(false);
+    expect(second[second.length - 1]).toEqual({
+      role: 'user',
+      content: 'wait, make it business class',
+    });
+
+    const stored = await wm.getHistory('voice:barge-ref', 'coordinator', { raw: true });
+    expect(stored.some(t => t.content === 'Booking a flight to Tokyo next Tuesday.')).toBe(true);
+    expect(stored.some(t => t.content === LLM_FAILURE_TURN_CONTENT)).toBe(false);
+
+    // Interrupting a reply that was playing is a real barge-in: the next
+    // utterance is its own turn, not joined to the interrupted one (#2240).
+    await runtime.endSession('barge-ref', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 0 });
+  });
+
+  it('joins a turn cancelled before any audio to the next utterance, with no failure marker (#2240)', async () => {
+    const wm = WorkingMemory.createInMemory();
+    const outbound = new OutboundContextService(
+      { query: async () => ({ rows: [] }) } as never,
+      logger,
+    );
+    // Holds the first turn in its prelude, so barge-in cancels it before any audio.
+    outbound.getActive = () => new Promise(() => {});
+
+    const llm = new FakeStreamProvider([reply('Afternoon only.')]);
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      outboundContextService: outbound,
+      historyReadTimeoutMs: 80,
+    });
+    await runtime.startSession({
+      sessionId: 'prelude-abort',
+      conversationId: 'voice:prelude-abort',
+      roomName: 'voice-prelude-abort',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: "what's on my calendar?", isFinal: true, speechFinal: true });
+    await delay(20);
+    stt.emit({ text: 'just the afternoon', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('prelude-abort');
+
+    // One model call, on the whole sentence — not a reply to the first half.
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    expect(consecutiveUserPairs(messages)).toBe(0);
+    expect(messages.map(m => m.content)).not.toContain(LLM_FAILURE_USER_MESSAGE);
+    expect(messages[messages.length - 1]).toEqual({
+      role: 'user',
+      content: "what's on my calendar? just the afternoon",
+    });
+
+    const stored = await wm.getHistory('voice:prelude-abort', 'coordinator', { raw: true });
+    expect(stored.some(t => t.content === LLM_FAILURE_TURN_CONTENT)).toBe(false);
+    expect(stored[stored.length - 1]).toEqual({ role: 'assistant', content: 'Afternoon only.' });
+    // A later turn reads the joined sentence, not the cancelled half.
+    const later = historyForLlm(await wm.getHistory('voice:prelude-abort', 'coordinator'));
+    expect(later.map(t => t.content)).toEqual(["what's on my calendar? just the afternoon", 'Afternoon only.']);
+
+    await runtime.endSession('prelude-abort', 'test');
+    // The cancelled half is counted once, as joined; only the joined turn is a turn.
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 1, bargeInCancels: 1, joinedUtterances: 1 });
+  });
+
+  it('pairs a mid-reply stream error with the heard fragment, not the failure marker', async () => {
+    const wm = WorkingMemory.createInMemory();
+    const llm = new FakeStreamProvider([
+      [
+        { type: 'text_delta', text: 'You have three things today. ' },
+        {
+          type: 'error',
+          error: {
+            type: 'PROVIDER_ERROR',
+            source: 'fake-stream',
+            message: 'boom',
+            retryable: true,
+            context: {},
+            timestamp: new Date(),
+          },
+        },
+      ],
+      reply('Your afternoon is clear.'),
+    ]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'stream-err',
+      conversationId: 'voice:stream-err',
+      roomName: 'voice-stream-err',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: "what's on my calendar?", isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('stream-err');
+    stt.emit({ text: 'just the afternoon', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('stream-err');
+
+    expect(llm.seenMessages).toHaveLength(2);
+    const second = llm.seenMessages[1]!;
+    expect(consecutiveUserPairs(second)).toBe(0);
+    expect(second.map(m => m.content)).toContain("what's on my calendar?");
+    expect(second.map(m => m.content)).toContain('You have three things today.');
+    expect(second.map(m => m.content)).not.toContain(LLM_FAILURE_USER_MESSAGE);
+    expect(second[second.length - 1]).toEqual({ role: 'user', content: 'just the afternoon' });
+
+    const stored = await wm.getHistory('voice:stream-err', 'coordinator', { raw: true });
+    expect(stored.some(t => t.content === 'You have three things today.')).toBe(true);
+    expect(stored.some(t => t.content === LLM_FAILURE_TURN_CONTENT)).toBe(false);
+  });
+
+  it('does not pair an older identical user row when this turn\'s addTurn failed', async () => {
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('voice:dup-hello', 'coordinator', { role: 'user', content: 'hello' });
+    const addTurn = vi.spyOn(wm, 'addTurn').mockRejectedValue(new Error('insert failed'));
+
+    const llm = new ThrowThenReplyProvider(reply('Hi again.'));
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'dup-hello',
+      conversationId: 'voice:dup-hello',
+      roomName: 'voice-dup-hello',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'hello', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('dup-hello');
+
+    addTurn.mockRestore();
+    const stored = await wm.getHistory('voice:dup-hello', 'coordinator', { raw: true });
+    expect(stored).toEqual([{ role: 'user', content: 'hello' }]);
+    expect(stored.some(t => t.role === 'assistant')).toBe(false);
+  });
+
+  it('keeps persisted history when in-process fallback is longer but not a continuation', async () => {
+    const persisted = WorkingMemory.createInMemory();
+    await persisted.addTurn('voice:prefix', 'coordinator', { role: 'user', content: 'old question' });
+    await persisted.addTurn('voice:prefix', 'coordinator', { role: 'assistant', content: 'old answer' });
+    const wm = {
+      addTurn: vi.fn(async () => {
+        throw new Error('insert failed');
+      }),
+      getHistory: vi.fn(async () => persisted.getHistory('voice:prefix', 'coordinator')),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([
+      reply('First in-process.'),
+      reply('Second in-process.'),
+      reply('Third uses the store.'),
+    ]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'prefix',
+      conversationId: 'voice:prefix',
+      roomName: 'voice-prefix',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'first live', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('prefix');
+    stt.emit({ text: 'second live', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('prefix');
+    stt.emit({ text: 'third live', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('prefix');
+
+    const third = llm.seenMessages[2]!;
+    expect(third.map(m => m.content)).toContain('old question');
+    expect(third.map(m => m.content)).toContain('old answer');
+    expect(third.map(m => m.content)).not.toContain('first live');
+    expect(third[third.length - 1]).toEqual({ role: 'user', content: 'third live' });
+  });
+
+  it('falls back to in-process history when the store sanitizes to empty after a failed assistant write', async () => {
+    const turns: Array<{ role: string; content: string }> = [];
+    const wm = {
+      addTurn: vi.fn(async (_c: string, _a: string, t: { role: string; content: string }) => {
+        if (t.role === 'assistant') throw new Error('assistant insert failed');
+        turns.push(t);
+      }),
+      getHistory: vi.fn(async () => [...turns]),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([
+      reply('You have a 3pm with Dana.'),
+      reply('Still Dana at 3.'),
+    ]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'san-empty',
+      conversationId: 'voice:san-empty',
+      roomName: 'voice-san-empty',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: "what's my 3pm?", isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('san-empty');
+    stt.emit({ text: 'and after that?', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('san-empty');
+
+    const second = llm.seenMessages[1]!;
+    expect(consecutiveUserPairs(second)).toBe(0);
+    expect(second.map(m => m.content)).toContain("what's my 3pm?");
+    expect(second.map(m => m.content)).toContain('You have a 3pm with Dana.');
+    expect(second[second.length - 1]).toEqual({ role: 'user', content: 'and after that?' });
+  });
+
+  it('sanitizes the in-process fallback after a failed persistSuccess leaves an orphan', async () => {
+    // addTurn fails and getHistory is empty, so the next turn reads session.history.
+    // First LLM throws → persistIncomplete still pairs the in-process user turn.
+    const failingWrites = {
+      addTurn: vi.fn(async () => {
+        throw new Error('insert failed');
+      }),
+      getHistory: vi.fn(async () => []),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new ThrowThenReplyProvider(reply('Second answer.'));
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: failingWrites,
+    });
+    await runtime.startSession({
+      sessionId: 'fb-orphan',
+      conversationId: 'voice:fb-orphan',
+      roomName: 'voice-fb-orphan',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+
+    stt.emit({ text: 'first question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('fb-orphan');
+    stt.emit({ text: 'second question', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('fb-orphan');
+
+    expect(llm.seenMessages).toHaveLength(2);
+    const second = llm.seenMessages[1]!;
+    expect(consecutiveUserPairs(second)).toBe(0);
+    expect(second.map(m => m.content)).toContain('first question');
+    expect(second.map(m => m.content)).toContain(LLM_FAILURE_USER_MESSAGE);
+    expect(second[second.length - 1]).toEqual({ role: 'user', content: 'second question' });
+  });
+
+  it('does not drop turns from a well-formed conversation', async () => {
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('voice:healthy', 'coordinator', { role: 'user', content: 'remember the budget is 50k' });
+    await wm.addTurn('voice:healthy', 'coordinator', { role: 'assistant', content: 'Noted: the budget is 50k.' });
+
+    const llm = new FakeStreamProvider([reply('It is 50k.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await runtime.startSession({
+      sessionId: 'healthy',
+      conversationId: 'voice:healthy',
+      roomName: 'voice-healthy',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'what was the budget again', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('healthy');
+
+    const messages = llm.seenMessages[0]!;
+    const contents = messages.map(m => m.content);
+    expect(contents).toContain('remember the budget is 50k');
+    expect(contents).toContain('Noted: the budget is 50k.');
+    expect(consecutiveUserPairs(messages)).toBe(0);
+    expect(messages[messages.length - 1]).toEqual({
+      role: 'user',
+      content: 'what was the budget again',
+    });
+  });
+});
+
+describe('VoiceRuntime opening greeting (#1596)', () => {
+  it('speaks an LLM greeting before any user speech and does not publish inbound.message', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('Good morning — what can I help with?'),
+    ]);
+    const { store, statuses } = fakeStore();
+    const { runtime, events, transport } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(3, 1),
+      store,
+      timezone: 'America/Toronto',
+    });
+
+    await runtime.startSession({
+      sessionId: 'g1',
+      conversationId: 'voice:g1',
+      roomName: 'voice-g1',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('g1');
+
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+    expect(events.filter(e => e.type === 'inbound.message')).toHaveLength(0);
+    expect(statuses).toContain('active');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    const system = messages[0]!;
+    expect(system.role).toBe('system');
+    expect(system.content).toContain(VOICE_GREETING_INSTRUCTION);
+    expect(system.content).toContain('## Current Date & Time');
+    const user = messages[messages.length - 1]!;
+    expect(user).toEqual({ role: 'user', content: VOICE_GREETING_USER_MESSAGE });
+  });
+
+  it('greeting for a non-principal caller has no principal framing (#1874)', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('Hi Alex — what can I help with?'),
+    ]);
+    const { runtime } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(3, 1),
+      timezone: 'America/Toronto',
+    });
+
+    await runtime.startSession({
+      sessionId: 'g-nonprincipal',
+      conversationId: 'voice:g-nonprincipal',
+      roomName: 'voice-g-nonprincipal',
+      agentToken: 'tok',
+      caller: partnerCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('g-nonprincipal');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.role).toBe('system');
+    const content = typeof system.content === 'string' ? system.content : '';
+    expect(content).toContain('<caller_display_name_json>');
+    expect(content).toContain(JSON.stringify('Alex Partner'));
+    expect(content).toContain('They are not the principal');
+    expect(content).not.toContain('The principal just called');
+    expect(content).not.toContain('You are speaking to the principal');
+    expect(content).not.toContain(VOICE_GREETING_INSTRUCTION);
+  });
+
+  it('includes outbound-context in the greeting system prompt when active', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('Hey — is this about that Google alert?'),
+    ]);
+    const signalAlertEntry: OutboundContextRow = {
+      id: 'entry-signal-alert',
+      conversationId: 'signal:ceo',
+      channelId: 'signal',
+      agentId: 'coordinator',
+      contentPreview: 'Google security alert: new sign-in on your account.',
+      expectedReply: null,
+      delegationHint: null,
+      metadata: { subject: 'security-alert' },
+      createdAt: new Date(Date.now() - 2 * 60 * 1000),
+      expiresAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
+      released: false,
+      recipientContactIds: null,
+      recipientMessages: [],
+    };
+    const real = new OutboundContextService(
+      { query: async () => ({ rows: [] }) } as never,
+      logger,
+    );
+    real.getActive = async () => [signalAlertEntry];
+
+    const { runtime } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      outboundContextService: real,
+    });
+
+    await runtime.startSession({
+      sessionId: 'g2',
+      conversationId: 'voice:g2',
+      roomName: 'voice-g2',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('g2');
+
+    const system = llm.seenMessages[0]![0]!;
+    expect(system.content).toContain('[ACTIVE OUTBOUND CONTEXT');
+    expect(system.content).toContain(VOICE_GREETING_INSTRUCTION);
+    expect(system.content).toContain('Google security alert');
+  });
+
+  it('barge-in cancels an in-flight greeting so the user turn can proceed', async () => {
+    const llm = new FakeStreamProvider(
+      [
+        [
+          { type: 'text_delta', text: 'Good afternoon, hope you are well today. ' },
+          { type: 'text_delta', text: 'What would you like to cover? ' },
+          {
+            type: 'message_end',
+            content: 'Good afternoon, hope you are well today. What would you like to cover?',
+            usage,
+            provenance,
+          },
+        ],
+        replyScript('Got it — calendar is clear.'),
+      ],
+      3,
+    );
+    const tts = new SlowTtsProvider(50, 5);
+    const { runtime, stt, events } = makeRuntime({ llm, tts });
+
+    await runtime.startSession({
+      sessionId: 'g3',
+      conversationId: 'voice:g3',
+      roomName: 'voice-g3',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+
+    // Let the greeting start speaking.
+    await delay(40);
+    expect(tts.requests.length).toBeGreaterThan(0);
+
+    // Principal interrupts mid-greeting.
+    stt.emit({ text: 'what is on my calendar', isFinal: false, confidence: 0.9 });
+    stt.emit({ text: 'what is on my calendar', isFinal: true, speechFinal: true });
+
+    await runtime.awaitIdle('g3');
+
+    expect(tts.cancelled.size).toBeGreaterThan(0);
+    const inbound = events.find(e => e.type === 'inbound.message');
+    expect(inbound).toBeDefined();
+    expect((inbound as { payload: { content: string } }).payload.content).toBe(
+      'what is on my calendar',
+    );
+    // Greeting + user turn both ran against the LLM.
+    expect(llm.seenMessages.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('persists synthetic user cue + greeting so later turns stay user-first', async () => {
+    const llm = new FakeStreamProvider([replyScript('Hey boss.')]);
+    const addTurn = vi.fn(async () => {});
+    const workingMemory = {
+      addTurn,
+      getHistory: vi.fn(async () => []),
+    } as unknown as WorkingMemory;
+
+    const { runtime } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory,
+    });
+
+    await runtime.startSession({
+      sessionId: 'g4',
+      conversationId: 'voice:g4',
+      roomName: 'voice-g4',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('g4');
+
+    expect(addTurn).toHaveBeenCalledTimes(2);
+    expect(addTurn).toHaveBeenNthCalledWith(1, 'voice:g4', 'coordinator', {
+      role: 'user',
+      content: VOICE_GREETING_USER_MESSAGE,
+    }, {
+      channelId: 'voice',
+      // Curia's own opening row. Without this the null sender closes the call
+      // to contact recall (#1892).
+      synthetic: true,
+      summarize: 'background',
+    });
+    expect(addTurn).toHaveBeenNthCalledWith(2, 'voice:g4', 'coordinator', {
+      role: 'assistant',
+      content: 'Hey boss.',
+    }, {
+      channelId: 'voice',
+      summarize: 'background',
+    });
+  });
+
+  it('does not flag caller speech as synthetic when it matches the greeting cue', async () => {
+    // The cue is synthetic because VoiceRuntime wrote it. A person saying the
+    // same words is a participant; matching the text must not drop them (#1892).
+    const llm = new FakeStreamProvider([replyScript('Go ahead.')]);
+    const addTurn = vi.fn(async () => {});
+    const workingMemory = {
+      addTurn,
+      getHistory: vi.fn(async () => []),
+    } as unknown as WorkingMemory;
+
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory,
+    });
+
+    await runtime.startSession({
+      sessionId: 'g4-said-cue',
+      conversationId: 'voice:g4-said-cue',
+      roomName: 'voice-g4-said-cue',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: VOICE_GREETING_USER_MESSAGE, isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('g4-said-cue');
+
+    expect(addTurn).toHaveBeenNthCalledWith(1, 'voice:g4-said-cue', 'coordinator', {
+      role: 'user',
+      content: VOICE_GREETING_USER_MESSAGE,
+    }, {
+      senderContactId: '11111111-1111-1111-1111-111111111111',
+      channelId: 'voice',
+      summarize: 'background',
+    });
+  });
+
+  it('completed greeting → user turn assembles a user-first message array (Anthropic contract)', async () => {
+    /**
+     * Provider stub that throws if the first non-system message is not `user` —
+     * locks the regression that a completed greeting must not leave history
+     * assistant-led (Anthropic Messages API 400).
+     */
+    class UserFirstEnforcingProvider extends FakeStreamProvider {
+      override async *stream(params: {
+        messages?: Message[];
+        options?: Record<string, unknown>;
+      }): AsyncIterable<LLMStreamEvent> {
+        const nonSystem = (params.messages ?? []).filter(m => m.role !== 'system');
+        const first = nonSystem[0];
+        if (first && first.role !== 'user') {
+          throw new Error(
+            `provider contract violated: first non-system message must be user, got ${first.role}`,
+          );
+        }
+        yield* super.stream(params);
+      }
+    }
+
+    const llm = new UserFirstEnforcingProvider([
+      replyScript('Good morning.'),
+      replyScript('Your calendar is clear this afternoon.'),
+    ]);
+    const turns: Array<{ role: string; content: string }> = [];
+    const workingMemory = {
+      addTurn: vi.fn(async (_c: string, _a: string, turn: { role: string; content: string }) => {
+        turns.push(turn);
+      }),
+      getHistory: vi.fn(async () => [...turns]),
+    } as unknown as WorkingMemory;
+
+    const { runtime, stt, transport } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory,
+    });
+
+    await runtime.startSession({
+      sessionId: 'g5',
+      conversationId: 'voice:g5',
+      roomName: 'voice-g5',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('g5');
+
+    // Greeting completed and persisted cue + assistant.
+    expect(turns).toEqual([
+      { role: 'user', content: VOICE_GREETING_USER_MESSAGE },
+      { role: 'assistant', content: 'Good morning.' },
+    ]);
+
+    stt.emit({ text: "what's on my calendar", isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('g5');
+
+    expect(llm.seenMessages).toHaveLength(2);
+    const userTurnMessages = llm.seenMessages[1]!;
+    const nonSystem = userTurnMessages.filter(m => m.role !== 'system');
+    expect(nonSystem[0]!.role).toBe('user');
+    expect(nonSystem[0]!.content).toBe(VOICE_GREETING_USER_MESSAGE);
+    expect(nonSystem[1]).toEqual({ role: 'assistant', content: 'Good morning.' });
+    expect(nonSystem[2]).toEqual({ role: 'user', content: "what's on my calendar" });
+    expect(transport.publishedFrames.length).toBeGreaterThan(0);
+  });
+});
+
+describe('transport override (#1672)', () => {
+  it('uses a provided transport, never calls createTransport, and skips deleteRoom', async () => {
+    const llm = new FakeStreamProvider([]);
+    // Standalone fixture transport (not the makeRuntime default) so we can
+    // assert it, specifically, was connected/disconnected exactly once.
+    const provided = new FakeAudioTransport();
+    // Would build a *different* transport if invoked — asserting it's never
+    // called proves the runtime short-circuits createTransport entirely.
+    const createTransport = vi.fn(() => new FakeAudioTransport());
+    const deleteRoom = vi.fn(async () => {});
+    const { runtime } = makeRuntime({ llm, createTransport, deleteRoom });
+
+    await runtime.startSession({
+      sessionId: 'sess-ext',
+      conversationId: 'voice:sess-ext',
+      roomName: 'signal-call:42',
+      caller: principalCaller(),
+      transport: provided,
+      openingGreeting: false,
+    });
+
+    expect(createTransport).not.toHaveBeenCalled();
+    expect(provided.connected).toBe(true);
+
+    await runtime.endSession('sess-ext', 'test_end');
+
+    expect(deleteRoom).not.toHaveBeenCalled();
+    expect(provided.disconnectCount).toBe(1);
+  });
+
+  it('throws when neither agentToken nor transport is provided', async () => {
+    const llm = new FakeStreamProvider([]);
+    const { runtime } = makeRuntime({ llm });
+
+    await expect(
+      runtime.startSession({
+        sessionId: 's',
+        conversationId: 'voice:s',
+        roomName: 'r',
+        caller: principalCaller(),
+      }),
+    ).rejects.toThrow(/agentToken/);
+  });
+
+  it('reaps (disconnects) a transport whose connect() rejects instead of leaking it', async () => {
+    // connect() throwing must still route through the catch block's
+    // transport.disconnect() call — a transport that connect()s partially
+    // (e.g. one of two subprocesses spawned) before throwing must not be
+    // left running forever.
+    class RejectsOnConnect extends FakeAudioTransport {
+      override async connect(): Promise<void> {
+        throw new Error('pulseaudio device not found');
+      }
+    }
+    const llm = new FakeStreamProvider([]);
+    const provided = new RejectsOnConnect();
+    const { runtime } = makeRuntime({ llm });
+
+    await expect(
+      runtime.startSession({
+        sessionId: 'sess-connect-fail',
+        conversationId: 'voice:sess-connect-fail',
+        roomName: 'signal-call:43',
+        caller: principalCaller(),
+        transport: provided,
+        openingGreeting: false,
+      }),
+    ).rejects.toThrow(/pulseaudio device not found/);
+
+    expect(runtime.activeSessionCount).toBe(0);
+    expect(provided.disconnectCount).toBe(1);
+  });
+});
+
+describe('VoiceRuntime contact recent history (#1599)', () => {
+  const reply = (text: string): LLMStreamEvent[] => [
+    { type: 'text_delta', text: `${text} ` },
+    { type: 'message_end', content: text, usage, provenance },
+  ];
+
+  const textContents = (msgs: Message[]): string[] =>
+    msgs.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)));
+
+  const BOB = '33333333-3333-3333-3333-333333333333';
+
+  it('lets a voice turn reference the caller Signal thread from earlier today', async () => {
+    const caller = principalCaller();
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('signal:+15551212', 'coordinator', { role: 'user', content: 'the board deck is due Friday' }, {
+      senderContactId: caller.contactId,
+      channelId: 'signal',
+    });
+    await wm.addTurn('signal:+15551212', 'coordinator', { role: 'assistant', content: 'I will remind you Thursday.' }, {
+      channelId: 'signal',
+    });
+    await wm.addTurn('email:bob', 'coordinator', { role: 'user', content: 'bob private plan' }, {
+      senderContactId: BOB,
+      channelId: 'email',
+    });
+
+    const llm = new FakeStreamProvider([reply('Friday it is.')]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      timezone: 'America/Toronto',
+    });
+    await runtime.startSession({
+      sessionId: 'recall1',
+      conversationId: 'voice:recall1',
+      roomName: 'voice-recall1',
+      agentToken: 'tok',
+      caller,
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'what did I tell you earlier', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('recall1');
+
+    const messages = llm.seenMessages[0]!;
+    const contents = textContents(messages);
+    const block = contents.find(c => c.includes(CONTACT_RECENT_HISTORY_HEADER));
+    expect(block).toBeDefined();
+    expect(block).toContain('in the last 48 hours');
+    expect(block).not.toContain('from other conversations today');
+    expect(block).toContain('the board deck is due Friday');
+    expect(block).toContain('I will remind you Thursday.');
+    expect(block).not.toContain('bob private plan');
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'what did I tell you earlier' });
+  });
+
+  it('does not surface another participant in a shared conversation to a non-principal caller', async () => {
+    const caller = partnerCaller();
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('signal:group=g1', 'coordinator', { role: 'user', content: 'alice asked about the venue' }, {
+      senderContactId: caller.contactId,
+      channelId: 'signal',
+    });
+    await wm.addTurn('signal:group=g1', 'coordinator', { role: 'user', content: 'bob shared the door code' }, {
+      senderContactId: BOB,
+      channelId: 'signal',
+    });
+    await wm.addTurn('signal:group=g1', 'coordinator', { role: 'assistant', content: 'noted both the venue and the code' }, {
+      channelId: 'signal',
+    });
+
+    const llm = new FakeStreamProvider([reply('The venue.')]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      timezone: 'America/Toronto',
+    });
+    await runtime.startSession({
+      sessionId: 'recall2',
+      conversationId: 'voice:recall2',
+      roomName: 'voice-recall2',
+      agentToken: 'tok',
+      caller,
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'what did we say', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('recall2');
+
+    const contents = textContents(llm.seenMessages[0]!);
+    const block = contents.find(c => c.includes(CONTACT_RECENT_HISTORY_HEADER));
+    expect(block).toContain('alice asked about the venue');
+    expect(contents.join('\n')).not.toContain('bob shared the door code');
+    expect(contents.join('\n')).not.toContain('noted both the venue and the code');
+  });
+
+  it('recalls the spoken reply from an earlier call that opened with the greeting cue', async () => {
+    const caller = principalCaller();
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('voice:earlier', 'coordinator', { role: 'user', content: VOICE_GREETING_USER_MESSAGE }, {
+      channelId: 'voice',
+      // As VoiceRuntime writes it — Curia's own opening row, not the caller's (#1892).
+      synthetic: true,
+    });
+    await wm.addTurn('voice:earlier', 'coordinator', { role: 'user', content: 'can you move the board prep to 4?' }, {
+      senderContactId: caller.contactId,
+      channelId: 'voice',
+    });
+    await wm.addTurn('voice:earlier', 'coordinator', { role: 'assistant', content: 'no, you have the investor call then' }, {
+      channelId: 'voice',
+    });
+
+    const llm = new FakeStreamProvider([reply('You have the investor call then.')]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      timezone: 'America/Toronto',
+    });
+    await runtime.startSession({
+      sessionId: 'recall-cue',
+      conversationId: 'voice:recall-cue',
+      roomName: 'voice-recall-cue',
+      agentToken: 'tok',
+      caller,
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'what did you say about the board prep', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('recall-cue');
+
+    const contents = textContents(llm.seenMessages[0]!);
+    const block = contents.find(c => c.includes(CONTACT_RECENT_HISTORY_HEADER));
+    expect(block).toContain('can you move the board prep to 4?');
+    expect(block).toContain('no, you have the investor call then');
+    expect(block).not.toContain(VOICE_GREETING_USER_MESSAGE);
+  });
+
+  it('recalls a voice call from the previous day and drops the one before that', async () => {
+    const caller = principalCaller();
+    const wm = WorkingMemory.createInMemory();
+    await wm.addTurn('voice:yesterday', 'coordinator', { role: 'user', content: 'move the board prep to 4' }, {
+      senderContactId: caller.contactId,
+      channelId: 'voice',
+      createdAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
+    });
+    await wm.addTurn('voice:yesterday', 'coordinator', { role: 'assistant', content: 'you have the investor call then' }, {
+      channelId: 'voice',
+      createdAt: new Date(Date.now() - 30 * 60 * 60 * 1000 + 1000),
+    });
+    await wm.addTurn('voice:older', 'coordinator', { role: 'user', content: 'the call from two days ago' }, {
+      senderContactId: caller.contactId,
+      channelId: 'voice',
+      createdAt: new Date(Date.now() - 60 * 60 * 60 * 1000),
+    });
+
+    const llm = new FakeStreamProvider([reply('Investor call.')]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      timezone: 'America/Toronto',
+    });
+    await runtime.startSession({
+      sessionId: 'recall-prev',
+      conversationId: 'voice:recall-prev',
+      roomName: 'voice-recall-prev',
+      agentToken: 'tok',
+      caller,
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'what did I say last time', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('recall-prev');
+
+    const contents = textContents(llm.seenMessages[0]!);
+    const block = contents.find(c => c.includes(CONTACT_RECENT_HISTORY_HEADER));
+    expect(block).toContain('move the board prep to 4');
+    expect(block).toContain('you have the investor call then');
+    expect(block).toContain('in the last 48 hours');
+    expect(block).not.toContain('from other conversations today');
+    expect(block).not.toContain('the call from two days ago');
+  });
+
+  it('keeps the live transcript when the contact recall read misses the deadline', async () => {
+    const stalled = {
+      addTurn: vi.fn(async () => {}),
+      getHistory: vi.fn(async () => [
+        { role: 'user', content: 'earlier on this call' },
+        { role: 'assistant', content: 'I heard you' },
+      ]),
+      getContactRecentHistory: vi.fn(() => new Promise(() => {})),
+      purgeExpired: vi.fn(async () => 0),
+    } as unknown as WorkingMemory;
+
+    const llm = new FakeStreamProvider([reply('Still here.')]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: stalled,
+      historyReadTimeoutMs: 40,
+      timezone: 'America/Toronto',
+    });
+    await runtime.startSession({
+      sessionId: 'recall3',
+      conversationId: 'voice:recall3',
+      roomName: 'voice-recall3',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'are you there', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('recall3');
+
+    const contents = textContents(llm.seenMessages[0]!);
+    expect(contents).toContain('earlier on this call');
+    expect(contents).toContain('I heard you');
+    expect(contents.join('\n')).not.toContain(CONTACT_RECENT_HISTORY_HEADER);
+    expect(llm.seenMessages[0]![llm.seenMessages[0]!.length - 1]).toEqual({
+      role: 'user',
+      content: 'are you there',
+    });
+  });
+});
+
+describe('VoiceRuntime turn-taking: hold, join, coalesce (#2240)', () => {
+  async function start(runtime: VoiceRuntime, sessionId: string): Promise<void> {
+    await runtime.startSession({
+      sessionId,
+      conversationId: `voice:${sessionId}`,
+      roomName: `voice-${sessionId}`,
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+  }
+
+  it('runs a multi-clause utterance with sub-second pauses as one turn, with no cancels', async () => {
+    const llm = new FakeStreamProvider([replyScript('On it.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 80 });
+    await start(runtime, 'hold-multi');
+
+    // Each clause ends in an end-of-speech signal, as Deepgram sends at a pause.
+    stt.emit({ text: 'I want you to research', isFinal: true, speechFinal: true });
+    await delay(30);
+    stt.emit({ text: 'tutoring', isFinal: false, confidence: 0.9 });
+    stt.emit({ text: 'tutoring programs for Evan', isFinal: true, speechFinal: true });
+    await delay(30);
+    stt.emit({ text: 'near his school', isFinal: true, speechFinal: true });
+    // Deepgram's UtteranceEnd follows speech_final and must not count again.
+    stt.emit({ text: '', isFinal: true, speechFinal: true });
+    expect(llm.seenMessages).toHaveLength(0);
+
+    await delay(150);
+    await runtime.awaitIdle('hold-multi');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    expect(inboundContents(events)).toEqual(['I want you to research tutoring programs for Evan near his school']);
+    await runtime.endSession('hold-multi', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 3, turns: 1, bargeInCancels: 0, joinedUtterances: 2 });
+  });
+
+  it('extends the pending utterance when speech arrives inside the hold window', async () => {
+    const llm = new FakeStreamProvider([replyScript('Got it.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 100 });
+    await start(runtime, 'hold-extend');
+
+    stt.emit({ text: 'His school is', isFinal: true, speechFinal: true });
+    await delay(60);
+    // The caller resumes before the hold expires.
+    stt.emit({ text: 'Oakbridge', isFinal: false, confidence: 0.9 });
+    await delay(80);
+    // Past the first hold's deadline: no turn, because the speech restarted it.
+    expect(llm.seenMessages).toHaveLength(0);
+
+    stt.emit({ text: 'Oakbridge Academy', isFinal: true, speechFinal: true });
+    await delay(50);
+    // The re-armed hold has not expired yet.
+    expect(llm.seenMessages).toHaveLength(0);
+
+    await delay(120);
+    await runtime.awaitIdle('hold-extend');
+    expect(llm.seenMessages).toHaveLength(1);
+    expect(inboundContents(events)).toEqual(['His school is Oakbridge Academy']);
+  });
+
+  it('ignores echo-sized or low-confidence speech inside the hold window', async () => {
+    const llm = new FakeStreamProvider([replyScript('Sure.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 60 });
+    await start(runtime, 'hold-noise');
+
+    stt.emit({ text: 'call Dana', isFinal: true, speechFinal: true });
+    stt.emit({ text: 'mm', isFinal: false, confidence: 0.9 });
+    stt.emit({ text: 'something', isFinal: false, confidence: 0.1 });
+    await delay(120);
+    await runtime.awaitIdle('hold-noise');
+
+    expect(inboundContents(events)).toEqual(['call Dana']);
+  });
+
+  it('runs utterances that finish while a turn is stuck as one turn, not one each', async () => {
+    // Models the 2026-10-23 call: a tool stalls (ignoring the abort), the caller
+    // keeps talking, and each fragment used to replay as its own turn after it.
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'async-offramp', input: {} }], usage, provenance }],
+      replyScript('Understood.'),
+      replyScript('Understood.'),
+    ]);
+    const invokeTool = vi.fn(async () => {
+      await delay(150);
+      return { content: 'queued' };
+    });
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), invokeTool });
+    await start(runtime, 'coalesce');
+
+    stt.emit({ text: 'look into tutoring for Evan', isFinal: true, speechFinal: true });
+    await delay(40);
+    expect(invokeTool).toHaveBeenCalledOnce();
+
+    stt.emit({ text: 'Before they begin that work,', isFinal: true, speechFinal: true, confidence: 0.9 });
+    stt.emit({ text: 'find facilities that', isFinal: true, speechFinal: true, confidence: 0.9 });
+    stt.emit({ text: 'are close to his school', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('coalesce');
+
+    expect(inboundContents(events)).toEqual([
+      'look into tutoring for Evan',
+      'Before they begin that work, find facilities that are close to his school',
+    ]);
+    await runtime.endSession('coalesce', 'test');
+    // The stalled turn had played its filler, so it is a real barge-in, not joined.
+    expect(endedTurnStats(events)).toEqual({ utterances: 4, turns: 2, bargeInCancels: 1, joinedUtterances: 2 });
+  });
+
+  it('still runs the held utterance when an interim restarts the hold and no final follows', async () => {
+    const llm = new FakeStreamProvider([replyScript('Okay.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 60 });
+    await start(runtime, 'hold-revised');
+
+    stt.emit({ text: 'send it to Dana', isFinal: true, speechFinal: true });
+    await delay(30);
+    // An interim Deepgram later revises away: no final, no end-of-speech.
+    stt.emit({ text: 'hmm well', isFinal: false, confidence: 0.9 });
+    await delay(150);
+    await runtime.awaitIdle('hold-revised');
+
+    expect(inboundContents(events)).toEqual(['send it to Dana']);
+  });
+
+  it('re-arms the hold on an end-of-speech that adds a short or low-confidence word', async () => {
+    const llm = new FakeStreamProvider([replyScript('Will do.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 100 });
+    await start(runtime, 'hold-short');
+
+    stt.emit({ text: 'call Dana', isFinal: true, speechFinal: true });
+    await delay(70);
+    // "ok" fails the speech gate (too short) but is part of the utterance.
+    stt.emit({ text: 'ok', isFinal: true, speechFinal: true });
+    await delay(60);
+    // Past the first deadline (100 ms), inside the re-armed one (~170 ms).
+    expect(llm.seenMessages).toHaveLength(0);
+
+    await delay(120);
+    await runtime.awaitIdle('hold-short');
+    expect(inboundContents(events)).toEqual(['call Dana ok']);
+  });
+
+  it('counts a final that lands after end-of-speech in the turn the hold flushes it into', async () => {
+    const llm = new FakeStreamProvider([replyScript('Calling her.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 60 });
+    await start(runtime, 'hold-open-words');
+
+    stt.emit({ text: 'call Dana', isFinal: true, speechFinal: true });
+    await delay(20);
+    // A final segment with no end-of-speech of its own; "ok" is too short to restart the hold.
+    stt.emit({ text: 'ok', isFinal: true });
+    await delay(100);
+    await runtime.awaitIdle('hold-open-words');
+    expect(inboundContents(events)).toEqual(['call Dana ok']);
+
+    // The late end-of-speech carries no new words and must not count again.
+    stt.emit({ text: '', isFinal: true, speechFinal: true });
+    await runtime.endSession('hold-open-words', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 1, bargeInCancels: 0, joinedUtterances: 1 });
+  });
+
+  /** Working memory whose history reads take `ms`, so a user turn sits in its preamble. */
+  function slowHistoryMemory(ms: number): WorkingMemory {
+    const wm = WorkingMemory.createInMemory();
+    const read = wm.getHistory.bind(wm);
+    vi.spyOn(wm, 'getHistory').mockImplementation(async (...args: Parameters<typeof read>) => {
+      await delay(ms);
+      return read(...args);
+    });
+    return wm;
+  }
+
+  it('joins speech that arrives during a user turn\'s preamble instead of queuing a second turn', async () => {
+    const wm = slowHistoryMemory(80);
+    const llm = new FakeStreamProvider([replyScript('Booked.'), replyScript('Booked.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'preamble');
+
+    stt.emit({ text: 'book the boardroom', isFinal: true, speechFinal: true });
+    await delay(20);
+    // The first turn is still reading history; nothing has been sent to the model.
+    expect(llm.seenMessages).toHaveLength(0);
+    stt.emit({ text: 'for Thursday at ten', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('preamble');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'book the boardroom for Thursday at ten' });
+    const stored = await wm.getHistory('voice:preamble', 'coordinator', { raw: true });
+    expect(stored.some(t => t.content === LLM_FAILURE_TURN_CONTENT)).toBe(false);
+  });
+
+  it('counts a chain of silent cancels once: utterances = turns + joined', async () => {
+    const wm = slowHistoryMemory(80);
+    const llm = new FakeStreamProvider([replyScript('Got it.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'chain');
+
+    stt.emit({ text: 'find tutoring', isFinal: true, speechFinal: true });
+    await delay(20);
+    stt.emit({ text: 'near his school', isFinal: true, speechFinal: true, confidence: 0.9 });
+    // The joined turn starts once the first unwinds (~80 ms); cancel it in its preamble too.
+    await delay(90);
+    stt.emit({ text: 'after three pm', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('chain');
+
+    expect(llm.seenMessages).toHaveLength(1);
+    const messages = llm.seenMessages[0]!;
+    expect(messages[messages.length - 1]).toEqual({
+      role: 'user',
+      content: 'find tutoring near his school after three pm',
+    });
+    await runtime.endSession('chain', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 3, turns: 1, bargeInCancels: 2, joinedUtterances: 2 });
+  });
+
+  it('pairs a carried-over utterance with the failure marker when the caller hangs up', async () => {
+    const wm = slowHistoryMemory(60);
+    const llm = new FakeStreamProvider([replyScript('Never spoken.')]);
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), workingMemory: wm });
+    await start(runtime, 'carry-hangup');
+
+    stt.emit({ text: 'move my three o clock', isFinal: true, speechFinal: true });
+    await delay(20);
+    // Speech cancels the turn before any audio, but never finalizes.
+    stt.emit({ text: 'hold on a sec', isFinal: false, confidence: 0.9 });
+    await runtime.awaitIdle('carry-hangup');
+    await runtime.endSession('carry-hangup', 'test');
+
+    expect(llm.seenMessages).toHaveLength(0);
+    const stored = await wm.getHistory('voice:carry-hangup', 'coordinator', { raw: true });
+    expect(stored).toEqual([
+      { role: 'user', content: 'move my three o clock' },
+      { role: 'assistant', content: LLM_FAILURE_TURN_CONTENT },
+    ]);
+    expect(endedTurnStats(events)).toEqual({ utterances: 1, turns: 1, bargeInCancels: 1, joinedUtterances: 0 });
+  });
+
+  it('pairs the carried-over part when the join would exceed maxUtteranceBytes', async () => {
+    const wm = slowHistoryMemory(60);
+    const llm = new FakeStreamProvider([replyScript('Planning review noted.')]);
+    const { runtime, stt, events } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(2, 1),
+      workingMemory: wm,
+      maxUtteranceBytes: 40,
+    });
+    await start(runtime, 'carry-oversize');
+
+    stt.emit({ text: 'please book the conference room', isFinal: true, speechFinal: true });
+    await delay(20);
+    stt.emit({ text: 'for the quarterly planning review', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('carry-oversize');
+
+    expect(inboundContents(events)).toEqual([
+      'please book the conference room',
+      'for the quarterly planning review',
+    ]);
+    const stored = await wm.getHistory('voice:carry-oversize', 'coordinator', { raw: true });
+    expect(stored.slice(0, 2)).toEqual([
+      { role: 'user', content: 'please book the conference room' },
+      { role: 'assistant', content: LLM_FAILURE_TURN_CONTENT },
+    ]);
+    await runtime.endSession('carry-oversize', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 0 });
+  });
+
+  it('never joins a turn that invoked a tool, even when no audio played', async () => {
+    const wm = WorkingMemory.createInMemory();
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'email-send', input: {} }], usage, provenance }],
+      replyScript('Copied Dana.'),
+      replyScript('Copied Dana.'),
+    ]);
+    const invokeTool = vi.fn(async () => {
+      await delay(50);
+      return { content: 'sent' };
+    });
+    // A TTS that yields no frames: the filler finishes without anything heard.
+    const { runtime, stt, events } = makeRuntime({ llm, tts: new SlowTtsProvider(0, 1), invokeTool, workingMemory: wm });
+    await start(runtime, 'tool-silent');
+
+    stt.emit({ text: 'email the board the deck', isFinal: true, speechFinal: true });
+    await delay(20);
+    expect(invokeTool).toHaveBeenCalledOnce();
+    stt.emit({ text: 'and cc Dana', isFinal: true, speechFinal: true, confidence: 0.9 });
+    await runtime.awaitIdle('tool-silent');
+
+    // Joined, the model would see the send request again and could resend it.
+    expect(inboundContents(events)).toEqual(['email the board the deck', 'and cc Dana']);
+    expect(invokeTool).toHaveBeenCalledOnce();
+    const stored = await wm.getHistory('voice:tool-silent', 'coordinator', { raw: true });
+    expect(stored.slice(0, 2)).toEqual([
+      { role: 'user', content: 'email the board the deck' },
+      { role: 'assistant', content: LLM_FAILURE_TURN_CONTENT },
+    ]);
+    await runtime.endSession('tool-silent', 'test');
+    expect(endedTurnStats(events)).toEqual({ utterances: 2, turns: 2, bargeInCancels: 1, joinedUtterances: 0 });
+  });
+
+  it('drops a pending hold when the session ends', async () => {
+    const llm = new FakeStreamProvider([replyScript('Never spoken.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), turnHoldMs: 50 });
+    await start(runtime, 'hold-hangup');
+
+    stt.emit({ text: 'one more thing', isFinal: true, speechFinal: true });
+    await runtime.endSession('hold-hangup', 'test');
+    await delay(100);
+
+    expect(llm.seenMessages).toHaveLength(0);
+  });
+});
+
+describe('VoiceRuntime first-token turn kind (#2271)', () => {
+  // Greetings also log round 0, so ADR-038's user-turn gate needs turnKind to
+  // leave them out: they send no tools and are the call's cold first request.
+  it('tags the greeting and user-turn first-token lines with turnKind', async () => {
+    const info = vi.fn();
+    const spyLogger: Logger = {
+      debug: vi.fn(),
+      info,
+      warn: vi.fn(),
+      error: vi.fn(),
+      fatal: vi.fn(),
+      trace: vi.fn(),
+      child: () => spyLogger,
+    } as unknown as Logger;
+    const llm = new FakeStreamProvider([replyScript('Hello there.'), replyScript('Sure thing.')]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(2, 1), logger: spyLogger });
+
+    await runtime.startSession({
+      sessionId: 'turn-kind',
+      conversationId: 'voice:turn-kind',
+      roomName: 'voice-turn-kind',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: true,
+    });
+    await runtime.awaitIdle('turn-kind');
+
+    stt.emit({ text: 'what is on today', isFinal: true, speechFinal: true, confidence: 0.95 });
+    await vi.waitFor(() => {
+      expect(info.mock.calls.filter(([, msg]) => msg === 'voice llm first token')).toHaveLength(2);
+    });
+
+    const kinds = info.mock.calls
+      .filter(([, msg]) => msg === 'voice llm first token')
+      .map(([fields]) => (fields as { turnKind?: string }).turnKind);
+    expect(kinds).toEqual(['greeting', 'user']);
+  });
+});
+
+describe('VoiceRuntime agendas (#2322)', () => {
+  const agenda = {
+    agendaId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    title: 'Q3 review',
+    topics: ['Pipeline'],
+    role: null,
+    context: 'Board wants a status.',
+    source: 'principal' as const,
+    sensitivity: 'internal' as const,
+    scheduledFor: null,
+    history: [],
+  };
+
+  function systemText(messages: Message[]): string {
+    return messages
+      .filter((message) => message.role === 'system' && typeof message.content === 'string')
+      .map((message) => message.content as string)
+      .join('\n');
+  }
+
+  function storeWithAppend() {
+    const base = fakeStore();
+    const appendAgendaLoad = vi.fn(async () => undefined);
+    const store = Object.assign(base.store, { appendAgendaLoad });
+    return { store, appendAgendaLoad };
+  }
+
+  it('preloaded agenda appears in every turn\'s system prompt', async () => {
+    const llm = new FakeStreamProvider([
+      replyScript('Hello.'),
+      replyScript('Still here.'),
+    ]);
+    const { runtime, stt } = makeRuntime({ llm, tts: new SlowTtsProvider(1, 1) });
+    await runtime.startSession({
+      sessionId: 's-preload',
+      conversationId: 'voice:s-preload',
+      roomName: 'voice-s-preload',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+      agendas: { loaded: [agenda], index: [] },
+    });
+    stt.emit({ text: 'let us start', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-preload');
+    stt.emit({ text: 'next', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-preload');
+    expect(llm.seenMessages.length).toBeGreaterThanOrEqual(2);
+    for (const messages of llm.seenMessages) {
+      expect(systemText(messages)).toContain('Q3 review');
+      expect(systemText(messages)).toContain('Board wants a status.');
+    }
+  });
+
+  it('a successful meeting-agenda-load result adds the agenda to the next turn\'s prompt and records the load', async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-agenda-load', input: { agenda_id: agenda.agendaId } }], usage, provenance }],
+      replyScript('Loaded.'),
+      replyScript('Continuing.'),
+    ]);
+    const { store, appendAgendaLoad } = storeWithAppend();
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      store,
+      invokeTool: async () => ({ content: JSON.stringify({ agenda }) }),
+    });
+    await runtime.startSession({
+      sessionId: 's-load',
+      conversationId: 'voice:s-load',
+      roomName: 'voice-s-load',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+      agendas: {
+        loaded: [],
+        index: [{ agendaId: agenda.agendaId, title: agenda.title, scheduledFor: null }],
+      },
+    });
+    stt.emit({ text: 'use the q3 agenda', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load');
+    stt.emit({ text: 'go on', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load');
+
+    const first = systemText(llm.seenMessages[0] ?? []);
+    expect(first).toContain(agenda.agendaId);
+    expect(first).toContain('Ask the caller if you are unsure');
+    expect(first).not.toContain('Board wants a status.');
+
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('Board wants a status.');
+    expect(last).not.toContain('Ask the caller if you are unsure');
+    expect(appendAgendaLoad).toHaveBeenCalledOnce();
+  });
+
+  it('a failed meeting-agenda-load leaves prompt and store untouched', async () => {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-agenda-load', input: { agenda_id: agenda.agendaId } }], usage, provenance }],
+      replyScript('Cannot.'),
+      replyScript('Still queued.'),
+    ]);
+    const { store, appendAgendaLoad } = storeWithAppend();
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      store,
+      invokeTool: async () => ({ content: 'That agenda has expired.', is_error: true }),
+    });
+    await runtime.startSession({
+      sessionId: 's-load-fail',
+      conversationId: 'voice:s-load-fail',
+      roomName: 'voice-s-load-fail',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+      agendas: {
+        loaded: [],
+        index: [{ agendaId: agenda.agendaId, title: agenda.title, scheduledFor: null }],
+      },
+    });
+    stt.emit({ text: 'use the q3 agenda', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load-fail');
+    stt.emit({ text: 'go on', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-load-fail');
+
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('Ask the caller if you are unsure');
+    expect(last).not.toContain('Board wants a status.');
+    expect(appendAgendaLoad).not.toHaveBeenCalled();
+  });
+});
+
+describe('VoiceRuntime meeting notes (#2347)', () => {
+  function systemText(messages: Message[]): string {
+    return messages
+      .filter((message) => message.role === 'system' && typeof message.content === 'string')
+      .map((message) => message.content as string)
+      .join('\n');
+  }
+
+  // The handler writes the mark; the runtime only reads its (audited) result.
+  async function callWithNotes(toolResult: { content: string; is_error?: boolean }) {
+    const llm = new FakeStreamProvider([
+      [{ type: 'tool_use', toolCalls: [{ id: 'c1', name: 'meeting-notes-start', input: { recap: true } }], usage, provenance }],
+      replyScript('Sure.'),
+      replyScript('Go on.'),
+    ]);
+    const { runtime, stt } = makeRuntime({
+      llm,
+      tts: new SlowTtsProvider(1, 1),
+      invokeTool: async () => toolResult,
+    });
+    await runtime.startSession({
+      sessionId: 's-notes',
+      conversationId: 'voice:s-notes',
+      roomName: 'voice-s-notes',
+      agentToken: 'tok',
+      caller: principalCaller(),
+      openingGreeting: false,
+    });
+    stt.emit({ text: 'keep notes and send me a recap', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-notes');
+    stt.emit({ text: 'first item', isFinal: true, speechFinal: true });
+    await runtime.awaitIdle('s-notes');
+    return llm;
+  }
+
+  it('restates a recap in every later turn\'s prompt after a successful result', async () => {
+    const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: true }) });
+    expect(systemText(llm.seenMessages[0] ?? [])).not.toContain('## Meeting notes');
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('## Meeting notes');
+    expect(last).toContain('Do not hand the recap off');
+  });
+
+  it('restates notes without a recap when none was asked for', async () => {
+    const llm = await callWithNotes({ content: JSON.stringify({ notes_on: true, recap: false }) });
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).toContain('A recap goes out only if an agenda topic');
+  });
+
+  it('leaves notes off after a failed result', async () => {
+    const llm = await callWithNotes({ content: 'Notes could not be started for this call.', is_error: true });
+    const last = systemText(llm.seenMessages[llm.seenMessages.length - 1] ?? []);
+    expect(last).not.toContain('## Meeting notes');
+  });
+
+  // #2347: one recap, one path. The delegation sentence must agree with the
+  // meeting-notes-start and async-offramp descriptions on the turn that chooses.
+  it('names meeting-notes-start for the recap and async-offramp for other after-call sends', () => {
+    const prompt = buildVoiceSystemPrompt({
+      specialistRoster: '- @ceo-inbox: the principal\'s inbox',
+      audience: { liveTurn: true },
+    });
+    expect(prompt).toContain('reading the principal\'s inbox');
+    expect(prompt).toContain('A recap of this call is meeting-notes-start.');
+    expect(prompt).toContain('such as links or research results, goes to async-offramp, not a specialist');
+  });
+});

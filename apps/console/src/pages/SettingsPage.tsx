@@ -5,27 +5,12 @@ import { Sidebar } from '../components/Sidebar';
 import { Topbar } from '../components/Topbar';
 import { apiFetch } from '../api';
 import { useTheme } from '../hooks/useTheme';
+// Shared with the operator config-settings pages — single source of truth for
+// the relative-time and HTTP-error-body helpers (they were duplicated here).
+import { errorMessage, timeAgo } from '../components/settings/ConfigHistory';
+import { BAND_META, bandForScore, type AutonomyBand } from '../autonomy-bands';
 
 // ── Band metadata ─────────────────────────────────────────────────────────────
-
-type AutonomyBand = 'full' | 'spot-check' | 'approval-required' | 'draft-only' | 'restricted';
-
-// Band colors match the legacy UI and the app's design token palette.
-const BAND_META: Record<AutonomyBand, { label: string; color: string; description: string }> = {
-  'full':              { label: 'Full',              color: '#5E9E6B', description: 'Curia acts independently with no confirmation required for any standard operation.' },
-  'spot-check':        { label: 'Spot-check',        color: '#6BAED6', description: 'Curia proceeds with most actions and flags a small random sample for your review.' },
-  'approval-required': { label: 'Approval Required', color: '#C9874A', description: 'Curia drafts and plans, then pauses for your explicit approval before acting.' },
-  'draft-only':        { label: 'Draft Only',        color: '#7E6BA8', description: 'Curia prepares drafts and summaries but does not send, schedule, or commit anything.' },
-  'restricted':        { label: 'Restricted',        color: '#E86040', description: 'Curia operates in read-only mode. No writes, sends, or external actions.' },
-};
-
-function bandForScore(score: number): AutonomyBand {
-  if (score >= 90) return 'full';
-  if (score >= 80) return 'spot-check';
-  if (score >= 70) return 'approval-required';
-  if (score >= 60) return 'draft-only';
-  return 'restricted';
-}
 
 function BandBadge({ band }: { band: AutonomyBand }) {
   const meta = BAND_META[band] ?? { label: band, color: '#999' };
@@ -41,17 +26,6 @@ function BandBadge({ band }: { band: AutonomyBand }) {
       {meta.label}
     </span>
   );
-}
-
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -72,20 +46,6 @@ interface HistoryEntry {
   changedBy: string;
   reason: string | null;
   changedAt: string;
-}
-
-// Safe error message extraction — guards against non-JSON error bodies (e.g. rate-limiter HTML).
-async function errorMessage(res: Response): Promise<string> {
-  const ct = res.headers.get('content-type') ?? '';
-  if (ct.includes('application/json')) {
-    try {
-      const d = await res.json() as { error?: string };
-      if (d.error) return d.error;
-    } catch (err) {
-      console.error('[errorMessage] failed to read JSON error body:', err);
-    }
-  }
-  return `HTTP ${res.status}`;
 }
 
 // ── Autonomy section ──────────────────────────────────────────────────────────
@@ -314,15 +274,16 @@ function AutonomySection() {
 
 // ── Settings layout ───────────────────────────────────────────────────────────
 
-// The settings nav sections. Only 'autonomy' is functional; 'workspace' is a stub
-// for a future PR. Skills and Agents used to live here but are now standalone
-// top-level pages (see RegistrySettings.tsx) reachable from the sidebar directly.
-// Rendered as <Link> elements so the URL changes on click and back/forward
-// navigation works correctly within the settings shell.
+// In-page settings nav (#1376). Order: Personality → Ghostwriting → Posture →
+// Autonomy → Memory. System lives as a standalone sidebar page outside this
+// shell (#1765), same as Skills / Agents / Channels.
 const SETTINGS_SECTIONS = [
-  { id: 'autonomy',  label: 'Autonomy',    href: '/settings/autonomy' },
-  { id: 'workspace', label: 'Workspace',   href: '/settings/workspace' },
-];
+  { id: 'personality',  label: 'Personality',  href: '/settings/personality' },
+  { id: 'ghostwriting', label: 'Ghostwriting', href: '/settings/ghostwriting' },
+  { id: 'posture',      label: 'Standing preferences', href: '/settings/posture' },
+  { id: 'autonomy',     label: 'Autonomy',     href: '/settings/autonomy' },
+  { id: 'memory',       label: 'Memory',       href: '/settings/memory' },
+] as const;
 
 interface SettingsLayoutProps {
   activeSection: string;
@@ -337,12 +298,14 @@ export function SettingsLayout({ activeSection, children }: SettingsLayoutProps)
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
   }, [mobileOpen]);
 
+  const activeLabel = SETTINGS_SECTIONS.find(s => s.id === activeSection)?.label ?? 'Settings';
+
   return (
     <MobileMenuContext.Provider value={{ open: mobileOpen, setOpen: setMobileOpen }}>
       <div className="app-root">
         <Sidebar activeView="settings" theme={theme} onThemeChange={setTheme} />
         <main className="main">
-          <Topbar crumb="Settings" title="Workspace" />
+          <Topbar crumb="Settings" title={activeLabel} />
           <div className="settings-shell">
             <nav className="settings-nav">
               <div className="settings-nav-title">Settings</div>
@@ -372,17 +335,6 @@ export function AutonomyPage() {
   return (
     <SettingsLayout activeSection="autonomy">
       <AutonomySection />
-    </SettingsLayout>
-  );
-}
-
-export function WorkspacePage() {
-  return (
-    <SettingsLayout activeSection="workspace">
-      <div className="settings-page-header">
-        <h2 className="settings-page-title">Workspace</h2>
-        <p className="settings-page-sub">Workspace settings — coming soon.</p>
-      </div>
     </SettingsLayout>
   );
 }

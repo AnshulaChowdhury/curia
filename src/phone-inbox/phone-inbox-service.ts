@@ -31,10 +31,18 @@ export interface SentMessage {
   date: number;
 }
 
+/** What the inbox looks like right now: the tagged unread messages, and how many unread there are in all. */
+export interface InboxSnapshot {
+  /** Unread messages still in the inbox that carry a triage tag (Urgent, Drafted or Seen). Never the whole inbox. */
+  messages: InboxMessage[];
+  /** Total unread in the inbox when the provider reports it; otherwise undefined. */
+  unreadCount: number | undefined;
+}
+
 /** Read-only view of one mailbox. Implemented over Nylas; faked in tests. */
 export interface MailboxReader {
-  /** Unread messages currently in the inbox, newest first. */
-  unreadInbox(): Promise<InboxMessage[]>;
+  /** The tagged, unread, still-in-inbox messages. Deliberately small: it must not scan the whole inbox. */
+  inboxSnapshot(): Promise<InboxSnapshot>;
   /** Messages the principal sent on or after [sinceSeconds]. */
   sentSince(sinceSeconds: number): Promise<SentMessage[]>;
 }
@@ -60,6 +68,11 @@ export interface PhoneInboxItem {
 export interface PhoneInboxAccount {
   id: PhoneInboxAccountId;
   address: string | null;
+  /**
+   * False when this mailbox isn't connected (no Nylas grant, e.g. an employer that blocks third-party
+   * access). Its counts are then 0 because nothing was read, not because it is clear; the phone says so.
+   */
+  syncing: boolean;
   needsYou: number;
   unread: number;
   items: PhoneInboxItem[];
@@ -92,6 +105,27 @@ function senderOf(message: InboxMessage): string {
   return message.fromName?.trim() || message.fromEmail?.trim() || '';
 }
 
+/** A mailbox read was refused because the provider is rate limiting us (HTTP 429). */
+export class MailboxRateLimitedError extends Error {
+  constructor(public readonly retryAfterSeconds: number | undefined) {
+    super('Mailbox provider is rate limiting requests');
+    this.name = 'MailboxRateLimitedError';
+  }
+}
+
+// An answer younger than this is served as is, so a phone that refreshes often costs the provider nothing.
+const FRESH_MS = 60_000;
+// If a read fails we keep serving the last good answer for this long, then say "not syncing".
+const STALE_MAX_MS = 30 * 60_000;
+// After a 429 we leave the provider alone for at least this long (or its Retry-After, if longer).
+const MIN_COOLDOWN_MS = 60_000;
+
+/** What we know between requests: the last good answer per mailbox, and when each is allowed to be asked again. */
+export class PhoneInboxCache {
+  readonly good = new Map<string, { account: PhoneInboxAccount; at: number }>();
+  readonly blockedUntil = new Map<string, number>();
+}
+
 export class PhoneInboxUnavailableError extends Error {
   constructor(public readonly accountId: PhoneInboxAccountId, cause: unknown) {
     super(`Could not read the ${accountId} mailbox`, { cause });
@@ -104,12 +138,13 @@ export class PhoneInboxService {
     private readonly accounts: PhoneInboxAccountConfig[],
     private readonly logger: Logger,
     private readonly now: () => Date = () => new Date(),
+    private readonly cache: PhoneInboxCache = new PhoneInboxCache(),
   ) {}
 
   /**
-   * Builds the current answer. Throws [PhoneInboxUnavailableError] if any configured mailbox can't be
-   * read: showing "0 need you" for a mailbox we failed to read would be wrong, and the phone keeps its
-   * cached list on a server error.
+   * Builds the current answer. A mailbox that can't be read doesn't fail the others: we serve its last
+   * good answer for up to 30 minutes, then report it as not syncing (never as "0 need you", which would
+   * look like all clear). A rate-limited mailbox is left alone until its cool-down ends.
    */
   async build(): Promise<PhoneInbox> {
     const now = this.now();
@@ -119,18 +154,50 @@ export class PhoneInboxService {
 
   private async buildAccount(account: PhoneInboxAccountConfig, now: Date): Promise<PhoneInboxAccount> {
     const { id, address, reader } = account;
-    if (!reader) return { id, address, needsYou: 0, unread: 0, items: [] };
+    if (!reader) return { id, address, syncing: false, needsYou: 0, unread: 0, items: [] };
 
-    const sinceSeconds = Math.floor(now.getTime() / 1000) - REPLY_LOOKBACK_SECONDS;
-    let unreadMessages: InboxMessage[];
-    let sent: SentMessage[];
+    const nowMs = now.getTime();
+    const cached = this.cache.good.get(id);
+    if (cached && nowMs - cached.at < FRESH_MS) return cached.account;
+    if ((this.cache.blockedUntil.get(id) ?? 0) > nowMs) return this.fallback(account, cached, nowMs);
+
     try {
-      [unreadMessages, sent] = await Promise.all([reader.unreadInbox(), reader.sentSince(sinceSeconds)]);
+      const built = await this.readAccount(account, reader, now);
+      this.cache.good.set(id, { account: built, at: nowMs });
+      this.cache.blockedUntil.delete(id);
+      return built;
     } catch (err) {
-      // Log the failure without any message content; the caller turns this into a 5xx.
-      this.logger.error({ err, account: id }, 'phone-inbox: mailbox read failed');
-      throw new PhoneInboxUnavailableError(id, err);
+      // Log the failure without any message content.
+      if (err instanceof MailboxRateLimitedError) {
+        const waitMs = Math.max(MIN_COOLDOWN_MS, (err.retryAfterSeconds ?? 0) * 1000);
+        this.cache.blockedUntil.set(id, nowMs + waitMs);
+        this.logger.warn({ account: id, retryAfterSeconds: err.retryAfterSeconds }, 'phone-inbox: mailbox rate limited; backing off');
+      } else {
+        this.logger.error({ err, account: id }, 'phone-inbox: mailbox read failed');
+      }
+      return this.fallback(account, cached, nowMs);
     }
+  }
+
+  private fallback(
+    account: PhoneInboxAccountConfig,
+    cached: { account: PhoneInboxAccount; at: number } | undefined,
+    nowMs: number,
+  ): PhoneInboxAccount {
+    if (cached && nowMs - cached.at <= STALE_MAX_MS) return cached.account;
+    return { id: account.id, address: account.address, syncing: false, needsYou: 0, unread: 0, items: [] };
+  }
+
+  private async readAccount(account: PhoneInboxAccountConfig, reader: MailboxReader, now: Date): Promise<PhoneInboxAccount> {
+    const { id, address } = account;
+    // One call at a time: the provider limits per mailbox, and parallel calls are what trips it.
+    const snapshot = await reader.inboxSnapshot();
+    const unreadMessages = snapshot.messages;
+    // Only look for replies since the oldest candidate arrived (and never further back than the lookback);
+    // with no candidates there is nothing to check, so no call at all.
+    const floor = Math.floor(now.getTime() / 1000) - REPLY_LOOKBACK_SECONDS;
+    const oldest = unreadMessages.reduce((min, m) => Math.min(min, m.date), Number.POSITIVE_INFINITY);
+    const sent = unreadMessages.length === 0 ? [] : await reader.sentSince(Math.max(floor, oldest - 60));
 
     const lastReplyByThread = new Map<string, number>();
     for (const message of sent) {
@@ -159,6 +226,6 @@ export class PhoneInboxService {
         ...(id === 'work-outlook' ? { messageId: message.id } : {}),
       }));
 
-    return { id, address, needsYou: items.length, unread: unreadMessages.length, items };
+    return { id, address, syncing: true, needsYou: items.length, unread: snapshot.unreadCount ?? unreadMessages.length, items };
   }
 }

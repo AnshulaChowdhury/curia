@@ -8,17 +8,21 @@ import {
 } from '@tanstack/react-router';
 import LoginPage from './pages/LoginPage';
 import { getSessionInfo } from './api';
+import { clampWizardStep } from './pages/wizard-utils';
+import { noteResolvedPath } from './pages/chat/ask-handoff';
 
 // Route components are lazy-loaded so Vite produces separate chunks per route.
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
 const AutonomyPage = lazy(() =>
   import('./pages/SettingsPage').then(m => ({ default: m.AutonomyPage })),
 );
-const WorkspacePage = lazy(() =>
-  import('./pages/SettingsPage').then(m => ({ default: m.WorkspacePage })),
-);
-const SkillsPage = lazy(() =>
-  import('./pages/RegistrySettings').then(m => ({ default: m.SkillsPage })),
+const PersonalityPage = lazy(() => import('./pages/PersonalitySettingsPage'));
+const GhostwritingPage = lazy(() => import('./pages/GhostwritingSettingsPage'));
+const PosturePage = lazy(() => import('./pages/PostureSettingsPage'));
+const MemoryPage = lazy(() => import('./pages/MemorySettingsPage'));
+const SystemPage = lazy(() => import('./pages/SystemSettingsPage'));
+const ToolsPage = lazy(() =>
+  import('./pages/RegistrySettings').then(m => ({ default: m.ToolsPage })),
 );
 const AgentsPage = lazy(() =>
   import('./pages/RegistrySettings').then(m => ({ default: m.AgentsPage })),
@@ -26,13 +30,14 @@ const AgentsPage = lazy(() =>
 const ChannelsPage = lazy(() =>
   import('./pages/ChannelSettings').then(m => ({ default: m.ChannelsPage })),
 );
-const ConnectionsPage = lazy(() => import('./pages/ConnectionsPage'));
+const McpToolsPage = lazy(() => import('./pages/McpToolsPage'));
 const WizardPage = lazy(() => import('./pages/WizardPage'));
 const SecretCapturePage = lazy(() => import('./pages/SecretCapturePage'));
 const ContactsPage = lazy(() => import('./pages/ContactsPage'));
 const JobsPage = lazy(() => import('./pages/JobsPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const KgPage = lazy(() => import('./pages/KgPage'));
+const DocumentsPage = lazy(() => import('./pages/DocumentsPage'));
 const ChatPage = lazy(() => import('./pages/ChatPage'));
 
 const rootRoute = createRootRoute({
@@ -76,12 +81,7 @@ const setupRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/setup',
   validateSearch: (search: Record<string, unknown>) => ({
-    // Wizard now has 5 steps after the "About you" principal step was added at
-    // step 1 (issue #771). Clamp incoming ?step= values so a stale link from
-    // before the renumbering doesn't blow up route rendering.
-    step: typeof search['step'] === 'number'
-      ? Math.max(1, Math.min(5, Math.round(search['step'] as number)))
-      : 1,
+    step: clampWizardStep(search['step']),
   }),
   component: WizardPage,
 });
@@ -92,7 +92,7 @@ const settingsRoute = createRoute({
   path: '/settings',
   beforeLoad: ({ location }) => {
     if (location.pathname === '/settings' || location.pathname === '/settings/') {
-      throw redirect({ to: '/settings/autonomy' });
+      throw redirect({ to: '/settings/personality' });
     }
   },
   component: () => (
@@ -102,31 +102,84 @@ const settingsRoute = createRoute({
   ),
 });
 
+const personalityRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/personality',
+  component: PersonalityPage,
+});
+
+const ghostwritingRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/ghostwriting',
+  component: GhostwritingPage,
+});
+
+// Preserve the pre-rename URL introduced earlier in this PR (#1376).
+const assistantRedirect = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/assistant',
+  beforeLoad: () => { throw redirect({ to: '/settings/personality' }); },
+});
+
+const postureRoute = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/posture',
+  component: PosturePage,
+});
+
 const autonomyRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/autonomy',
   component: AutonomyPage,
 });
 
-const workspaceRoute = createRoute({
+const memoryRoute = createRoute({
   getParentRoute: () => settingsRoute,
-  path: '/workspace',
-  component: WorkspacePage,
+  path: '/memory',
+  component: MemoryPage,
 });
 
-// Skills and Agents are now standalone top-level pages (peer to Contacts/Tasks),
-// no longer rendered inside the settings shell. The two routes below preserve the
-// old /settings/skills and /settings/agents URLs by redirecting to the new paths.
+// System is a standalone top-level page (peer to Tools/Agents/Channels), no
+// longer rendered inside the settings shell. Preserve old /settings/system
+// bookmarks by redirecting to /system (#1765).
+const systemRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/system',
+  component: SystemPage,
+});
+
+const systemSettingsRedirect = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/system',
+  beforeLoad: () => { throw redirect({ to: '/system' }); },
+});
+
+// Tools and Agents are standalone top-level pages (peer to Contacts/Tasks),
+// no longer rendered inside the settings shell. Preserve old /settings/skills,
+// /skills, and /settings/agents URLs by redirecting to the new paths.
 const skillsSettingsRedirect = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/skills',
-  beforeLoad: () => { throw redirect({ to: '/skills' }); },
+  beforeLoad: () => { throw redirect({ to: '/tools' }); },
+});
+
+const legacySkillsRedirect = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/skills',
+  beforeLoad: () => { throw redirect({ to: '/tools' }); },
 });
 
 const agentsSettingsRedirect = createRoute({
   getParentRoute: () => settingsRoute,
   path: '/agents',
   beforeLoad: () => { throw redirect({ to: '/agents' }); },
+});
+
+// Legacy stub — Workspace was removed in #1376; send bookmarks to the new default.
+const workspaceRedirect = createRoute({
+  getParentRoute: () => settingsRoute,
+  path: '/workspace',
+  beforeLoad: () => { throw redirect({ to: '/settings/personality' }); },
 });
 
 const loginRoute = createRoute({
@@ -155,16 +208,25 @@ const jobsRoute = createRoute({
   component: JobsPage,
 });
 
+const jobDetailRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/jobs/$jobId',
+  component: JobsPage,
+});
+
 const tasksRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/tasks',
+  validateSearch: (search: Record<string, unknown>) => ({
+    task: typeof search['task'] === 'string' ? search['task'] : undefined,
+  }),
   component: TasksPage,
 });
 
 const skillsRoute = createRoute({
   getParentRoute: () => authedRoute,
-  path: '/skills',
-  component: SkillsPage,
+  path: '/tools',
+  component: ToolsPage,
 });
 
 const agentsRoute = createRoute({
@@ -179,10 +241,10 @@ const channelsRoute = createRoute({
   component: ChannelsPage,
 });
 
-const connectionsRoute = createRoute({
+const mcpSkillsRoute = createRoute({
   getParentRoute: () => authedRoute,
-  path: '/connections',
-  component: ConnectionsPage,
+  path: '/mcp-skills',
+  component: McpToolsPage,
 });
 
 const kgRoute = createRoute({
@@ -195,6 +257,18 @@ const kgRoute = createRoute({
   component: KgPage,
 });
 
+// Memory → Documents (#1821). `path` opens the live document at a path; `id` opens a
+// specific row, which is how archived documents (several may share a path) are addressed.
+const documentsRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/documents',
+  validateSearch: (search: Record<string, unknown>) => ({
+    path: typeof search['path'] === 'string' ? search['path'] : undefined,
+    id: typeof search['id'] === 'string' ? search['id'] : undefined,
+  }),
+  component: DocumentsPage,
+});
+
 const routeTree = rootRoute.addChildren([
   authedRoute.addChildren([
     dashboardRoute,
@@ -202,19 +276,37 @@ const routeTree = rootRoute.addChildren([
     setupRoute,
     contactsRoute,
     jobsRoute,
+    jobDetailRoute,
     tasksRoute,
     skillsRoute,
+    legacySkillsRedirect,
     agentsRoute,
     channelsRoute,
-    connectionsRoute,
+    mcpSkillsRoute,
     kgRoute,
-    settingsRoute.addChildren([autonomyRoute, workspaceRoute, skillsSettingsRedirect, agentsSettingsRedirect]),
+    documentsRoute,
+    systemRoute,
+    settingsRoute.addChildren([
+      personalityRoute,
+      ghostwritingRoute,
+      postureRoute,
+      autonomyRoute,
+      memoryRoute,
+      systemSettingsRedirect,
+      assistantRedirect,
+      workspaceRedirect,
+      skillsSettingsRedirect,
+      agentsSettingsRedirect,
+    ]),
   ]),
   loginRoute,
   secretCaptureRoute,
 ]);
 
 export const router = createRouter({ routeTree });
+
+// Drop a pending Ask Curia question once the principal lands anywhere but /chat (#2351).
+router.subscribe('onResolved', ({ toLocation }) => noteResolvedPath(toLocation.pathname));
 
 // Register router type for full type-safety on useNavigate, Link, etc.
 declare module '@tanstack/react-router' {

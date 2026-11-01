@@ -1,34 +1,39 @@
 import { describe, it, expect, vi } from 'vitest';
 import pino from 'pino';
 import { EventBus } from '../../src/bus/bus.js';
-import { SkillRegistry } from '../../src/skills/registry.js';
+import { ToolRegistry } from '../../src/skills/registry.js';
 import { ExecutionLayer } from '../../src/skills/execution.js';
 import { OutboundGateway } from '../../src/skills/outbound-gateway.js';
 import type { BusEvent, OutboundDeliveredEvent } from '../../src/bus/events.js';
-import type { SkillManifest } from '../../src/skills/types.js';
+import type { ToolManifest } from '../../src/skills/types.js';
 import type { ContactService } from '../../src/contacts/contact-service.js';
 import type { OutboundContentFilter } from '../../src/dispatch/outbound-filter.js';
 import type { OutboundContextService } from '../../src/dispatch/outbound-context.js';
 import { SignalSendHandler } from '../../skills/signal-send/handler.js';
-import signalSendManifest from '../../skills/signal-send/skill.json' with { type: 'json' };
+import signalSendManifest from '../../skills/signal-send/tool.json' with { type: 'json' };
+import type { SignalRpcClient } from '../../src/channels/signal/signal-rpc-client.js';
 
 const logger = pino({ level: 'silent' });
+
+// signal-send takes a contact reference (#2041): the skill looks the number up from
+// this contact's verified signal identity.
+const RECIPIENT_ID = '44444444-4444-4444-8444-444444444444';
 
 describe('outbound.delivered emission (#729)', () => {
   it('signal-send invocation publishes one outbound.delivered event with full payload', async () => {
     const bus = new EventBus(logger);
     const captured: BusEvent[] = [];
 
-    // Capture both skill.result and outbound.delivered events to validate the full pipeline.
+    // Capture both tool.result and outbound.delivered events to validate the full pipeline.
     bus.subscribe('outbound.delivered', 'system', async (evt) => { captured.push(evt); });
-    bus.subscribe('skill.result', 'system', async (evt) => { captured.push(evt); });
+    bus.subscribe('tool.result', 'system', async (evt) => { captured.push(evt); });
 
-    // Mock signal-cli RPC client — send resolves to undefined (success), listGroups
-    // returns empty array (used only for group sends, irrelevant for 1:1).
+    // Mock signal-cli RPC client — send resolves to the Signal timestamp (message id).
     const signalClient = {
-      send: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn().mockResolvedValue('1700000000999'),
       listGroups: vi.fn().mockResolvedValue([]),
-    };
+      isConnected: vi.fn().mockReturnValue(true),
+    } as unknown as SignalRpcClient;
 
     // Mock ContactService — resolveByChannelIdentity is called twice:
     //   1. In OutboundGateway.send() Step 1 (blocked-contact check + trust capture)
@@ -37,13 +42,18 @@ describe('outbound.delivered emission (#729)', () => {
     // createContact, linkIdentity, or setStatus calls are made).
     const contactService = {
       resolveByChannelIdentity: vi.fn().mockResolvedValue({
-        contactId: 'contact-int-1',
+        contactId: RECIPIENT_ID,
         displayName: 'Integration Test Recipient',
         role: null,
         tier: 'known',
         kgNodeId: null,
         verified: true,
       }),
+      getContactWithIdentities: vi.fn(async (id: string) => (id === RECIPIENT_ID ? {
+        contact: { id, displayName: 'Integration Test Recipient', primaryEmail: null, primaryPhone: '+15555550199', tier: 'known' },
+        identities: [{ id: 'identity-int-1', contactId: id, channel: 'signal', channelIdentifier: '+15555550199', label: null,
+          verified: true, verifiedAt: new Date(), status: 'active', source: 'ceo_stated', createdAt: new Date(), updatedAt: new Date() }],
+      } : undefined)),
     } as unknown as ContactService;
 
     // Mock OutboundContentFilter — passes all messages (no blocking in this test path).
@@ -58,6 +68,7 @@ describe('outbound.delivered emission (#729)', () => {
     const outboundContextService = {
       defaultExpiryHours: 6,
       explicitExpiryHours: 24,
+      defaultExpiryHoursFor: (channelId: string) => (channelId === 'email' ? 72 : 6),
       register: vi.fn().mockResolvedValue('ctx-entry-int-1'),
       release: vi.fn().mockResolvedValue(undefined),
     } as unknown as OutboundContextService;
@@ -76,8 +87,8 @@ describe('outbound.delivered emission (#729)', () => {
     });
 
     // Register the signal-send skill with the real manifest and handler.
-    const registry = new SkillRegistry();
-    registry.register(signalSendManifest as SkillManifest, new SignalSendHandler());
+    const registry = new ToolRegistry();
+    registry.register(signalSendManifest as ToolManifest, new SignalSendHandler());
 
     // Build the real ExecutionLayer wired with the gateway, bus, contactService,
     // and outboundContextService. The signal-send manifest declares both
@@ -97,7 +108,7 @@ describe('outbound.delivered emission (#729)', () => {
     // so taskEventId/conversationId must go in the fourth argument for them to reach the payload.
     const result = await executionLayer.invoke(
       'signal-send',
-      { recipient: '+15555550199', message: 'audit emission test body' },
+      { recipient: RECIPIENT_ID, message: 'audit emission test body' },
       undefined,
       {
         agentId: 'coordinator',
@@ -110,7 +121,7 @@ describe('outbound.delivered emission (#729)', () => {
     expect(result.success).toBe(true);
 
     // The execution layer calls invoke() directly here — no AgentRuntime in the loop,
-    // so skill.result events are not published (that happens in the agent layer).
+    // so tool.result events are not published (that happens in the agent layer).
     // The outbound.delivered event is published by OutboundGateway after the wire-level
     // send succeeds, which is the audit signal this test validates.
     const deliveredEvents = captured.filter(
@@ -121,10 +132,11 @@ describe('outbound.delivered emission (#729)', () => {
     expect(deliveredEvents[0]!.payload).toMatchObject({
       channel: 'signal',
       recipientId: '+15555550199',
-      recipientContactId: 'contact-int-1',
+      recipientContactId: RECIPIENT_ID,
       content: 'audit emission test body',
       conversationId: 'signal:+15555550199',
       taskEventId: 'task-int-1',
+      messageId: '1700000000999',
     });
   });
 });

@@ -14,6 +14,34 @@ import {
 } from '../bus/events.js';
 import type { DbTaskRow, TaskRow } from './queries/tasks.js';
 import { mapTaskRow } from './queries/tasks.js';
+import type { TaskOriginator } from '../contacts/types.js';
+import { capOriginatorToParent } from '../contacts/principal.js';
+import {
+  readPlanBlock,
+  preparePlanBlock,
+  type PreparePlanBlockInput,
+  type PlanProgressBlock,
+  type PlanWriteResult,
+} from './plan-progress.js';
+import {
+  readResumableBlock,
+  prepareResumableBlock,
+  type PrepareResumableBlockInput,
+  type ResumableProgressBlock,
+  type ResumableWriteResult,
+} from './resumable-progress.js';
+import {
+  prepareActiveSkillsBlock,
+  type ActiveSkillsBlock,
+  type ActiveSkillsWriteResult,
+} from './active-skills-progress.js';
+import { prepareResumableBlockWithSpill } from './resumable-accumulator-spill.js';
+import type { WorkingDocsRepo } from './working-docs-repo.js';
+import type { TaskOutreachRepo } from '../dispatch/task-outreach.js';
+import { type ResumableCircuitState } from '../agents/resumable-circuit-breaker.js';
+import { isPgUniqueViolation } from '../agents/resumable-continuation.js';
+import type { PlanAdaptiveState } from '../agents/plan-adaptive-replan.js';
+import type { TaskEscalation } from '../agents/task-escalation.js';
 
 // All SELECT / RETURNING clauses use this column list. Centralised so a schema
 // change only needs updating in one place.
@@ -21,10 +49,20 @@ const TASK_COLUMNS = `
   id, agent_id, intent_anchor, title, description, status, progress, error_budget,
   conversation_id, created_at, updated_at, owner, waiting_on_contact_id,
   waiting_on_text, parent_task_id, blocked_by_task_id, priority, due_at,
-  source, source_agent_id, created_by, tags
+  source, source_agent_id, created_by, tags, originator
 `;
 
 // -- Public types --
+
+/** A status change away from done or cancelled. Callers match the class, not the message. */
+export class TaskTerminalStateError extends Error {
+  readonly status: string;
+  constructor(status: string) {
+    super(`Cannot transition task from '${status}' — it is a terminal state.`);
+    this.name = 'TaskTerminalStateError';
+    this.status = status;
+  }
+}
 
 export interface CreateTaskParams {
   agentId: string;
@@ -32,6 +70,11 @@ export interface CreateTaskParams {
   description?: string;
   owner?: 'curia' | 'ceo' | 'external';
   parentTaskId?: string;
+  /**
+   * Parent row the caller already loaded. When its id matches `parentTaskId`,
+   * originator capping uses this row and does not read the parent again.
+   */
+  parentTask?: TaskRow | null;
   blockedByTaskId?: string;
   priority?: number;
   dueAt?: Date;
@@ -44,6 +87,43 @@ export interface CreateTaskParams {
   createdBy?: string;
   /** When set, creates a linked one-shot scheduled_jobs row in the same transaction. */
   wakeAt?: Date;
+  /**
+   * Replaces the default `{ "type": "task-wake" }` payload on that job. Must still
+   * be a task-wake envelope. Used so a deferred delegation wakes in the originating
+   * conversation (#1893).
+   */
+  wakePayload?: Record<string, unknown>;
+  /** Lineage to stamp on the task (#1125) — copied from the creating event's originator
+   *  (ctx.taskMetadata.originator). For child tasks (parentTaskId set) it is capped to the
+   *  parent's lineage, never above it. Absent/null → no lineage (agent / no-bypass). */
+  originator?: TaskOriginator | null;
+  /** When true, stamps error_budget.resumable so the checkpoint harness activates (#1173). */
+  resumable?: boolean;
+  /** Seeds an initial progress note (#1267). Makes the new row's last_progress_note non-empty
+   *  so the daily digest renders real content, not just title + tags. */
+  progressNote?: string;
+  /** Structured escalation payload (#1267), stored at progress.escalation for audit and a
+   *  future interactive surface. Set by the circuit-breaker / delegation escalation paths. */
+  escalation?: TaskEscalation;
+}
+
+/**
+ * Build the initial tasks.progress JSON for a new row (#1267). Defaults to the legacy
+ * empty-notes seed (`{"notes":[]}`). An optional first progress note makes the row's
+ * last_progress_note non-empty — the field the daily digest reads — and an optional
+ * structured escalation block is stored under progress.escalation.
+ */
+export function buildInitialTaskProgress(opts: {
+  progressNote?: string;
+  escalation?: TaskEscalation;
+  now?: Date;
+}): Record<string, unknown> {
+  const notes = opts.progressNote
+    ? [{ at: (opts.now ?? new Date()).toISOString(), note: opts.progressNote }]
+    : [];
+  const progress: Record<string, unknown> = { notes };
+  if (opts.escalation) progress.escalation = opts.escalation;
+  return progress;
 }
 
 export interface UpdateTaskParams {
@@ -65,6 +145,41 @@ export interface ListTasksFilters {
   parentTaskId?: string;
   dueBefore?: Date;
   limit?: number;
+  /** Keyset pagination cursor (#1433). When set, only rows strictly *after* this row in the
+   *  (priority DESC, due_at ASC NULLS LAST, id ASC) ordering are returned. Build it from the
+   *  last row of the previous page. */
+  cursor?: TaskListCursor;
+}
+
+/**
+ * Opaque keyset-pagination cursor for {@link TaskRepo.listTasks} (#1433). Encodes the sort key of
+ * the last row returned — (priority, due_at, id) — so the next page can resume without skipping or
+ * duplicating rows. `id` is the total-ordering tiebreaker that makes the sort deterministic even
+ * when priority and due_at tie.
+ */
+export interface TaskListCursor {
+  priority: number;
+  dueAt: string | null;
+  id: string;
+}
+
+/** Options for {@link TaskRepo.listAllTasks} (#1433). */
+export interface ListAllTasksOptions {
+  /** Rows fetched per keyset page. Default 500. */
+  pageSize?: number;
+  /** Hard ceiling on the total rows returned across all pages — a safety valve so a runaway task
+   *  volume can't turn one poll into an unbounded scan. When reached, iteration stops, a warning is
+   *  logged, and the result's `truncated` flag is set. Default 5000. */
+  maxTasks?: number;
+}
+
+/** Result of {@link TaskRepo.listAllTasks} (#1433). `truncated` is true when the safety ceiling was
+ *  hit before the result set was exhausted, so `tasks` is a partial view and the caller should treat
+ *  its answer as incomplete (mirrors the `{ messages, truncated }` shape sent-observe already
+ *  consumes from listAllMessages). */
+export interface ListAllTasksResult {
+  tasks: TaskListRow[];
+  truncated: boolean;
 }
 
 // Extended row returned by list — includes the next pending wake-up time if any.
@@ -75,13 +190,44 @@ export interface TaskListRow extends TaskRow {
 // Terminal statuses: no transitions out of these.
 const TERMINAL_STATUSES = new Set(['done', 'cancelled']);
 
+/** Active child statuses reconciled when a parent reaches a terminal state (#1239). */
+const RECONCILABLE_CHILD_STATUSES = ['open', 'in_progress', 'waiting', 'blocked'];
+
+type DbQueryable = Pick<Pool, 'query'>;
+
+interface ReconciledChildRow {
+  id: string;
+  previous_status: string;
+}
+
 export class TaskRepo {
   constructor(
     private readonly pool: Pool,
     private readonly bus: EventBus,
     private readonly logger: Logger,
     private readonly timezone: string = 'UTC',
+    private readonly workingDocsRepo?: WorkingDocsRepo,
+    /**
+     * Closes a finished task's outreach rows (#2312). Injected rather than imported so the
+     * repo stays free of dispatch wiring; absent in tests and tools that build their own repo.
+     */
+    private readonly outreach?: Pick<TaskOutreachRepo, 'closeForTask' | 'reopenForTask'>,
   ) {}
+
+  /**
+   * Stop waiting on replies to outreach for tasks that just ended. After the commit and
+   * best-effort: the task is already done, and an open row only expires later (30 days).
+   */
+  private async closeOutreach(taskIds: readonly string[]): Promise<void> {
+    if (!this.outreach) return;
+    for (const taskId of taskIds) {
+      try {
+        await this.outreach.closeForTask(taskId);
+      } catch (err) {
+        this.logger.warn({ err, taskId }, 'task-repo: failed to close task outreach — rows stay open until they expire');
+      }
+    }
+  }
 
   /**
    * Insert a new task row. When `wakeAt` is provided, the insert and the
@@ -94,6 +240,7 @@ export class TaskRepo {
       description,
       owner = 'curia',
       parentTaskId,
+      parentTask,
       blockedByTaskId,
       priority = 50,
       dueAt,
@@ -105,20 +252,41 @@ export class TaskRepo {
       sourceAgentId,
       createdBy,
       wakeAt,
+      originator,
+      resumable,
+      progressNote,
+      escalation,
+      wakePayload,
     } = params;
 
     const resolvedCreatedBy = createdBy ?? agentId;
     const resolvedIntentAnchor = intentAnchor ?? title;
+    const errorBudgetJson = resumable ? JSON.stringify({ resumable: true }) : '{}';
+    // Seed the row's progress so the digest's last_progress_note has content from creation (#1267).
+    const progressJson = JSON.stringify(buildInitialTaskProgress({ progressNote, escalation }));
+
+    // Resolve the lineage to stamp (#1125). For a child task, cap the creating event's
+    // originator to the parent's lineage so a child can never carry standing above its parent.
+    // Callers that already loaded the parent (task-create) pass it in; everyone else
+    // pays one read on the child-creation path only.
+    let resolvedOriginator: TaskOriginator | null = originator ?? null;
+    if (parentTaskId) {
+      const parent = parentTask && parentTask.id === parentTaskId
+        ? parentTask
+        : await this.getTask(parentTaskId);
+      resolvedOriginator = capOriginatorToParent(resolvedOriginator, parent?.originator ?? null);
+    }
+    const originatorJson = resolvedOriginator ? JSON.stringify(resolvedOriginator) : null;
 
     // Always insert with 'open' status for skill-created tasks.
     const taskInsertSql = `
       INSERT INTO tasks (
         agent_id, title, intent_anchor, description, status, progress, error_budget,
         owner, parent_task_id, blocked_by_task_id, priority, due_at, tags,
-        waiting_on_contact_id, waiting_on_text, source, source_agent_id, created_by
+        waiting_on_contact_id, waiting_on_text, source, source_agent_id, created_by, originator
       )
-      VALUES ($1, $2, $3, $4, 'open', '{"notes":[]}'::jsonb, '{}'::jsonb,
-              $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, 'open', $18::jsonb, $17::jsonb,
+              $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb)
       RETURNING ${TASK_COLUMNS}
     `;
     const taskParams: unknown[] = [
@@ -137,6 +305,9 @@ export class TaskRepo {
       source,
       sourceAgentId ?? null,
       resolvedCreatedBy,
+      originatorJson,
+      errorBudgetJson,
+      progressJson, // $18 — seeded progress (notes + optional escalation block)
     ];
 
     let row: DbTaskRow;
@@ -145,30 +316,40 @@ export class TaskRepo {
       // Atomic CTE: insert task + insert linked one-shot wake-up job in one round-trip.
       // The task_payload carries minimal context; the dispatcher (issue 4) loads the full
       // task from tasks.id via the scheduled_jobs.task_id FK.
+      //
+      // The wake job carries the task's `originator` (selected straight from new_task, so it is
+      // definitionally the same, parent-capped lineage stamped on the task) but writes NO `standing`
+      // envelope (#1153). A `wake_at` time is pre-chosen, so this is a pre-authorized deferral, the
+      // same category as a `scheduler-create` job: fireJob threads `job.originator` onto the fired
+      // agent.task but mints no `wakeContext`, so it KEEPS its originator at fire time and is NOT
+      // subject to the heartbeat bypass ladder (the time was already decided). It is still not a live
+      // principal turn, so `elevated` authority primitives remain blocked on wake (see design §3b).
       const cteSql = `
         WITH new_task AS (
           INSERT INTO tasks (
             agent_id, title, intent_anchor, description, status, progress, error_budget,
             owner, parent_task_id, blocked_by_task_id, priority, due_at, tags,
-            waiting_on_contact_id, waiting_on_text, source, source_agent_id, created_by
+            waiting_on_contact_id, waiting_on_text, source, source_agent_id, created_by, originator
           )
-          VALUES ($1, $2, $3, $4, 'open', '{"notes":[]}'::jsonb, '{}'::jsonb,
-                  $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+          VALUES ($1, $2, $3, $4, 'open', $18::jsonb, $17::jsonb,
+                  $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb)
           RETURNING ${TASK_COLUMNS}
         ),
         _wake_job AS (
-          INSERT INTO scheduled_jobs (agent_id, run_at, task_payload, status, next_run_at, created_by, timezone, task_id)
-          SELECT $16, $17, '{"type":"task-wake"}'::jsonb, 'pending', $17, $18, $19, new_task.id
+          INSERT INTO scheduled_jobs (agent_id, run_at, task_payload, status, next_run_at, created_by, timezone, task_id, originator)
+          SELECT $19, $20, $23::jsonb, 'pending', $20, $21, $22, new_task.id, new_task.originator
           FROM new_task
         )
         SELECT * FROM new_task
       `;
       const { rows } = await this.pool.query(cteSql, [
-        ...taskParams,
-        agentId,           // $16 — scheduled_jobs.agent_id
-        wakeAt,            // $17 — run_at / next_run_at
-        resolvedCreatedBy, // $18 — created_by
-        this.timezone,     // $19 — timezone
+        ...taskParams,     // $1–$18 (taskParams[17] = $18 = seeded progress)
+        agentId,           // $19 — scheduled_jobs.agent_id
+        wakeAt,            // $20 — run_at / next_run_at
+        resolvedCreatedBy, // $21 — created_by
+        this.timezone,     // $22 — timezone
+        // $23 — default envelope, or a delegation-retry envelope (#1893).
+        JSON.stringify(wakePayload ?? { type: 'task-wake' }),
       ]);
       row = rows[0] as DbTaskRow | undefined
         ?? (() => { throw new Error('task-repo: createTask CTE returned no row'); })();
@@ -212,12 +393,33 @@ export class TaskRepo {
     return row ? mapTaskRow(row) : null;
   }
 
+  /** Walk parent_task_id links to the project-root task (#1210). Returns null when not found. */
+  async resolveProjectRootTaskId(taskId: string): Promise<string | null> {
+    let currentId: string | null = taskId;
+    let rootId: string | null = null;
+    const seen = new Set<string>();
+
+    while (currentId) {
+      if (seen.has(currentId)) return null;
+      seen.add(currentId);
+      const task = await this.getTask(currentId);
+      if (!task) return null;
+      rootId = task.id;
+      currentId = task.parentTaskId;
+    }
+
+    return rootId;
+  }
+
   /**
-   * List tasks with optional filters. Returns rows ordered by priority DESC, due_at ASC NULLS LAST.
+   * List tasks with optional filters. Returns rows in a deterministic total order:
+   * priority DESC, due_at ASC NULLS LAST, id ASC. The id tiebreaker makes the ordering stable so
+   * a `cursor` (#1433) can page through the full result set without skipping or duplicating rows —
+   * see {@link listAllTasks} for the paging loop.
    * Joins with scheduled_jobs to include the next pending wake-up time.
    */
   async listTasks(filters: ListTasksFilters = {}): Promise<TaskListRow[]> {
-    const { statuses, owner, tag, parentTaskId, dueBefore, limit = 25 } = filters;
+    const { statuses, owner, tag, parentTaskId, dueBefore, cursor, limit = 25 } = filters;
 
     const conditions: string[] = [];
     const queryParams: unknown[] = [];
@@ -243,6 +445,30 @@ export class TaskRepo {
       conditions.push(`t.due_at < $${idx++}`);
       queryParams.push(dueBefore);
     }
+    if (cursor) {
+      // Keyset predicate: keep only rows strictly *after* the cursor row in the
+      // (priority DESC, due_at ASC NULLS LAST, id ASC) ordering. Placeholders are reused for
+      // the same value (Postgres allows referencing $N multiple times).
+      const pIdx = idx++;
+      queryParams.push(cursor.priority);
+      const iIdx = idx++;
+      queryParams.push(cursor.id);
+      if (cursor.dueAt === null) {
+        // Cursor sits in the NULLS-LAST tail: the only later rows are lower-priority rows, or
+        // same-priority rows that are also null-due with a greater id (any non-null due_at sorts
+        // *before* the nulls, so it's already been paged past).
+        conditions.push(
+          `(t.priority < $${pIdx} OR (t.priority = $${pIdx} AND t.due_at IS NULL AND t.id > $${iIdx}))`,
+        );
+      } else {
+        const dIdx = idx++;
+        queryParams.push(cursor.dueAt);
+        conditions.push(
+          `(t.priority < $${pIdx} OR (t.priority = $${pIdx} AND ` +
+            `(t.due_at IS NULL OR t.due_at > $${dIdx} OR (t.due_at = $${dIdx} AND t.id > $${iIdx}))))`,
+        );
+      }
+    }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
@@ -253,15 +479,21 @@ export class TaskRepo {
         t.id, t.agent_id, t.intent_anchor, t.title, t.description, t.status, t.progress,
         t.error_budget, t.conversation_id, t.created_at, t.updated_at, t.owner,
         t.waiting_on_contact_id, t.waiting_on_text, t.parent_task_id, t.blocked_by_task_id,
-        t.priority, t.due_at, t.source, t.source_agent_id, t.created_by, t.tags,
+        t.priority, t.due_at, t.source, t.source_agent_id, t.created_by, t.tags, t.originator,
         (
-          SELECT sj.run_at FROM scheduled_jobs sj
-          WHERE sj.task_id = t.id AND sj.status = 'pending'
-          ORDER BY sj.run_at ASC LIMIT 1
+          SELECT COALESCE(sj.deferred_wake_at, sj.run_at)
+            FROM scheduled_jobs sj
+           WHERE sj.task_id = t.id
+             AND (
+               sj.status = 'pending'
+               OR (sj.status = 'running' AND sj.deferred_wake_at IS NOT NULL)
+             )
+           ORDER BY COALESCE(sj.deferred_wake_at, sj.run_at) ASC
+           LIMIT 1
         ) AS next_wake_at
       FROM tasks t
       ${whereClause}
-      ORDER BY t.priority DESC, t.due_at ASC NULLS LAST
+      ORDER BY t.priority DESC, t.due_at ASC NULLS LAST, t.id ASC
       LIMIT $${idx}
     `;
 
@@ -273,9 +505,72 @@ export class TaskRepo {
   }
 
   /**
+   * Fetch ALL tasks matching the filters by walking keyset pages (#1433). Callers that must
+   * consider every eligible task — e.g. sent-observe completion matching, which previously capped
+   * at 100 and silently ignored the rest — should use this instead of {@link listTasks}, whose
+   * single page is bounded by `limit`.
+   *
+   * Ordering is the deterministic total order from listTasks (priority DESC, due_at ASC NULLS LAST,
+   * id ASC), so no row is skipped or duplicated across pages. `maxTasks` is a safety ceiling: when
+   * reached, iteration stops, a warning is logged, and the result's `truncated` flag is set so the
+   * caller can react rather than silently trusting a partial view.
+   */
+  async listAllTasks(
+    filters: Omit<ListTasksFilters, 'limit' | 'cursor'> = {},
+    options: ListAllTasksOptions = {},
+  ): Promise<ListAllTasksResult> {
+    // Normalize pageSize to >= 1: a LIMIT 0 page is always short-but-nonempty in the loop's eyes
+    // (0 < 0 is false), so it would fall through to the cursor build and crash on rows[-1].
+    const pageSize = Math.max(1, options.pageSize ?? 500);
+    const maxTasks = options.maxTasks ?? 5000;
+    const all: TaskListRow[] = [];
+    let cursor: TaskListCursor | undefined;
+
+    // Bound the loop by the ceiling so a bug in cursor advancement can never spin forever.
+    // +1 slack lets a full final page (rows.length === pageSize) still terminate via its short
+    // successor before the ceiling logic fires.
+    const maxPages = Math.ceil(maxTasks / pageSize) + 1;
+    for (let page = 0; page < maxPages; page++) {
+      const rows = await this.listTasks({ ...filters, limit: pageSize, cursor });
+      all.push(...rows);
+
+      // A short page means the result set is drained — this is the last page, nothing truncated.
+      if (rows.length < pageSize) return { tasks: all, truncated: false };
+
+      // Strict `>`, not `>=`: a full page landing *exactly* on the ceiling might be the last page
+      // that exists. Let the slack iteration fetch its (short/empty) successor to confirm drainage,
+      // so an exact-boundary dataset reports truncated:false instead of a spurious ceiling hit.
+      if (all.length > maxTasks) {
+        this.logger.warn(
+          { maxTasks, fetched: all.length, filters },
+          'task-repo: listAllTasks hit the safety ceiling — remaining tasks were not fetched',
+        );
+        return { tasks: all.slice(0, maxTasks), truncated: true };
+      }
+
+      const last = rows[rows.length - 1]!;
+      cursor = { priority: last.priority, dueAt: last.dueAt, id: last.id };
+    }
+
+    // Exhausted the page budget without a short page — treat as the ceiling being hit.
+    this.logger.warn(
+      { maxTasks, fetched: all.length, filters },
+      'task-repo: listAllTasks exhausted its page budget — remaining tasks were not fetched',
+    );
+    return { tasks: all.slice(0, maxTasks), truncated: true };
+  }
+
+  /**
    * Update a task's fields. Validates status transitions: done and cancelled are terminal.
-   * When `wakeAt` is provided, existing pending wake-up jobs are cancelled and a new one
-   * is created — all in a single CTE for atomicity.
+   * When `wakeAt` is provided, an existing pending wake row is updated in place (run_at /
+   * next_run_at); otherwise the most recent terminal wake row is revived or a new row is
+   * inserted — all in a single CTE for atomicity (#1415, mirrors enqueueTaskWake).
+   *
+   * A wake that is `running` (the task rescheduling itself from inside its own wake)
+   * is not updated in place and not inserted beside: completion writes that row back
+   * to `completed`, which would drop an in-place `run_at`, and a second active row
+   * collides with migration 067. The requested time is stored on `deferred_wake_at`
+   * and armed by the run's completion path (#1938).
    *
    * Returns the updated task row, or null if the task was not found.
    */
@@ -290,18 +585,8 @@ export class TaskRepo {
     // Enforce terminal-state guard.
     if (updates.status && updates.status !== current.status) {
       if (TERMINAL_STATUSES.has(current.status)) {
-        throw new Error(
-          `Cannot transition task from '${current.status}' — it is a terminal state.`,
-        );
+        throw new TaskTerminalStateError(current.status);
       }
-    }
-
-    // Append progress note to progress.notes if provided.
-    let newProgress = current.progress;
-    if (updates.progressNote) {
-      const notes = (Array.isArray(newProgress.notes) ? newProgress.notes : []) as Array<unknown>;
-      notes.push({ at: new Date().toISOString(), note: updates.progressNote });
-      newProgress = { ...newProgress, notes };
     }
 
     // Build the SET clause dynamically — only update columns that were supplied.
@@ -329,9 +614,16 @@ export class TaskRepo {
       setClauses.push(`tags = $${idx++}`);
       updateParams.push(updates.tags);
     }
-    if (updates.progressNote !== undefined) {
-      setClauses.push(`progress = $${idx++}::jsonb`);
-      updateParams.push(JSON.stringify(newProgress));
+    // Append progress note atomically — jsonb_set preserves sibling blocks (plan, resumable, etc.).
+    if (updates.progressNote) {
+      const noteEntry = { at: new Date().toISOString(), note: updates.progressNote };
+      setClauses.push(`progress = jsonb_set(
+        COALESCE(progress, '{}'::jsonb),
+        '{notes}',
+        COALESCE(progress->'notes', '[]'::jsonb) || $${idx++}::jsonb,
+        true
+      )`);
+      updateParams.push(JSON.stringify([noteEntry]));
     }
     if ('blockedByTaskId' in updates) {
       setClauses.push(`blocked_by_task_id = $${idx++}`);
@@ -351,62 +643,181 @@ export class TaskRepo {
       RETURNING ${TASK_COLUMNS}
     `;
 
-    // Terminal-status transitions (cancelled / done) always cancel pending wake-up jobs.
-    // When wakeAt is also provided the cancel+create is already atomic; the extra
-    // _cancel_wake arm here handles the bare status-only path.
-    const cancelOnTerminal = (updates.status === 'cancelled' || updates.status === 'done')
-      && !updates.wakeAt;
+    // Terminal-status transitions (cancelled / done) always cancel pending wake-up jobs
+    // and drop any deferred_wake_at, even when wakeAt is also supplied — terminal wins
+    // over reschedule (#1415 review, #1938). Otherwise wakeAt updates the pending row
+    // in place, records a deferral on a running row, or revives/inserts.
+    const cancelOnTerminal = updates.status === 'cancelled' || updates.status === 'done';
+    const rescheduleWake = updates.wakeAt !== undefined && !cancelOnTerminal;
 
-    let updatedRow: DbTaskRow;
+    const transitioningToTerminal = updates.status !== undefined
+      && updates.status !== current.status
+      && (updates.status === 'done' || updates.status === 'cancelled');
 
-    if (updates.wakeAt || cancelOnTerminal) {
-      // Atomic CTE: update task + cancel old wake-up jobs + optionally insert new one.
-      const wakeAgentIdx = whereIdx + 1;
-      const wakeRunAtIdx = updates.wakeAt ? whereIdx + 2 : null;
-      const wakeCreatedByIdx = updates.wakeAt ? whereIdx + 3 : null;
-      const wakeTzIdx = updates.wakeAt ? whereIdx + 4 : null;
+    const executeUpdate = async (executor: DbQueryable): Promise<DbTaskRow | null> => {
+      if (rescheduleWake || cancelOnTerminal) {
+        const wakeAgentIdx = whereIdx + 1;
+        const wakeRunAtIdx = rescheduleWake ? whereIdx + 2 : null;
+        const wakeCreatedByIdx = rescheduleWake ? whereIdx + 3 : null;
+        const wakeTzIdx = rescheduleWake ? whereIdx + 4 : null;
+        const wakeOriginatorIdx = rescheduleWake ? whereIdx + 5 : null;
 
-      const cteSql = `
+        // Every wake mutation is gated on updated_task so a concurrent terminal
+        // transition cannot revive/insert a pending wake after the task UPDATE matched 0 rows.
+        const cteSql = rescheduleWake ? `
         WITH updated_task AS (
           ${updateSql}
         ),
+        _update_pending_wake AS (
+          UPDATE scheduled_jobs
+             SET run_at = $${wakeRunAtIdx}, next_run_at = $${wakeRunAtIdx},
+                 agent_id = $${wakeAgentIdx}, created_by = $${wakeCreatedByIdx},
+                 timezone = $${wakeTzIdx},
+                 task_payload = '{"type":"task-wake"}'::jsonb,
+                 originator = $${wakeOriginatorIdx}::jsonb,
+                 deferred_wake_at = NULL
+           WHERE task_id = $${whereIdx}
+             AND task_payload->>'type' = 'task-wake'
+             AND status = 'pending'
+             AND EXISTS (SELECT 1 FROM updated_task)
+          RETURNING id
+        ),
+        -- Running rows stay running. Mutating run_at here races the completion
+        -- write, which would mark the row completed and drop the new time; inserting
+        -- a second active row hits scheduled_jobs_one_active_wake_per_task_uq (#1938).
+        -- A completion that commits mid-statement is not caught by _revive_wake:
+        -- that arm's snapshot still shows running, so the terminal predicate never
+        -- locks the row and never rechecks. _insert_wake covers running → completed
+        -- (the old row is terminal, so the new pending row does not collide).
+        -- running → pending (completion already armed a deferral) makes _insert_wake
+        -- hit the unique index; updateTask retries the statement once on that 23505.
+        _defer_running_wake AS (
+          UPDATE scheduled_jobs
+             SET deferred_wake_at = $${wakeRunAtIdx}
+           WHERE task_id = $${whereIdx}
+             AND task_payload->>'type' = 'task-wake'
+             AND status = 'running'
+             AND EXISTS (SELECT 1 FROM updated_task)
+          RETURNING id
+        ),
+        _revive_wake AS (
+          UPDATE scheduled_jobs
+             SET status = 'pending', run_at = $${wakeRunAtIdx}, next_run_at = $${wakeRunAtIdx},
+                 run_started_at = NULL,
+                 consecutive_failures = CASE WHEN status IN ('failed','suspended') THEN consecutive_failures ELSE 0 END,
+                 last_error = CASE WHEN status IN ('failed','suspended') THEN last_error ELSE NULL END,
+                 last_run_outcome = CASE WHEN status IN ('failed','suspended') THEN last_run_outcome ELSE NULL END,
+                 agent_id = $${wakeAgentIdx}, created_by = $${wakeCreatedByIdx},
+                 timezone = $${wakeTzIdx}, task_payload = '{"type":"task-wake"}'::jsonb,
+                 originator = $${wakeOriginatorIdx}::jsonb,
+                 deferred_wake_at = NULL
+           WHERE id = (
+             SELECT id FROM scheduled_jobs
+              WHERE task_id = $${whereIdx} AND task_payload->>'type' = 'task-wake'
+                AND status IN ('completed', 'failed', 'suspended', 'cancelled')
+              ORDER BY created_at DESC
+              LIMIT 1
+           )
+             AND status IN ('completed', 'failed', 'suspended', 'cancelled')
+             AND NOT EXISTS (SELECT 1 FROM _update_pending_wake)
+             AND NOT EXISTS (SELECT 1 FROM _defer_running_wake)
+             AND EXISTS (SELECT 1 FROM updated_task)
+          RETURNING id
+        ),
+        _insert_wake AS (
+          INSERT INTO scheduled_jobs (agent_id, run_at, task_payload, status, next_run_at, created_by, timezone, task_id, originator)
+          SELECT $${wakeAgentIdx}, $${wakeRunAtIdx}, '{"type":"task-wake"}'::jsonb, 'pending',
+                 $${wakeRunAtIdx}, $${wakeCreatedByIdx}, $${wakeTzIdx}, $${whereIdx}, $${wakeOriginatorIdx}::jsonb
+           WHERE NOT EXISTS (SELECT 1 FROM _update_pending_wake)
+             AND NOT EXISTS (SELECT 1 FROM _defer_running_wake)
+             AND NOT EXISTS (SELECT 1 FROM _revive_wake)
+             AND EXISTS (SELECT 1 FROM updated_task)
+          RETURNING id
+        )
+        SELECT * FROM updated_task
+      ` : `
+        WITH updated_task AS (
+          ${updateSql}
+        ),
+        -- Pending, suspended, and paused wakes are cancelled. A running wake stays
+        -- running so its completion can finish, but its deferral is dropped — terminal
+        -- wins, including a suspended row that was keeping deferred_wake_at for resume.
+        -- If completion already flipped that running row to pending, READ COMMITTED
+        -- rechecks the new version and cancels it.
         _cancel_wake AS (
-          UPDATE scheduled_jobs SET status = 'cancelled'
-          WHERE task_id = $${whereIdx} AND status = 'pending'
-        )${updates.wakeAt ? `,
-        _new_wake AS (
-          INSERT INTO scheduled_jobs (agent_id, run_at, task_payload, status, next_run_at, created_by, timezone, task_id)
-          VALUES ($${wakeAgentIdx}, $${wakeRunAtIdx}, '{"type":"task-wake"}'::jsonb, 'pending',
-                  $${wakeRunAtIdx}, $${wakeCreatedByIdx}, $${wakeTzIdx}, $${whereIdx})
-        )` : ''}
+          UPDATE scheduled_jobs
+             SET status = CASE WHEN status = 'running' THEN status ELSE 'cancelled' END,
+                 deferred_wake_at = NULL
+           WHERE task_id = $${whereIdx}
+             AND status IN ('pending', 'running', 'suspended', 'paused')
+        )
         SELECT * FROM updated_task
       `;
-      const allParams: unknown[] = [...updateParams];
-      if (updates.wakeAt) {
-        allParams.push(
-          // Route the new wake-up job to the correct specialist, in priority order:
-          // 1. source_agent_id — explicit specialist set at task-create time
-          // 2. tasks.agent_id  — stable task ownership (covers legacy/manual tasks where
-          //                      source_agent_id is NULL but agent_id names a specialist)
-          // 3. callerAgentId   — last resort; avoids routing to coordinator when the
-          //                      task has no agent assignment at all
-          current.sourceAgentId ?? current.agentId ?? callerAgentId, // $wakeAgentIdx
-          updates.wakeAt,                                             // $wakeRunAtIdx
-          callerAgentId ?? current.agentId,                          // $wakeCreatedByIdx
-          this.timezone,                                             // $wakeTzIdx
+        const allParams: unknown[] = [...updateParams];
+        if (rescheduleWake) {
+          allParams.push(
+            current.sourceAgentId ?? current.agentId ?? callerAgentId,
+            updates.wakeAt,
+            callerAgentId ?? current.agentId,
+            this.timezone,
+            current.originator ? JSON.stringify(current.originator) : null,
+          );
+        }
+        const { rows } = await executor.query(cteSql, allParams);
+        return (rows[0] as DbTaskRow | undefined) ?? null;
+      }
+
+      const { rows } = await executor.query(updateSql, updateParams);
+      return (rows[0] as DbTaskRow | undefined) ?? null;
+    };
+
+    let updatedRow: DbTaskRow;
+    let reconciledChildren: ReconciledChildRow[] = [];
+
+    if (transitioningToTerminal) {
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const row = await executeUpdate(client);
+        if (!row) {
+          await client.query('ROLLBACK');
+          return await this.resolveEmptyUpdateReturning(taskId);
+        }
+        reconciledChildren = await this.runReconcileChildrenQuery(
+          client,
+          taskId,
+          `reconciled: parent ${taskId} ${updates.status}`,
         );
+        await client.query('COMMIT');
+        updatedRow = row;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
       }
-      const { rows } = await this.pool.query(cteSql, allParams);
-      if (!rows[0]) {
-        return await this.resolveEmptyUpdateReturning(taskId);
-      }
-      updatedRow = rows[0] as DbTaskRow;
     } else {
-      const { rows } = await this.pool.query(updateSql, updateParams);
-      if (!rows[0]) {
+      let row: DbTaskRow | null;
+      try {
+        row = await executeUpdate(this.pool);
+      } catch (err) {
+        // Completion can arm running → pending after this statement's snapshot,
+        // so _insert_wake collides with the one-active-wake index. One retry sees
+        // the pending row and updates it in place (#1938).
+        const constraint = (err as { constraint?: string } | null)?.constraint;
+        const wakeConflict = constraint === undefined
+          || constraint === 'scheduled_jobs_one_active_wake_per_task_uq';
+        if (!(rescheduleWake && isPgUniqueViolation(err) && wakeConflict)) throw err;
+        this.logger.info(
+          { taskId, constraint },
+          'task-repo: reschedule collided with an in-flight wake arm — retrying once',
+        );
+        row = await executeUpdate(this.pool);
+      }
+      if (!row) {
         return await this.resolveEmptyUpdateReturning(taskId);
       }
-      updatedRow = rows[0] as DbTaskRow;
+      updatedRow = row;
     }
 
     const updated = mapTaskRow(updatedRow);
@@ -423,6 +834,15 @@ export class TaskRepo {
       }));
     } catch (busErr) {
       this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after updateTask');
+    }
+
+    if (reconciledChildren.length > 0) {
+      const reason = `reconciled: parent ${taskId} ${updates.status}`;
+      await this.publishReconcileChildEvents(reconciledChildren, reason, callerAgentId, taskId);
+    }
+
+    if (transitioningToTerminal) {
+      await this.closeOutreach([taskId, ...reconciledChildren.map((c) => c.id)]);
     }
 
     this.logger.info(
@@ -467,35 +887,75 @@ export class TaskRepo {
       );
     }
 
-    // Append completion note to progress.notes if provided.
-    const notes = (Array.isArray(current.progress.notes) ? current.progress.notes : []) as Array<unknown>;
-    if (completionNote) {
-      notes.push({ at: new Date().toISOString(), note: completionNote });
-    }
-    const newProgress = { ...current.progress, notes };
+    const noteEntry = completionNote
+      ? { at: new Date().toISOString(), note: completionNote }
+      : null;
 
-    // The WHERE guard prevents a concurrent write from moving the task to a terminal
-    // state between our pre-check read and this UPDATE.
-    const cteSql = `
+    const cteSql = noteEntry
+      ? `
       WITH done_task AS (
         UPDATE tasks
-        SET status = 'done', progress = $1::jsonb, updated_at = now()
+        SET status = 'done',
+            progress = jsonb_set(
+              COALESCE(progress, '{}'::jsonb),
+              '{notes}',
+              COALESCE(progress->'notes', '[]'::jsonb) || $1::jsonb,
+              true
+            ),
+            updated_at = now()
         WHERE id = $2 AND status NOT IN ('done', 'cancelled')
         RETURNING ${TASK_COLUMNS}
       ),
       _cancel_wake AS (
-        UPDATE scheduled_jobs SET status = 'cancelled'
-        WHERE task_id = $2 AND status = 'pending'
+        UPDATE scheduled_jobs
+           SET status = CASE WHEN status = 'running' THEN status ELSE 'cancelled' END,
+               deferred_wake_at = NULL
+         WHERE task_id = $2 AND status IN ('pending', 'running', 'suspended', 'paused')
+      )
+      SELECT * FROM done_task
+    `
+      : `
+      WITH done_task AS (
+        UPDATE tasks
+        SET status = 'done', updated_at = now()
+        WHERE id = $1 AND status NOT IN ('done', 'cancelled')
+        RETURNING ${TASK_COLUMNS}
+      ),
+      _cancel_wake AS (
+        UPDATE scheduled_jobs
+           SET status = CASE WHEN status = 'running' THEN status ELSE 'cancelled' END,
+               deferred_wake_at = NULL
+         WHERE task_id = $1 AND status IN ('pending', 'running', 'suspended', 'paused')
       )
       SELECT * FROM done_task
     `;
 
-    const { rows } = await this.pool.query(cteSql, [JSON.stringify(newProgress), taskId]);
-    const row = rows[0] as DbTaskRow | undefined;
-    if (!row) {
-      // Task existed at pre-check time and was not terminal — if RETURNING is empty,
-      // the row was either deleted or moved to a terminal state concurrently.
-      return await this.resolveEmptyUpdateReturning(taskId);
+    const queryParams = noteEntry
+      ? [JSON.stringify([noteEntry]), taskId]
+      : [taskId];
+
+    const client = await this.pool.connect();
+    let row: DbTaskRow | undefined;
+    let reconciledChildren: ReconciledChildRow[] = [];
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(cteSql, queryParams);
+      row = rows[0] as DbTaskRow | undefined;
+      if (!row) {
+        await client.query('ROLLBACK');
+        return await this.resolveEmptyUpdateReturning(taskId);
+      }
+      reconciledChildren = await this.runReconcileChildrenQuery(
+        client,
+        taskId,
+        `reconciled: parent ${taskId} done`,
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
 
     const updated = mapTaskRow(row);
@@ -510,8 +970,209 @@ export class TaskRepo {
       this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after completeTask');
     }
 
+    if (reconciledChildren.length > 0) {
+      await this.publishReconcileChildEvents(
+        reconciledChildren,
+        `reconciled: parent ${taskId} done`,
+        callerAgentId,
+        taskId,
+      );
+    }
+
+    await this.closeOutreach([taskId, ...reconciledChildren.map((c) => c.id)]);
+
     this.logger.info({ taskId: updated.id }, 'task-repo: completed task');
     return updated;
+  }
+
+  /**
+   * Reopen a done task back to open — used for reversible sent-mail auto-completes (#1424).
+   * Cancelled tasks cannot be reopened. Appends an audit note in progress.notes.
+   *
+   * completeTask cancels the task's pending wake-up job as part of marking it done, so
+   * reopening must symmetrically revive that cancelled wake — otherwise undoing an
+   * auto-complete leaves the task open with no scheduled reminder (CodeRabbit finding:
+   * "reopenTask must restore the task's cancelled wake"). The revival mirrors the
+   * `_revive_wake` CTE in updateTask (#1415, mirrors enqueueTaskWake), gated on the task
+   * UPDATE via EXISTS so a concurrent status change can't revive a wake after the row
+   * update matched 0 rows. Unlike updateTask's revival, reopenTask has no new `wakeAt` to
+   * apply, so it only flips the row's status back to 'pending' and clears run-attempt
+   * bookkeeping — the original run_at / next_run_at schedule is preserved as-is.
+   */
+  async reopenTask(
+    taskId: string,
+    note?: string,
+    callerAgentId?: string,
+  ): Promise<TaskRow | null> {
+    const current = await this.getTask(taskId);
+    if (!current) return null;
+    if (current.status !== 'done') {
+      throw new Error(
+        `Cannot reopen task — status is '${current.status}' (only 'done' can be reopened).`,
+      );
+    }
+
+    const noteEntry = {
+      at: new Date().toISOString(),
+      note: note ?? 'Reopened (undo auto-complete from sent mail)',
+    };
+
+    const cteSql = `
+      WITH reopened_task AS (
+        UPDATE tasks
+        SET status = 'open',
+            progress = jsonb_set(
+              COALESCE(progress, '{}'::jsonb),
+              '{notes}',
+              COALESCE(progress->'notes', '[]'::jsonb) || $1::jsonb,
+              true
+            ),
+            updated_at = now()
+        WHERE id = $2 AND status = 'done'
+        RETURNING ${TASK_COLUMNS}
+      ),
+      _revive_wake AS (
+        UPDATE scheduled_jobs
+           SET status = 'pending',
+               run_started_at = NULL,
+               consecutive_failures = 0,
+               last_error = NULL,
+               last_run_outcome = NULL
+         WHERE id = (
+           SELECT id FROM scheduled_jobs
+            WHERE task_id = $2 AND task_payload->>'type' = 'task-wake'
+              AND status = 'cancelled'
+            ORDER BY created_at DESC
+            LIMIT 1
+         )
+           AND status = 'cancelled'
+           AND EXISTS (SELECT 1 FROM reopened_task)
+        RETURNING id
+      )
+      SELECT * FROM reopened_task
+    `;
+
+    const { rows } = await this.pool.query(
+      cteSql,
+      [JSON.stringify([noteEntry]), taskId],
+    );
+    const row = rows[0] as DbTaskRow | undefined;
+    if (!row) return null;
+
+    const updated = mapTaskRow(row);
+    try {
+      await this.bus.publish('execution', createTaskUpdated({
+        taskId: updated.id,
+        previousStatus: 'done',
+        newStatus: 'open',
+        progressNote: noteEntry.note,
+        agentId: callerAgentId ?? null,
+      }));
+    } catch (busErr) {
+      this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after reopenTask');
+    }
+
+    // Its outreach closed with it: replies must find the task again (#2312). Best-effort.
+    if (this.outreach) {
+      try {
+        await this.outreach.reopenForTask(updated.id);
+      } catch (err) {
+        this.logger.warn({ err, taskId: updated.id }, 'task-repo: failed to reopen task outreach — replies will not link to the reopened task');
+      }
+    }
+
+    this.logger.info({ taskId: updated.id }, 'task-repo: reopened task');
+    return updated;
+  }
+
+  private async runReconcileChildrenQuery(
+    executor: DbQueryable,
+    taskId: string,
+    reason: string,
+  ): Promise<ReconciledChildRow[]> {
+    const noteEntry = { at: new Date().toISOString(), note: reason };
+
+    const { rows } = await executor.query<ReconciledChildRow>(
+      `WITH RECURSIVE descendants AS (
+         SELECT id, status FROM tasks WHERE parent_task_id = $1
+         UNION ALL
+         SELECT t.id, t.status FROM tasks t
+         INNER JOIN descendants d ON t.parent_task_id = d.id
+       ),
+       to_reconcile AS (
+         SELECT id, status AS previous_status FROM descendants
+         WHERE status = ANY($2::text[])
+       ),
+       cancelled AS (
+         UPDATE tasks
+            SET status = 'cancelled',
+                progress = jsonb_set(
+                  COALESCE(progress, '{}'::jsonb),
+                  '{notes}',
+                  COALESCE(progress->'notes', '[]'::jsonb) || $3::jsonb,
+                  true
+                ),
+                updated_at = now()
+          WHERE id IN (SELECT id FROM to_reconcile)
+            AND status = ANY($2::text[])
+          RETURNING id
+       ),
+       _cancel_wakes AS (
+         UPDATE scheduled_jobs
+            SET status = 'cancelled', deferred_wake_at = NULL
+          WHERE task_id IN (SELECT id FROM to_reconcile)
+            AND status IN ('pending', 'running', 'suspended', 'paused')
+       )
+       SELECT c.id, tr.previous_status
+         FROM cancelled c
+         JOIN to_reconcile tr ON tr.id = c.id`,
+      [taskId, RECONCILABLE_CHILD_STATUSES, JSON.stringify([noteEntry])],
+    );
+
+    return rows;
+  }
+
+  private async publishReconcileChildEvents(
+    rows: readonly ReconciledChildRow[],
+    reason: string,
+    callerAgentId: string | undefined,
+    parentTaskId: string,
+  ): Promise<void> {
+    for (const row of rows) {
+      try {
+        await this.bus.publish('execution', createTaskUpdated({
+          taskId: row.id,
+          previousStatus: row.previous_status,
+          newStatus: 'cancelled',
+          progressNote: reason,
+          agentId: callerAgentId ?? null,
+        }));
+      } catch (busErr) {
+        this.logger.error({ busErr, taskId: row.id }, 'task-repo: bus publish failed after reconcileChildren');
+      }
+    }
+
+    if (rows.length > 0) {
+      this.logger.info(
+        { parentTaskId, cancelledChildIds: rows.map((r) => r.id), reason },
+        'task-repo: reconciled open descendant children',
+      );
+    }
+  }
+
+  /**
+   * Recursively cancel non-terminal descendant tasks and their pending wakes when a
+   * parent goal completes, is cancelled, or is superseded (#1239).
+   */
+  async reconcileChildren(
+    taskId: string,
+    reason: string,
+    callerAgentId?: string,
+  ): Promise<string[]> {
+    const rows = await this.runReconcileChildrenQuery(this.pool, taskId, reason);
+    await this.publishReconcileChildEvents(rows, reason, callerAgentId, taskId);
+    await this.closeOutreach(rows.map((r) => r.id));
+    return rows.map((r) => r.id);
   }
 
   /**
@@ -522,9 +1183,341 @@ export class TaskRepo {
    */
   async cancelWakeUpJobs(taskId: string): Promise<void> {
     const result = await this.pool.query(
-      `UPDATE scheduled_jobs SET status = 'cancelled' WHERE task_id = $1 AND status = 'pending'`,
+      `UPDATE scheduled_jobs
+          SET status = CASE WHEN status = 'running' THEN status ELSE 'cancelled' END,
+              deferred_wake_at = NULL
+        WHERE task_id = $1 AND status IN ('pending', 'running', 'suspended', 'paused')`,
       [taskId],
     );
     this.logger.info({ taskId, rowsAffected: result.rowCount }, 'task-repo: cancelled wake-up jobs');
+  }
+
+  /** Read the typed resumable block from a task's progress JSONB. */
+  async getResumableBlock(taskId: string): Promise<ResumableProgressBlock | null> {
+    const task = await this.getTask(taskId);
+    if (!task) return null;
+    return readResumableBlock(task.progress);
+  }
+
+  /**
+   * Persist a resumable checkpoint under progress.resumable. Enforces inline accumulator
+   * and block size caps — inline overflow spills to the document workspace (#1210).
+   */
+  async setResumableBlock(
+    taskId: string,
+    input: PrepareResumableBlockInput,
+    callerAgentId?: string,
+  ): Promise<{ task: TaskRow; block: ResumableProgressBlock } | ResumableWriteResult> {
+    const current = await this.getTask(taskId);
+    if (!current) {
+      return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+    }
+    if (TERMINAL_STATUSES.has(current.status)) {
+      return { ok: false, code: 'invalid_block', message: `task ${taskId} is in a terminal state` };
+    }
+
+    let prepared = prepareResumableBlock(input);
+    if (!prepared.ok && prepared.code === 'inline_accumulator_overflow' && this.workingDocsRepo) {
+      const rootTaskId = await this.resolveProjectRootTaskId(taskId);
+      if (!rootTaskId) {
+        return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+      }
+      const rootTask = rootTaskId === taskId ? current : await this.getTask(rootTaskId);
+      prepared = await prepareResumableBlockWithSpill(input, {
+        workingDocsRepo: this.workingDocsRepo,
+        rootTaskId,
+        taskId,
+        agentId: callerAgentId,
+        title: rootTask?.title,
+      });
+    }
+    if (!prepared.ok) return prepared;
+
+    const { rows } = await this.pool.query(
+      `UPDATE tasks
+          SET progress = jsonb_set(COALESCE(progress, '{}'::jsonb), '{resumable}', $1::jsonb, true),
+              updated_at = now()
+        WHERE id = $2
+          AND status NOT IN ('done', 'cancelled')
+        RETURNING ${TASK_COLUMNS}`,
+      [JSON.stringify(prepared.block), taskId],
+    );
+    const row = rows[0] as DbTaskRow | undefined;
+    if (!row) {
+      const currentTask = await this.getTask(taskId);
+      if (!currentTask) {
+        return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+      }
+      if (TERMINAL_STATUSES.has(currentTask.status)) {
+        return { ok: false, code: 'invalid_block', message: `task ${taskId} is in a terminal state` };
+      }
+      throw new Error(`task-repo: setResumableBlock update returned no row for non-terminal task ${taskId}`);
+    }
+
+    const updated = mapTaskRow(row);
+
+    try {
+      await this.bus.publish('execution', createTaskUpdated({
+        taskId: updated.id,
+        previousStatus: current.status,
+        agentId: callerAgentId ?? null,
+      }));
+    } catch (busErr) {
+      this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after setResumableBlock');
+    }
+
+    this.logger.info(
+      { taskId: updated.id, done: prepared.block.done, total: prepared.block.total },
+      'task-repo: persisted resumable checkpoint',
+    );
+    return { task: updated, block: prepared.block };
+  }
+
+  /** Read the typed plan block from a task's progress JSONB. */
+  async getPlanBlock(taskId: string): Promise<PlanProgressBlock | null> {
+    const task = await this.getTask(taskId);
+    if (!task) return null;
+    return readPlanBlock(task.progress);
+  }
+
+  /**
+   * Persist a plan under progress.plan. Enforces the block size cap — descriptors only,
+   * no per-item payloads inline (#1236).
+   */
+  async setPlanBlock(
+    taskId: string,
+    input: PreparePlanBlockInput,
+    callerAgentId?: string,
+  ): Promise<{ task: TaskRow; block: PlanProgressBlock } | PlanWriteResult> {
+    const current = await this.getTask(taskId);
+    if (!current) {
+      return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+    }
+    if (TERMINAL_STATUSES.has(current.status)) {
+      return { ok: false, code: 'invalid_block', message: `task ${taskId} is in a terminal state` };
+    }
+
+    const prepared = preparePlanBlock(input);
+    if (!prepared.ok) return prepared;
+
+    const { rows } = await this.pool.query(
+      `UPDATE tasks
+          SET progress = jsonb_set(COALESCE(progress, '{}'::jsonb), '{plan}', $1::jsonb, true),
+              updated_at = now()
+        WHERE id = $2
+          AND status NOT IN ('done', 'cancelled')
+        RETURNING ${TASK_COLUMNS}`,
+      [JSON.stringify(prepared.block), taskId],
+    );
+    const row = rows[0] as DbTaskRow | undefined;
+    if (!row) {
+      const currentTask = await this.getTask(taskId);
+      if (!currentTask) {
+        return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+      }
+      if (TERMINAL_STATUSES.has(currentTask.status)) {
+        return { ok: false, code: 'invalid_block', message: `task ${taskId} is in a terminal state` };
+      }
+      throw new Error(`task-repo: setPlanBlock update returned no row for non-terminal task ${taskId}`);
+    }
+
+    const updated = mapTaskRow(row);
+
+    try {
+      await this.bus.publish('execution', createTaskUpdated({
+        taskId: updated.id,
+        previousStatus: current.status,
+        agentId: callerAgentId ?? null,
+      }));
+    } catch (busErr) {
+      this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after setPlanBlock');
+    }
+
+    this.logger.info(
+      { taskId: updated.id, done: prepared.block.done, total: prepared.block.total },
+      'task-repo: persisted plan block',
+    );
+    return { task: updated, block: prepared.block };
+  }
+
+  async setActiveSkillsBlock(
+    taskId: string,
+    block: ActiveSkillsBlock,
+    callerAgentId?: string,
+  ): Promise<{ task: TaskRow; block: ActiveSkillsBlock } | ActiveSkillsWriteResult> {
+    const current = await this.getTask(taskId);
+    if (!current) {
+      return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+    }
+    if (TERMINAL_STATUSES.has(current.status)) {
+      return { ok: false, code: 'invalid_block', message: `task ${taskId} is in a terminal state` };
+    }
+
+    const prepared = prepareActiveSkillsBlock(block);
+    if (!prepared.ok) return prepared;
+
+    const { rows } = await this.pool.query(
+      `UPDATE tasks
+          SET progress = jsonb_set(COALESCE(progress, '{}'::jsonb), '{activeSkills}', $1::jsonb, true),
+              updated_at = now()
+        WHERE id = $2
+          AND status NOT IN ('done', 'cancelled')
+        RETURNING ${TASK_COLUMNS}`,
+      [JSON.stringify(prepared.block), taskId],
+    );
+    const row = rows[0] as DbTaskRow | undefined;
+    if (!row) {
+      const currentTask = await this.getTask(taskId);
+      if (!currentTask) {
+        return { ok: false, code: 'invalid_block', message: `task not found: ${taskId}` };
+      }
+      if (TERMINAL_STATUSES.has(currentTask.status)) {
+        return { ok: false, code: 'invalid_block', message: `task ${taskId} is in a terminal state` };
+      }
+      throw new Error(`task-repo: setActiveSkillsBlock update returned no row for non-terminal task ${taskId}`);
+    }
+
+    const updated = mapTaskRow(row);
+
+    try {
+      await this.bus.publish('execution', createTaskUpdated({
+        taskId: updated.id,
+        previousStatus: current.status,
+        agentId: callerAgentId ?? null,
+      }));
+    } catch (busErr) {
+      this.logger.error({ busErr, taskId: updated.id }, 'task-repo: bus publish failed after setActiveSkillsBlock');
+    }
+
+    this.logger.info(
+      { taskId: updated.id, skills: prepared.block.skills.map((s) => s.name) },
+      'task-repo: persisted activeSkills block',
+    );
+    return { task: updated, block: prepared.block };
+  }
+
+  /** Persist progress.resumableCircuit counters after a healthy paused slice (#1176). */
+  async persistResumableCircuitState(taskId: string, state: ResumableCircuitState): Promise<void> {
+    await this.pool.query(
+      `UPDATE tasks
+          SET progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object('resumableCircuit', $1::jsonb),
+              updated_at = now()
+        WHERE id = $2
+          AND status NOT IN ('done', 'cancelled', 'failed')`,
+      [JSON.stringify(state), taskId],
+    );
+  }
+
+  /** Persist progress.planAdaptive state (divergence signals, depth counters) (#1266).
+   *  Does not touch updated_at — child blocked-since uses updatedAt as its signal proxy. */
+  async persistPlanAdaptiveState(taskId: string, state: PlanAdaptiveState): Promise<void> {
+    await this.pool.query(
+      `UPDATE tasks
+          SET progress = COALESCE(progress, '{}'::jsonb) || jsonb_build_object('planAdaptive', $1::jsonb)
+        WHERE id = $2
+          AND status NOT IN ('done', 'cancelled', 'failed')`,
+      [JSON.stringify(state), taskId],
+    );
+  }
+
+  /**
+   * Fail a resumable task on circuit-breaker breach: status failed, cancel wakes,
+   * merge circuit state + progress note, add escalation tags, and reconcile
+   * (cancel) open descendant children.
+   *
+   * `failed` is a terminal state just like `done`/`cancelled`, so it must run the
+   * same child reconciliation those paths do — otherwise a planned parent that the
+   * circuit-breaker fails leaves its open children behind for the BacklogHeartbeat
+   * to re-poke forever, which is exactly the orphaned-subtask futility loop
+   * (memo gap #6) the plan primitive exists to close (#1177 closeout).
+   */
+  async failResumableTask(
+    taskId: string,
+    options: {
+      progressNote: string;
+      circuitState: ResumableCircuitState;
+      tags: string[];
+    },
+  ): Promise<TaskRow | null> {
+    const current = await this.getTask(taskId);
+    if (!current) return null;
+    if (TERMINAL_STATUSES.has(current.status) || current.status === 'failed') {
+      return current;
+    }
+
+    const notes = [{ at: new Date().toISOString(), note: options.progressNote }];
+    const mergedTags = [...new Set([...current.tags, ...options.tags])];
+    const reconcileReason = `reconciled: parent ${taskId} failed`;
+
+    // The parent-fail UPDATE and the descendant reconciliation run in one
+    // transaction so a failed parent can never be observed with open children
+    // (mirrors completeTask's atomic reconcile).
+    const client = await this.pool.connect();
+    let row: DbTaskRow | undefined;
+    let reconciledChildren: ReconciledChildRow[] = [];
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `WITH updated_task AS (
+           UPDATE tasks
+              SET status = 'failed',
+                  progress = COALESCE(progress, '{}'::jsonb)
+                    || jsonb_build_object('resumableCircuit', $1::jsonb)
+                    || jsonb_build_object('notes', COALESCE(progress->'notes', '[]'::jsonb) || $2::jsonb),
+                  tags = $3::text[],
+                  updated_at = now()
+            WHERE id = $4
+              AND status NOT IN ('done', 'cancelled', 'failed')
+            RETURNING ${TASK_COLUMNS}
+         ),
+         _cancel_wake AS (
+           UPDATE scheduled_jobs
+              SET status = 'cancelled', deferred_wake_at = NULL
+            WHERE task_id = $4 AND status IN ('pending', 'running', 'suspended', 'paused')
+         )
+         SELECT * FROM updated_task`,
+        [JSON.stringify(options.circuitState), JSON.stringify(notes), mergedTags, taskId],
+      );
+      row = rows[0] as DbTaskRow | undefined;
+      if (!row) {
+        // The row flipped to a terminal status (or vanished) between getTask and
+        // this UPDATE. Unlike completeTask we return current truth rather than
+        // throwing — failResumableTask is idempotent terminalization (the top
+        // guard already treats an already-terminal task as a no-op success).
+        await client.query('ROLLBACK');
+        return await this.getTask(taskId);
+      }
+      reconciledChildren = await this.runReconcileChildrenQuery(client, taskId, reconcileReason);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const updated = mapTaskRow(row);
+    try {
+      await this.bus.publish('execution', createTaskUpdated({
+        taskId: updated.id,
+        previousStatus: current.status,
+        newStatus: 'failed',
+        progressNote: options.progressNote,
+        agentId: null,
+      }));
+    } catch (busErr) {
+      this.logger.error({ busErr, taskId }, 'task-repo: bus publish failed after failResumableTask');
+    }
+
+    // System-triggered failure has no caller agent (matches the null agentId above).
+    if (reconciledChildren.length > 0) {
+      await this.publishReconcileChildEvents(reconciledChildren, reconcileReason, undefined, taskId);
+    }
+
+    // A failed task is abandoned work: a reply to its outreach must not link to it (#2312).
+    await this.closeOutreach([taskId, ...reconciledChildren.map((c) => c.id)]);
+
+    this.logger.warn({ taskId }, 'task-repo: resumable task failed by circuit breaker');
+    return updated;
   }
 }

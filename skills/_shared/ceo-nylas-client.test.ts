@@ -1,0 +1,592 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { CeoNylasClient, NylasApiError, clearFolderCache } from './ceo-nylas-client.js';
+import type { Logger } from '../../src/logger.js';
+
+// Several tests drive requests through listFolders, whose result is cached per grant.
+beforeEach(() => {
+  clearFolderCache();
+});
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function makeLogger(): Logger {
+  return {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  } as unknown as Logger;
+}
+
+function makeClient(log: Logger = makeLogger()): CeoNylasClient {
+  return new CeoNylasClient('test-api-key', 'test-grant-id', log);
+}
+
+/** Build a Response-like object that fetch() would return. */
+function makeResponse(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+  opts: { cancelSpy?: ReturnType<typeof vi.fn> } = {},
+): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (name: string) => headers[name.toLowerCase()] ?? null,
+    },
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+    // Real Response has a ReadableStream body; we stub cancel() so the
+    // optional-chaining call in requestWithCursor is exercised, not silently skipped.
+    body: { cancel: opts.cancelSpy ?? vi.fn() },
+  } as unknown as Response;
+}
+
+function successResponse(data: unknown): Response {
+  return makeResponse(200, { data });
+}
+
+function rateLimitResponse(retryAfter?: string): Response {
+  const headers: Record<string, string> = {};
+  if (retryAfter !== undefined) headers['retry-after'] = retryAfter;
+  return makeResponse(429, { error: { type: 'rate_limit_error', message: 'Too many requests' } }, headers);
+}
+
+// ── Retry / backoff tests ────────────────────────────────────────────────────
+
+describe('CeoNylasClient — 429 retry / backoff', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    // Restore mocks first: one test spies on the fake setTimeout, and restoring
+    // that spy after useRealTimers() would reinstall the fake for later tests.
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('retries on 429 and succeeds when the next attempt returns 200', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimitResponse())
+      .mockResolvedValue(successResponse([{ id: 'f1', name: 'INBOX' }]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    // listFolders uses request() → requestWithCursor() internally
+    const promise = client.listFolders();
+
+    // Advance timers so the backoff delay resolves without real waiting.
+    await vi.runAllTimersAsync();
+    const folders = await promise;
+
+    expect(folders).toHaveLength(1);
+    expect(folders[0]!.name).toBe('INBOX');
+    // Called twice: once for the 429, once for the successful retry.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors the Retry-After header for the backoff delay', async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimitResponse('3'))
+      .mockResolvedValue(successResponse([{ id: 'f1', name: 'INBOX' }]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    const promise = client.listFolders();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // The first setTimeout call should be for ~3000ms (Retry-After: 3 + ±25% jitter).
+    const firstDelay = setTimeoutSpy.mock.calls[0]?.[1];
+    expect(firstDelay).toBeGreaterThanOrEqual(3000 * 0.75);
+    expect(firstDelay).toBeLessThanOrEqual(3000 * 1.25);
+  });
+
+  it('throws a typed NylasApiError(429) when retries are exhausted', async () => {
+    // Always return 429 — exhaust all 3 retries.
+    const fetchMock = vi.fn().mockResolvedValue(rateLimitResponse());
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    let caughtErr: unknown;
+    const promise = client.listFolders().catch((err: unknown) => {
+      caughtErr = err;
+    });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(caughtErr).toBeInstanceOf(NylasApiError);
+    const err = caughtErr as NylasApiError;
+    // Must be typed status 429.
+    expect(err.status).toBe(429);
+    const msg = err.message.toLowerCase();
+    // Must NOT imply an auth failure (words that would prompt "re-auth" advice).
+    expect(msg).not.toMatch(/\bexpired\b|\bre-authoriz|\binvalid.token|\btoken.expired/);
+    // Must explicitly say rate-limited or 429 so downstream agents can identify
+    // this as transient congestion rather than an auth/credentials problem.
+    expect(msg).toMatch(/rate.limit|429/);
+
+    // 1 initial attempt + 3 retries = 4 total fetches.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not retry non-retriable errors (4xx other than 429)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(400, { error: 'bad request' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    let caughtErr: unknown;
+    const promise = client.listFolders().catch((e: unknown) => {
+      caughtErr = e;
+    });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(caughtErr).toBeInstanceOf(NylasApiError);
+    // No retry — only one fetch.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry non-retriable errors (401 Unauthorized)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(401, { error: 'unauthorized' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    let caughtErr: unknown;
+    const promise = client.listFolders().catch((e: unknown) => {
+      caughtErr = e;
+    });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(caughtErr).toBeInstanceOf(NylasApiError);
+    expect((caughtErr as NylasApiError).status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('caps Retry-After at 30s when the header specifies a larger value', async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimitResponse('120')) // 120s >> 30s cap
+      .mockResolvedValue(successResponse([{ id: 'f1', name: 'INBOX' }]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const log = makeLogger();
+    const client = makeClient(log);
+    const promise = client.listFolders();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    // The delay must be ≤ 30s * 1.25 jitter ceiling.
+    const firstDelay = setTimeoutSpy.mock.calls[0]?.[1];
+    expect(firstDelay).toBeLessThanOrEqual(30_000 * 1.25);
+    // A warning should be logged that Retry-After was clamped.
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ retryAfterSeconds: 120 }),
+      expect.stringContaining('Retry-After exceeds cap'),
+    );
+  });
+
+  it('logs a warning when Retry-After is an unparseable date-format string', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimitResponse('Wed, 01 Jan 2025 00:00:00 GMT'))
+      .mockResolvedValue(successResponse([{ id: 'f1', name: 'INBOX' }]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const log = makeLogger();
+    const client = makeClient(log);
+    const promise = client.listFolders();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ retryAfterRaw: 'Wed, 01 Jan 2025 00:00:00 GMT' }),
+      expect.stringContaining('unparseable Retry-After'),
+    );
+  });
+
+  it('does not retry 5xx on non-GET methods (POST) to avoid duplicate sends', async () => {
+    // createFolder uses POST — a 503 on it must NOT be retried.
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse(503, { error: 'service unavailable' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    let caughtErr: unknown;
+    const promise = client.createFolder('TestLabel').catch((e: unknown) => {
+      caughtErr = e;
+    });
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(caughtErr).toBeInstanceOf(NylasApiError);
+    expect((caughtErr as NylasApiError).status).toBe(503);
+    // No retry — only the single initial attempt.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the 429 response body before sleeping (releases the connection slot)', async () => {
+    const cancelSpy = vi.fn();
+    // Inject the cancelSpy into the first 429 response.
+    const rateLimitRes = makeResponse(
+      429,
+      { error: { type: 'rate_limit_error', message: 'Too many requests' } },
+      {},
+      { cancelSpy },
+    );
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimitRes)
+      .mockResolvedValue(successResponse([{ id: 'f1', name: 'INBOX' }]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    const promise = client.listFolders();
+    await vi.runAllTimersAsync();
+    await promise;
+
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries 5xx on GET methods (safe to retry idempotent reads)', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(makeResponse(503, { error: 'service unavailable' }))
+      .mockResolvedValue(successResponse([{ id: 'f1', name: 'INBOX' }]));
+
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    const promise = client.listFolders();
+    await vi.runAllTimersAsync();
+    const folders = await promise;
+
+    expect(folders).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── limit clamping tests ─────────────────────────────────────────────────────
+
+describe('CeoNylasClient — list limit clamping (≤ 20)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('clamps listMessages limit when caller passes > 20', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listMessages({ limit: 50 });
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('20');
+  });
+
+  it('preserves listMessages limit when caller passes ≤ 20', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listMessages({ limit: 10 });
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('10');
+  });
+
+  it('clamps listDrafts limit when caller passes > 20', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listDrafts({ limit: 100 });
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('20');
+  });
+
+  it('clamps listAllDrafts pageSize to 20', async () => {
+    // Return an empty page with no cursor so the loop exits after one fetch.
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    // Pass a pageSize that exceeds the cap.
+    await client.listAllDrafts({ pageSize: 100 });
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('20');
+  });
+
+  it('clamps listAllDrafts default pageSize (previously 100) to 20', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listAllDrafts();
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('20');
+  });
+
+  it('sends limit=20 for listMessages when no limit is specified (Nylas default is 50 — too high)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listMessages();
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('20');
+  });
+
+  it('marks text/calendar attachments with MIME parameters as calendar invites', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([{
+      id: 'msg-1',
+      subject: 'Invite',
+      from: [],
+      to: [],
+      cc: [],
+      date: 1,
+      attachments: [{
+        id: 'att-1',
+        filename: 'invite.ics',
+        content_type: 'text/calendar; method=REQUEST; charset=UTF-8',
+        size: 123,
+      }],
+    }]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    const messages = await client.listMessages();
+
+    expect(messages[0]!.attachments[0]!.isCalendarInvite).toBe(true);
+  });
+
+  it('sends limit=20 for listDrafts when no limit is specified (Nylas default is 50 — too high)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listDrafts();
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('limit')).toBe('20');
+  });
+});
+
+// ── received_before (oldest-first paging, #1431) ────────────────────────────
+describe('CeoNylasClient — received_before filter', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sends received_before on listMessages', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    await client.listMessages({ folder: 'SENT', receivedAfter: 50, receivedBefore: 200 });
+
+    const calledUrl = new URL(fetchMock.mock.calls[0]![0] as string);
+    expect(calledUrl.searchParams.get('received_before')).toBe('200');
+    expect(calledUrl.searchParams.get('received_after')).toBe('50');
+  });
+
+  it('listAllMessages re-sends the filters on cursor pages (#2377)', async () => {
+    // Page 1: one message + a cursor. Page 2 (page_token present): empty, no cursor → loop exits.
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (String(url).includes('page_token')) {
+        return makeResponse(200, { data: [] });
+      }
+      return makeResponse(200, {
+        data: [{ id: 'm1', date: 100, folders: ['SENT'] }],
+        next_cursor: 'CUR',
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = makeClient();
+    const { messages } = await client.listAllMessages({
+      folder: 'SENT',
+      receivedAfter: 50,
+      receivedBefore: 200,
+      maxScan: 500,
+    });
+
+    expect(messages).toHaveLength(1);
+    const page1 = new URL(fetchMock.mock.calls[0]![0] as string);
+    const page2 = new URL(fetchMock.mock.calls[1]![0] as string);
+    expect(page1.searchParams.get('received_before')).toBe('200');
+    expect(page1.searchParams.get('received_after')).toBe('50');
+    expect(page2.searchParams.get('page_token')).toBe('CUR');
+    // The cursor does not carry the filters, so they are re-sent.
+    expect(page2.searchParams.get('in')).toBe('SENT');
+    expect(page2.searchParams.get('received_after')).toBe('50');
+    expect(page2.searchParams.get('received_before')).toBe('200');
+  });
+});
+
+// ── Folder cache (#2083) ─────────────────────────────────────────────────────
+
+describe('CeoNylasClient — folder cache', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  function folderFetch() {
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) =>
+      init?.method === 'POST'
+        ? successResponse({ id: 'Label_9', name: 'New' })
+        : successResponse([{ id: 'Label_1', name: 'Receipts' }]),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const listings = () =>
+      fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'GET').length;
+    return { fetchMock, listings };
+  }
+
+  it('lists folders once for two calls within the TTL, across client instances', async () => {
+    const { listings } = folderFetch();
+
+    // Handlers build a fresh client per call, so the cache must outlive one.
+    await makeClient().listFolders();
+    const second = await makeClient().listFolders();
+
+    expect(second).toEqual([{ id: 'Label_1', name: 'Receipts' }]);
+    expect(listings()).toBe(1);
+  });
+
+  it('lists again once the TTL has passed', async () => {
+    vi.useFakeTimers();
+    const { listings } = folderFetch();
+
+    await makeClient().listFolders();
+    vi.advanceTimersByTime(5 * 60_000 + 1);
+    await makeClient().listFolders();
+
+    expect(listings()).toBe(2);
+  });
+
+  it('lists again after createFolder', async () => {
+    const { listings } = folderFetch();
+
+    await makeClient().listFolders();
+    await makeClient().createFolder('New');
+    await makeClient().listFolders();
+
+    expect(listings()).toBe(2);
+  });
+
+  it('keeps one cache entry per grant', async () => {
+    const { listings } = folderFetch();
+
+    await makeClient().listFolders();
+    await new CeoNylasClient('test-api-key', 'other-grant', makeLogger()).listFolders();
+
+    expect(listings()).toBe(2);
+  });
+
+  it('hands each caller its own array', async () => {
+    folderFetch();
+
+    const first = await makeClient().listFolders();
+    first.push({ id: 'Label_X', name: 'Injected' });
+
+    expect(await makeClient().listFolders()).toHaveLength(1);
+  });
+});
+
+// ── Call budget (#2083) ──────────────────────────────────────────────────────
+
+describe('CeoNylasClient — call budget', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('fails fast when Retry-After is longer than the call has left', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimitResponse('30'));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CeoNylasClient('k', 'test-grant-id', makeLogger(), { deadline: Date.now() + 2_000 });
+
+    const started = Date.now();
+    const err = await client.markAsRead('m1').catch((e: unknown) => e);
+
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(err).toBeInstanceOf(NylasApiError);
+    expect((err as NylasApiError).status).toBe(429);
+    expect((err as NylasApiError).message).toMatch(/Transient.*retry shortly/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('still waits out a Retry-After that fits in the budget', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimitResponse('0.05'))
+      .mockResolvedValue(successResponse({ id: 'm1' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new CeoNylasClient('k', 'test-grant-id', makeLogger(), { deadline: Date.now() + 5_000 });
+
+    await client.markAsRead('m1');
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes the abort signal to fetch', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successResponse({ id: 'm1' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const abort = new AbortController();
+
+    await new CeoNylasClient('k', 'test-grant-id', makeLogger(), { signal: abort.signal }).markAsRead('m1');
+
+    expect((fetchMock.mock.calls[0]![1] as RequestInit).signal).toBe(abort.signal);
+  });
+
+  it('sends nothing once the signal has fired', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const abort = new AbortController();
+    abort.abort();
+
+    const err = await new CeoNylasClient('k', 'test-grant-id', makeLogger(), { signal: abort.signal })
+      .markAsRead('m1')
+      .catch((e: unknown) => e);
+
+    expect((err as Error).message).toMatch(/cancelled because the tool call timed out/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('stops a backoff sleep when the signal fires mid-wait', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(rateLimitResponse('2'));
+    vi.stubGlobal('fetch', fetchMock);
+    const abort = new AbortController();
+    setTimeout(() => abort.abort(), 20);
+
+    const started = Date.now();
+    const err = await new CeoNylasClient('k', 'test-grant-id', makeLogger(), { signal: abort.signal })
+      .markAsRead('m1')
+      .catch((e: unknown) => e);
+
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect((err as Error).message).toMatch(/cancelled/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

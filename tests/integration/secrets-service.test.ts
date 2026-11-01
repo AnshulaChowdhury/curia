@@ -22,7 +22,8 @@ describeIf('SecretsService', () => {
   });
 
   afterEach(async () => {
-    await pool.query("DELETE FROM secrets WHERE name LIKE 'test_%'");
+    await pool.query("DELETE FROM secrets WHERE name LIKE 'test_%' OR name LIKE 'user.test_%' OR name LIKE 'channel.test_%'");
+    await pool.query("DELETE FROM user_secret_details WHERE name LIKE 'user.test_%'");
   });
 
   afterAll(async () => {
@@ -91,5 +92,30 @@ describeIf('SecretsService', () => {
     // Values must never appear — list() returns names only.
     expect(names).not.toContain('secret-a');
     expect(JSON.stringify(names)).not.toContain('secret-b');
+  });
+
+  it('upsertUserDetails stores sign-in details and merges later partial updates (#2201)', async () => {
+    await service.upsertUserDetails('user.test_insurer', { loginUrl: 'https://id.example.com/', username: 'someone' });
+    await service.upsertUserDetails('user.test_insurer', { username: 'someone-else' });
+    const details = await service.listUserDetails();
+    expect(details.get('user.test_insurer')).toEqual({ loginUrl: 'https://id.example.com/', username: 'someone-else' });
+  });
+
+  it('upsertUserDetails refuses a non-user key, and the table enforces it too (#2201)', async () => {
+    await expect(service.upsertUserDetails('test_api_key', { username: 'x' })).rejects.toThrow(/user\.\*/);
+    await expect(pool.query("INSERT INTO user_secret_details (name) VALUES ('test_api_key')")).rejects.toThrow();
+  });
+
+  it('listUserNames returns only user.* keys, never values or system/channel names', async () => {
+    await service.set('user.test_listed', 'user-secret-value');
+    await service.set('test_anthropic_standin', 'sys-secret-value');
+    await service.set('channel.test_listed', 'channel-secret-value');
+    const names = await service.listUserNames();
+    expect(names).toContain('user.test_listed');
+    expect(names).not.toContain('test_anthropic_standin');
+    expect(names).not.toContain('channel.test_listed');
+    expect(names.every(n => n.startsWith('user.'))).toBe(true);
+    expect(JSON.stringify(names)).not.toContain('user-secret-value');
+    expect(JSON.stringify(names)).not.toContain('sys-secret-value');
   });
 });

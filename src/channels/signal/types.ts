@@ -7,8 +7,9 @@
 //   - Inbound: receive notifications (text messages, group messages)
 //   - Outbound: send requests, read receipt requests
 //
+// Voice-call control (callEvent notifications) lives in call-types.ts (#1672).
+//
 // Ignored envelope types (not modelled here because we drop them):
-//   - callMessage — voice/video call events
 //   - typingMessage — typing indicators
 //   - receiptMessage — delivery/read receipt confirmations from Signal peers
 //
@@ -86,9 +87,15 @@ export interface SignalAttachment {
   contentType: string;
   filename?: string;
   size: number;
+  /** True when the sender recorded this as a Signal voice note (JsonAttachment.isVoiceNote). */
+  isVoiceNote?: boolean;
 }
 
-/** An emoji reaction to a previous message. We ignore these per spec (MVP). */
+/**
+ * An emoji reaction to a previous message.
+ * Normalized to `inbound.reaction` by the Signal adapter; emoji→intent mapping
+ * lives in dispatch/approval (#1479), never in the channel layer.
+ */
 export interface SignalReaction {
   emoji: string;
   /** E.164 number of the message author being reacted to */

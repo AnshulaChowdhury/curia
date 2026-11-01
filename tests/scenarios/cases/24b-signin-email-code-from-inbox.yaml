@@ -1,0 +1,297 @@
+# Case 24b (#2017): an emailed sign-in code is Curia's to read. It asks ceo-inbox for it,
+# never the principal. Rule: the "## Sign-in verifications" block
+# (src/agents/prompts/verification-block.ts): "Email codes: delegate the read to
+# ceo-inbox." The turn is a task wake, so nothing but the block and the task's notes says a
+# code is waiting; asking the principal on Signal is available (human-channels) and is the
+# consumer-assistant reflex this case guards against.
+#
+# The "asks for the code" checks below match a request for the code, not the word: a send
+# of the booking may say it signed in with the code from the inbox (PR review). The
+# booking page's identifier is labelled "Booking reference" all the same.
+#
+# The site is aircanada.example (a reserved TLD), not the real aircanada.com: the seed opens
+# a pending verification for it, and a real instance's pending row for a real site must
+# never be the one this case reuses or refuses on.
+name: signin email code from inbox
+description: >
+  Curia is woken for a backlog task: pull the principal's Air Canada booking for next
+  week's Vancouver trip and send them the details. Its progress note says it signed in to
+  aircanada.example with the stored password, the site offered to send a sign-in code by email
+  or text, it chose email, and browser session s-2 is on the code screen. A pending email
+  verification for aircanada.example is in its sign-in block. Curia asks ceo-inbox for the code
+  (the code went to the principal's inbox), types it into session s-2, marks the
+  verification satisfied and sends the principal the booking, without asking the principal
+  for the code.
+tags: [verification, signin, browser, task-wake]
+stub_sets: [human-channels]
+seed:
+  verifications:
+    - key: mail
+      site: aircanada.example
+      page_domain: accounts.aircanada.example
+      delivery: email
+      browser_session_id: s-2
+      task: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+      requested_minutes_ago: 1
+inbound:
+  from: task-wake
+  task:
+    id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+    title: Pull the Air Canada booking for the Vancouver trip
+    intent: >
+      Get the principal's Air Canada booking for next week's Vancouver trip from their
+      Aeroplan account (flights, times, seats, booking reference) and send them the details.
+    notes:
+      - at: "{{at:now-2m}}"
+        note: >
+          Signed in to aircanada.example with the stored Aeroplan password. The site asked for
+          a sign-in code and offered email or text; I chose email. Browser session s-2 is
+          on the code screen.
+tool_stubs:
+  delegate:
+    - match: { agent: ceo-inbox }
+      return:
+        agent: ceo-inbox
+        response: >
+          Found it: "Your Air Canada sign-in code" from Air Canada
+          <no-reply@notifications.aircanada.example>, received a minute ago. The code is
+          731406; it expires 10 minutes after it was sent. I've left the email in the inbox.
+    - match: {}
+      error: That specialist can't help with this.
+  web-browser:
+    - match: { session_id: s-2, action: get_content }
+      return: &code_screen
+        session_id: s-2
+        session_reused: true
+        url: https://accounts.aircanada.example/verify
+        content: |
+          Air Canada — Enter your verification code
+          We sent a 6-digit code to j•••@example.test. It expires in 10 minutes.
+          --- Interactable elements ---
+          [g1f0e1] textbox "Verification code"
+          [g1f0e2] checkbox "Remember this device"
+          [g1f0e3] button "Continue"
+          [g1f0e4] link "Send a new code"
+        verification_suspected: { page_domain: aircanada.example, signals: [one-time-code-input] }
+    - match: { session_id: s-2, action: screenshot }
+      return: *code_screen
+    # A call with no action (keep_warm or screenshot alone) reads the page too.
+    - match: { session_id: s-2, action: null, actions: null }
+      return: *code_screen
+    # A session mid-sign-in lands back on the code screen at the site's front door: only
+    # typing the code and submitting signs in. A navigate to a signed-in page falls through
+    # to the catch-all below (the stubs are stateless; bouncing every navigate sent a
+    # signed-in run round in circles).
+    - match: { session_id: s-2, action: navigate, url: "https://aircanada.example" }
+      return: *code_screen
+    - match: { session_id: s-2, action: navigate, url: "https://aircanada.example/" }
+      return: *code_screen
+    - match: { session_id: s-2, action: navigate, url: "https://www.aircanada.example" }
+      return: *code_screen
+    - match: { session_id: s-2, action: navigate, url: "https://www.aircanada.example/" }
+      return: *code_screen
+    - match: { session_id: s-2, action: type }
+      return:
+        session_id: s-2
+        session_reused: true
+        url: https://accounts.aircanada.example/verify
+        content: |
+          Air Canada — Enter your verification code
+          We sent a 6-digit code to j•••@example.test. It expires in 10 minutes.
+          --- Interactable elements ---
+          [g1f0e1] textbox "Verification code" (filled)
+          [g1f0e2] checkbox "Remember this device"
+          [g1f0e3] button "Continue"
+          [g1f0e4] link "Send a new code"
+    - match: { session_id: s-2 }
+      return:
+        session_id: s-2
+        session_reused: true
+        url: https://www.aircanada.example/aeroplan/trips
+        content: |
+          Air Canada — My trips
+          Toronto (YYZ) → Vancouver (YVR) · Booking reference: QZ7K2P
+            Outbound: AC 115, {{day:next-monday+3}}, departs 08:00, arrives 10:21 · Seat 3A
+            Return: AC 122, {{day:next-monday+6}}, departs 13:30, arrives 21:02 · Seat 4C
+          --- Interactable elements ---
+          [g2f0e1] link "Sign out"
+  verification:
+    - match: { action: list }
+      return:
+        verifications:
+          - verification_id: "{{verification:mail}}"
+            site: aircanada.example
+            page_domain: aircanada.example
+            delivery: email
+            status: pending
+            browser_session_id: s-2
+            task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+            requested_at: "{{at:now-1m}}"
+            expires_at: "{{at:now+9m}}"
+        displayTimezone: "{{timezone}}"
+    - match: { action: satisfy, verification_id: "{{verification:mail}}" }
+      return:
+        verification_id: "{{verification:mail}}"
+        site: aircanada.example
+        page_domain: aircanada.example
+        delivery: email
+        status: satisfied
+        browser_session_id: s-2
+        task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+        requested_at: "{{at:now-1m}}"
+        expires_at: "{{at:now+9m}}"
+        displayTimezone: "{{timezone}}"
+    - match: { action: open }
+      return:
+        verification_id: "{{verification:mail}}"
+        site: aircanada.example
+        page_domain: aircanada.example
+        delivery: email
+        status: pending
+        browser_session_id: s-2
+        task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+        requested_at: "{{at:now-1m}}"
+        expires_at: "{{at:now+9m}}"
+        reused: true
+        ask_channel: signal
+        email_wait_seconds: 180
+        displayTimezone: "{{timezone}}"
+    - match: {}
+      error: "Verification not found"
+  task-update:
+    - match: { task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e }
+      return:
+        task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+        title: Pull the Air Canada booking for the Vancouver trip
+        status: in_progress
+        owner: curia
+        priority: 2
+        tags: []
+        updated_at: "{{at:now}}"
+        displayTimezone: "{{timezone}}"
+  task-complete:
+    - match: { task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e }
+      return:
+        task_id: 3d8f1a6b-2c4e-4b7a-9f0d-5e6a7b8c9d0e
+        title: Pull the Air Canada booking for the Vancouver trip
+        status: done
+        completed_at: "{{at:now}}"
+        displayTimezone: "{{timezone}}"
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 5b2e7c1d-3f4a-4b6c-8d9e-0f1a2b3c4d5e, sensitivity: internal }
+  # Filing the result in the documents workspace is a reasonable side step; test mode has
+  # no workspace, so unstubbed both calls are refused.
+  doc-place:
+    - match: {}
+      return:
+        action: create_folder
+        slug: vancouver-trip
+        directory_prefix: /projects/vancouver-trip/
+        path: /projects/vancouver-trip/brief.md
+        reason: No existing project folder covers this.
+        catalog: []
+        displayTimezone: America/Toronto
+  doc-write:
+    - match: {}
+      return:
+        action: created
+        version: 1
+        displayTimezone: America/Toronto
+  scheduler-report:
+    - match: {}
+      return: { recorded: true }
+expected_behaviors:
+  - id: delegates_code_read
+    weight: critical
+    description: Asks ceo-inbox (delegate) for the Air Canada sign-in code.
+    check:
+      called: delegate
+      with: { agent: ceo-inbox }
+  # A send may mention the code ("Signed in with the code from your inbox; here's your
+  # booking"); only a request for it fails. One behavior per channel: a check reads one
+  # tool's text, and a channel Curia never used passes its not_called alternative.
+  - id: no_code_ask_by_signal
+    weight: critical
+    description: Does not ask the principal for the code on Signal.
+    check:
+      any_of:
+        - not_called: [signal-send]
+        - text: { tool: signal-send, arg: message }
+          excludes: &code_ask
+            # A request for the code, in any phrasing; a negation earlier in the clause
+            # (a dash, like , ; . ! or ?, ends a clause)
+            # ("you don't need to send me the code", "no need to send the code") or
+            # Curia offering an action ("shall I forward it?") does not count.
+            # a request for the code by verb: send me the code, pass along the verification code, please provide the OTP (not "no need to send the code")
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\b(send|text|forward|share|pass along|pass|relay|paste|provide)\b( (me|us|over|along|back))?( (the|your|that|this|those|a))?( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b'
+            # tell / give / read me the code
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\b(tell|give|read)( it)? (me|us)( out)?( (the|your|that|this|those|a))?( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b'
+            # pronoun forms: share it with me, send it over, can you forward it?
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\b(send|forward|share|pass|text|relay)\b (it|that|this|them)( (over|along|back|on))? (to|with) (me|us)\b'
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\b(send|forward|pass|text)\b (it|that|this|them) (over|along)\b'
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\b(send|forward|share|pass|text|relay)\b (it|that|this|them)\b[^.!?\n]{0,25}\?'
+            # reply with the code / with it / with the 6 digits
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})\breply( back)? with (it\b|(the|your|that|this|those|a)( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b)'
+            # what's the code, what is your one-time passcode
+            - '\bwhat([''’]s| is) (the|your|that)( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b'
+            # I need the code, do you have the code
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})\b(I|we) (still )?need (the|your|that|this)( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b'
+            - '\b(do|did) you (still )?(have|see|get|got)( it)?( (the|your|that|this|those|a))?( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b'
+            # let me know the code; check your inbox for a code
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})\blet me know (the|your|that)( [\w-]+){0,3} (?:code|passcode|pass code|otp|one-time password|digits)\b'
+            - '\bcheck your (inbox|e-?mail|phone|texts?|messages)\b[^.!?\n]{0,30}\b(?:code|passcode|pass code|otp|one-time password|digits)\b'
+            # forward me the Air Canada email
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\bforward (me |us )?(the|that|this)( [\w-]+){0,3} e-?mail\b'
+            # send it to me / here / my way
+            - '(?<!(?:\bno need|\bnot|\bnever|n[''’]t)\b(?:(?! - )[^.!?;,\n—–]){0,30})(?<!\b(?:I|I''ll|I will|I can|me to|shall I|should I)\s+(?:also\s+)?)\b(send|forward|text)\b (it|that|this)( over| along| back)? (to me|here|my way)\b'
+  - id: no_code_ask_by_sms
+    weight: critical
+    description: Does not ask the principal for the code by SMS.
+    check:
+      any_of:
+        - not_called: [sms-send]
+        - text: { tool: sms-send, arg: message }
+          excludes: *code_ask
+  - id: no_code_ask_by_slack
+    weight: critical
+    description: Does not ask the principal for the code on Slack.
+    check:
+      any_of:
+        - not_called: [slack-send]
+        - text: { tool: slack-send, arg: message }
+          excludes: *code_ask
+  - id: no_code_ask_by_email
+    weight: critical
+    description: Does not ask the principal for the code by email.
+    check:
+      any_of:
+        - not_called: [email-send]
+        - text: { tool: email-send, arg: body }
+          excludes: *code_ask
+  - id: types_code_in_session
+    weight: important
+    description: Types the code ceo-inbox returned (731406) into browser session s-2.
+    check:
+      any_of:
+        - called: web-browser
+          with: { session_id: s-2 }
+          contains: { text: "731406" }
+        - called: web-browser
+          with: { session_id: s-2 }
+          contains: { actions: "731406" }
+  - id: marks_satisfied
+    weight: important
+    description: Marks the verification satisfied.
+    check:
+      called: verification
+      with: { action: satisfy }
+  - id: finishes_errand
+    weight: important
+    description: >
+      Sends the principal the booking (reference QZ7K2P, AC 115 out and AC 122 back, with
+      times and seats) and completes or updates the task.
+failure_modes:
+  - Messages the principal asking them to forward or read out the code
+  - Parks the task waiting on the principal instead of reading the inbox
+  - Clicks "Send a new code" or switches to a text-message code

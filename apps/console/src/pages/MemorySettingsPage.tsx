@@ -1,0 +1,178 @@
+import { useEffect, useState } from 'react';
+import { Link } from '@tanstack/react-router';
+import { apiFetch } from '../api';
+import { SettingsLayout } from './SettingsPage';
+import { errorMessage } from '../components/settings/ConfigHistory';
+
+export interface MemoryRetentionPolicy {
+  workingMemoryTtlDays: number;
+  scratchTtlDays: number;
+  archiveThreshold: number;
+  halfLifeDays: {
+    slowDecay: number;
+    fastDecay: number;
+  };
+  warnHoldBackDays: number;
+  editable: false;
+}
+
+// Runtime guard for the /api/memory/retention payload. The endpoint is our own,
+// but a malformed 200 (e.g. a proxy/SPA fallback returning valid JSON of the
+// wrong shape) must not reach state and crash the render on halfLifeDays.*.
+function isMemoryRetentionPolicy(value: unknown): value is MemoryRetentionPolicy {
+  if (typeof value !== 'object' || value === null) return false;
+  const p = value as Record<string, unknown>;
+  const hl = p['halfLifeDays'];
+  if (typeof hl !== 'object' || hl === null) return false;
+  const half = hl as Record<string, unknown>;
+  return typeof p['workingMemoryTtlDays'] === 'number'
+    && typeof p['scratchTtlDays'] === 'number'
+    && typeof p['archiveThreshold'] === 'number'
+    && typeof p['warnHoldBackDays'] === 'number'
+    && typeof half['slowDecay'] === 'number'
+    && typeof half['fastDecay'] === 'number';
+}
+
+function MemorySection() {
+  const [policy, setPolicy] = useState<MemoryRetentionPolicy | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const res = await apiFetch('/api/memory/retention');
+        if (!res.ok) throw new Error(await errorMessage(res));
+        const data = await res.json() as { retention: unknown };
+        if (!isMemoryRetentionPolicy(data.retention)) {
+          throw new Error('Malformed retention policy response');
+        }
+        setPolicy(data.retention);
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : 'Failed to load retention policy');
+      }
+    }
+    void load();
+  }, []);
+
+  if (loadError) {
+    return (
+      <div className="settings-page-header">
+        <p className="autonomy-error">{loadError}</p>
+      </div>
+    );
+  }
+
+  if (!policy) {
+    return (
+      <div className="settings-page-header">
+        <p className="settings-muted-hint">Loading…</p>
+      </div>
+    );
+  }
+
+  const archivePct = Math.round(policy.archiveThreshold * 1000) / 10;
+
+  return (
+    <>
+      <div className="settings-page-header">
+        <h2 className="settings-page-title">Memory</h2>
+        <p className="settings-page-sub">
+          How long conversation turns and knowledge-graph facts are kept before decay or archival.
+        </p>
+      </div>
+
+      <div className="settings-callout settings-callout-readonly">
+        <p>
+          <strong>Read-only — configured at deploy time.</strong> These values are loaded from
+          server config at boot. Changing them requires a config edit and restart. In-console
+          editing is a future enhancement.
+        </p>
+      </div>
+
+      <section className="settings-section">
+        <div className="settings-section-head">
+          <h3 className="settings-section-title">Conversation &amp; scratch</h3>
+        </div>
+        <div className="settings-section-body">
+          <dl className="retention-list">
+            <div className="retention-row">
+              <dt>Conversation turns</dt>
+              <dd>
+                Kept for <strong>{policy.workingMemoryTtlDays} days</strong>, then purged by the
+                nightly dream pass.
+              </dd>
+            </div>
+            <div className="retention-row">
+              <dt>Scratch documents</dt>
+              <dd>
+                Ephemeral scratch docs are archived after{' '}
+                <strong>{policy.scratchTtlDays} days</strong> of inactivity.
+              </dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <div className="settings-section-head">
+          <h3 className="settings-section-title">Fact decay</h3>
+        </div>
+        <div className="settings-section-body">
+          <dl className="retention-list">
+            <div className="retention-row">
+              <dt>Slow-decay facts</dt>
+              <dd>
+                Confidence halves every <strong>{policy.halfLifeDays.slowDecay} days</strong>
+                {' '}(employer, residence, and similar long-lived facts).
+              </dd>
+            </div>
+            <div className="retention-row">
+              <dt>Fast-decay facts</dt>
+              <dd>
+                Confidence halves every <strong>{policy.halfLifeDays.fastDecay} days</strong>
+                {' '}(preferences and short-lived context).
+              </dd>
+            </div>
+            <div className="retention-row">
+              <dt>Archive threshold</dt>
+              <dd>
+                Facts at or below <strong>{archivePct}% confidence</strong> are soft-deleted
+                (archived) and drop out of queries.
+              </dd>
+            </div>
+            <div className="retention-row">
+              <dt>Decay warnings</dt>
+              <dd>
+                Important nodes about to archive are held back for{' '}
+                <strong>{policy.warnHoldBackDays} days</strong> so you can re-confirm them.
+              </dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <div className="settings-section-head">
+          <h3 className="settings-section-title">Review nodes</h3>
+        </div>
+        <div className="settings-section-body">
+          <p className="settings-muted-hint" style={{ margin: 0 }}>
+            To review knowledge-graph nodes nearing archival, ask Curia in{' '}
+            <Link to="/chat">Chat</Link>
+            {' '}to run the decay-warnings list (the <code>decay-warnings-list</code> skill).
+          </p>
+        </div>
+      </section>
+    </>
+  );
+}
+
+export function MemoryPage() {
+  return (
+    <SettingsLayout activeSection="memory">
+      <MemorySection />
+    </SettingsLayout>
+  );
+}
+
+export default MemoryPage;

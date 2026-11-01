@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useNavigate, useSearch } from '@tanstack/react-router';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
 import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
@@ -175,7 +176,10 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
   const [owner, setOwner] = useState<TaskOwner>(task?.owner ?? 'curia');
   const [priority, setPriority] = useState(String(task?.priority ?? 50));
   const [dueAt, setDueAt] = useState(task?.dueAt ? task.dueAt.slice(0, 10) : '');
-  const [source, setSource] = useState<TaskSource>(task?.source ?? 'agent');
+  // New console tasks default to 'ceo' (#1127): the console is a principal surface, so a task
+  // created here is CEO-authorized work, not an agent-spawned side-effect. A 'ceo' source keeps
+  // it non-derived so its principal lineage survives the woken-task bypass ladder.
+  const [source, setSource] = useState<TaskSource>(task?.source ?? 'ceo');
   const [tags, setTags] = useState((task?.tags ?? []).join(', '));
   const [conversationId, setConversationId] = useState(task?.conversationId ?? '');
   const [waitingOnText, setWaitingOnText] = useState(task?.waitingOnText ?? '');
@@ -237,13 +241,13 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
 
       let res: Response;
       if (creating) {
-        res = await apiFetch('/api/kg/tasks', {
+        res = await apiFetch('/api/tasks', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       } else {
-        res = await apiFetch(`/api/kg/tasks/${task!.id}`, {
+        res = await apiFetch(`/api/tasks/${task!.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -266,7 +270,7 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
     setDeleting(true);
     setError(null);
     try {
-      const res = await apiFetch(`/api/kg/tasks/${task.id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/tasks/${task.id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(await errorMessage(res));
       onDeleted(task.id);
     } catch (err) {
@@ -302,17 +306,6 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
         >
           {related.title}
         </button>
-      </div>
-    );
-  }
-
-  // Render a read-only UUID field (for system-managed FKs with no link behaviour).
-  function uuidField(label: string, value: string | null) {
-    if (!value) return null;
-    return (
-      <div className="form-field">
-        <label>{label}</label>
-        <div className="form-field-readonly cell-mono" style={{ fontSize: 11, wordBreak: 'break-all' }}>{value}</div>
       </div>
     );
   }
@@ -437,13 +430,19 @@ function TaskEditDrawer({ task, creating, onClose, onSaved, onDeleted, lookupTas
               )}
               {relatedTaskLink('Parent task', task?.parentTaskId ?? null)}
               {relatedTaskLink('Blocked by', task?.blockedByTaskId ?? null)}
-              {uuidField('Source agent ID', task?.sourceAgentId ?? null)}
+              {task?.sourceAgentId && (
+                <div className="form-field">
+                  <label>Source agent</label>
+                  <div className="form-field-readonly">{task.sourceAgentId}</div>
+                </div>
+              )}
             </>
           )}
 
           <div className="form-field">
-            <label htmlFor="tf-budget">Error budget JSON</label>
-            <textarea id="tf-budget" rows={4} value={errorBudget} onChange={e => setErrorBudget(e.target.value)} placeholder='{"maxTurns": 12, "maxConsecutiveErrors": 3}' style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }} />
+            <label htmlFor="tf-budget">Resumable config JSON</label>
+            <textarea id="tf-budget" rows={4} value={errorBudget} onChange={e => setErrorBudget(e.target.value)} placeholder='{"resumable": true, "max_iterations": 50}' style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 12 }} />
+            <p style={{ fontSize: 12, margin: '4px 0 0', opacity: 0.75 }}>Per-invocation turn limits are set in agent YAML, not here. Use resumable flags and aggregate ceiling overrides only.</p>
           </div>
           <div className="form-field">
             <label htmlFor="tf-progress">Progress JSON</label>
@@ -488,6 +487,8 @@ type StatusFilter = typeof STATUS_FILTERS[number];
 type OwnerFilter = 'all' | TaskOwner;
 
 export default function TasksPage() {
+  const navigate = useNavigate();
+  const { task: taskIdFromUrl } = useSearch({ strict: false }) as { task?: string };
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -502,6 +503,7 @@ export default function TasksPage() {
   const [pageSize, setPageSize] = useState(10);
   const [editing, setEditing] = useState<Task | null>(null);
   const [creating, setCreating] = useState(false);
+  const appliedUrlTaskRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
@@ -510,7 +512,7 @@ export default function TasksPage() {
   const load = useCallback(async () => {
     setLoadError(null);
     try {
-      const res = await apiFetch('/api/kg/tasks');
+      const res = await apiFetch('/api/tasks');
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { tasks: Task[] };
       setTasks(data.tasks);
@@ -521,6 +523,17 @@ export default function TasksPage() {
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    if (!taskIdFromUrl || tasks.length === 0) return;
+    if (appliedUrlTaskRef.current === taskIdFromUrl) return;
+    const target = tasks.find(t => t.id === taskIdFromUrl);
+    if (target) {
+      appliedUrlTaskRef.current = taskIdFromUrl;
+      setCreating(false);
+      setEditing(target);
+    }
+  }, [taskIdFromUrl, tasks]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { all: tasks.length };
@@ -607,6 +620,15 @@ export default function TasksPage() {
     if (target) {
       setCreating(false);
       setEditing(target);
+    }
+  }
+
+  function handleCloseDrawer() {
+    setEditing(null);
+    setCreating(false);
+    if (taskIdFromUrl) {
+      appliedUrlTaskRef.current = undefined;
+      void navigate({ to: '/tasks', search: { task: undefined }, replace: true });
     }
   }
 
@@ -787,7 +809,7 @@ export default function TasksPage() {
                     key={editing ? `${editing.id}-${editing.updatedAt}` : 'new'}
                     task={editing}
                     creating={creating}
-                    onClose={() => { setEditing(null); setCreating(false); }}
+                    onClose={handleCloseDrawer}
                     onSaved={handleSaved}
                     onDeleted={handleDeleted}
                     lookupTask={lookupTask}

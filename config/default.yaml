@@ -2,10 +2,13 @@
 # Agents declare a tier (fast | standard | powerful) — this config maps each
 # tier to a concrete model. The provider is resolved from the model registry.
 # Change these values to upgrade all agents of a tier in one place.
+# A tier may also set `reasoning: { effort: none | low | medium | high | max }`
+# for agent turns (ADR-048); unset means the model's own default. Boot fails
+# if the tier's model does not list the effort in the model registry.
 model_routing:
   tiers:
     fast:
-      model: claude-haiku-4-5
+      model: claude-haiku-5-5
     standard:
       model: claude-sonnet-4-6
     powerful:
@@ -16,39 +19,27 @@ channels:
   cli:
     enabled: true
   max_message_bytes: 102400   # 100KB — inbound messages exceeding this are rejected before routing
-  # Signal channel activation is controlled by env vars, not this file.
-  # Set SIGNAL_SOCKET_PATH + SIGNAL_PHONE_NUMBER at runtime to enable the Signal adapter.
-  # Trust level and unknown-sender policy live in config/channel-trust.yaml.
-
-# Multi-account email configuration (spec §03-email-channel.md).
-#
-# Note: email credentials may now also be supplied via the secrets vault (keys
-# `channel.email.*`) and managed in the Channels console page. The config path
-# below remains supported and is preferred for multi-account setups.
-#
-# channel_accounts.email defines one or more named Nylas-backed email accounts.
-# Each account has its own grant ID and self-email address. All accounts send
-# directly via the OutboundGateway (autonomy-gated).
-#
-# Credential values may be supplied inline or as env-var references using the
-# `env:VAR_NAME` syntax (recommended for secrets):
-#
-#   nylas_grant_id: "env:NYLAS_GRANT_ID"
-#   self_email:     "env:NYLAS_SELF_EMAIL"
-#
-# Backward compatibility: if this block is absent, the email channel falls back to the
-# single-account env-var mode (NYLAS_API_KEY / NYLAS_GRANT_ID / NYLAS_SELF_EMAIL).
-#
-# Example:
-# (Keys are the logical account names; they become the accountId on bus events.)
-#
-# channel_accounts:
-#   email:
-#     curia:
-#       nylas_grant_id: "env:NYLAS_GRANT_ID_CURIA"
-#       self_email:     "env:NYLAS_SELF_EMAIL_CURIA"
-#
-# channel_accounts: {}
+  email:
+    # Max coordinator turns one mailbox may have in flight from inbound mail.
+    # The poll returns after the Nylas fetch and write-ahead; it does not wait
+    # for those turns. Messages on one thread stay in date order and never run
+    # together. Further threads wait for a free slot. The cap bounds concurrent
+    # turns only — queued messages stay in memory until a slot frees (#2254).
+    max_concurrent_turns: 4
+  # Signal / Slack channel activation is controlled by vault credentials + the channel
+  # registry (Settings → Channels), not this file. Trust policies live in channel-trust.yaml.
+  slack:
+    # Optional allowlist of Slack channel ids (C…) for @mentions. Empty = all channels
+    # the bot is a member of. DMs are never filtered by this list.
+    allowed_channel_ids: []
+  voice:
+    # Optional concrete model for voice turns. Empty = existing fast tier.
+    model: ""
+    # LiveKit RoomService base URL (server→LiveKit DeleteRoom / admin). Distinct from
+    # the browser signaling URL in Settings → Channels → Voice (wss://…). Compose
+    # default reaches the `livekit` service on the internal network. Host-side
+    # `pnpm dev` with published ports: override to http://localhost:7880 in local.yaml.
+    livekit_management_url: "http://livekit:7880"
 
 # Rate limits for automatic contact creation from email participants.
 # Prevents spam campaigns from flooding the contacts table.
@@ -58,8 +49,10 @@ contact_creation_limits:
   max_per_hour: 100      # max new contacts created per hour, per email account
 
 browser:
-  # How long a browser session stays alive after its last action (ms).
-  sessionTtlMs: 600000   # 10 minutes
+  # How long a browser session stays alive after its last action (ms). Long enough that a
+  # multi-page form (e.g. a 60-question survey) isn't evicted mid-flow between agent turns —
+  # eviction orphans every element ref the agent still holds.
+  sessionTtlMs: 1800000   # 30 minutes
   # How often the session sweep runs to close expired sessions (ms).
   sweepIntervalMs: 120000  # 2 minutes
   # Persistent profile directory. Empty → ${HOME}/.curia/browser-profile.
@@ -68,8 +61,19 @@ browser:
   # Browser channel: "chrome" for real Chrome (must be installed in the image),
   # empty for the bundled Playwright Chromium.
   channel: ""
-  # Context locale (BCP 47).
+  # Optional egress proxy for browser traffic. Full URL or bare host:port
+  # (e.g. "http://browser-proxy:8888"). Empty → direct egress. Set this per-deployment
+  # to route the browser through a residential exit and avoid a datacenter-IP bot signal.
+  proxy: ""
+  # Browser locale (BCP 47).
   locale: "en-US"
+  # Ordered navigator.languages / Accept-Language list, locale first (e.g. [en-CA, en-US, en]).
+  # Empty → [locale]. Match these to the principal's country and the egress IP.
+  languages: []
+  # Longest the web-browser skill waits for a page to finish redirecting before reading it
+  # (ms). Ordinary pages return at once; the wait only runs while a page is blank, still
+  # changing URL, or on a sign-in handoff. Air Canada's sign-in chain takes ~28s. Max 90000.
+  settleCapMs: 35000
 
 agents:
   coordinator:
@@ -80,24 +84,20 @@ dispatch:
   # event fires and background memory extraction (extract-relationships, etc.) runs.
   conversationCheckpointDebounceMs: 600000   # 10 minutes
 
-  # In-memory rate limiting for the dispatch layer (spec §06-audit-and-security.md).
-  # Protects against message flooding from malfunctioning channels, abusive senders,
-  # or compromised integrations. Two independent limits are enforced:
-  #
-  #   global     — total messages per window across all senders; enforced before any
-  #                policy-gate processing (guards against aggregate DoS flooding).
-  #   per-sender — messages per sender per window; enforced after policy gates
-  #                (blocked/held senders are already dropped before this check).
-  #
-  # Excess messages are dropped silently — no response is sent to the sender.
-  # Violations are audit-logged as message.rejected events with reason
-  # 'global_rate_limited' or 'sender_rate_limited', and logged at warn level.
-  #
-  # Changes take effect on restart.
+  # In-memory flood protection. Excess messages are dropped silently and
+  # audit-logged as message.rejected. Changes take effect on restart.
   rate_limit:
     window_ms: 60000        # 1-minute fixed window
     max_per_sender: 15      # messages per sender per window (15 allows for an active chat burst)
     max_global: 100         # total messages per window across all senders
+
+  # Turn lanes + mid-turn injection (#2018, ADR-053).
+  # enabled: false, or omitting the key, keeps concurrent turns.
+  turnInjection:
+    enabled: true
+    maxInjectionsPerTurn: 5        # ADR-053 §3
+    extraRoundsPerInjection: 2     # ADR-053 §3: added to the host's maxTurns per drained input
+    laneWaitTimeoutMs: 1200000     # ADR-053 §6: 20 min, then fail open (log error, run anyway)
 
 workingMemory:
   # TTL for working memory turns. Rows are expired by DreamEngine's nightly purge
@@ -120,6 +120,27 @@ workingMemory:
     threshold: 20   # turns that trigger a summarization pass
     keepWindow: 10  # most-recent turns to retain as active after summarization
 
+documentWorkspace:
+  # Inactivity TTL for ephemeral `/scratch/<conversation-id>/…` documents. DreamEngine's
+  # nightly pass soft-deletes (sets archived_at) on live scratch rows whose updated_at is
+  # older than this many days. Omit `ttl_days` in frontmatter to inherit this default;
+  # set `ttl_days: 0` on a scratch doc to opt out. `/projects/…` documents are never
+  # auto-archived.
+  scratchTtlDays: 7
+  # Largest document (serialized OKF bytes) the console Documents page edits in place.
+  # Bigger documents are read-only there: download, edit offline, re-import. 1024–4194304.
+  consoleEditMaxBytes: 65536
+  # An agent's `pinned_context` document or config value longer than this many characters
+  # logs a warning each turn it is injected (#2338). It is still injected in full.
+  pinnedContextWarnChars: 16000
+  # When a planned parent completes, promote its curated deliverable into the KG via
+  # extract-facts / extract-relationships, then archive the project's workspace docs.
+  # Per-task override: error_budget.kg_promotion: false skips promotion for that task.
+  kgPromotion:
+    enabled: true
+    maxFacts: 50
+    maxRelationships: 50
+
 skillOutput:
   # Maximum character length of a sanitized skill result before truncation.
   # Skills that return more than this (search results, page crawls, long calendar
@@ -129,13 +150,29 @@ skillOutput:
   maxLength: 200000  # 200k characters (~50k tokens at 4 chars/token)
 
 # Delegate skill configuration.
-# Controls the default timeout for specialist agent delegations when no explicit
-# timeout_ms is provided by the caller or runtime. Deployment-specific model
-# latency (e.g. switching the standard tier to a higher-latency model) can be
-# accommodated here without a code change or release.
-# Override in config/local.yaml to match your deployment's model latency.
+# Controls the default timeout for specialist agent delegations when the runtime
+# resolves no expected duration for the target (no scheduled-task
+# expectedDurationSeconds and no agent expected_duration_seconds). The coordinator
+# LLM cannot set this — timeout_ms is not in the delegate input schema and the
+# runtime discards any value the model emits.
+#
+# Sized to the pooled p99 (444s) of 1,550 delegate runs before 2026-09-20 — the
+# clean baseline confirmed after #1873, not the degraded 2026-09-20→22 window.
+# Rounded up to 450s. A per-agent expected_duration_seconds still overrides this
+# (duration + bounded headroom). A local.yaml value below 450000 reintroduces
+# false timeouts for hint-less specialists and warns at startup. (#1857)
 delegate:
-  defaultTimeoutMs: 90000   # 90s — appropriate for interactive delegations with Sonnet-class models
+  defaultTimeoutMs: 450000   # 450s — pooled p99 before 2026-09-20, rounded up (#1857)
+
+  # Late delivery (#1799). A delegate wait that times out does NOT stop the specialist: it keeps
+  # running and eventually publishes a result. These settings control the handle that keeps that
+  # late result from being orphaned — it is correlated back to the delegation, recorded on the
+  # escalation review task, and audited.
+  lateDelivery:
+    enabled: true
+    ttlMinutes: 60            # how long to keep waiting for the abandoned specialist
+    sweepIntervalMinutes: 5   # restart recovery from audit_log + expiry of dead handles
+    maxResultChars: 8000      # cap on the result text copied into the review task note
 
 # Scheduler configuration.
 # Controls runtime defaults for the scheduler watchdog and recovery logic.
@@ -145,14 +182,68 @@ scheduler:
   # Raise this if you run long-running scheduled jobs without explicit duration hints.
   defaultExpectedDurationSeconds: 600  # 10 minutes
 
+  # Max agent runs the scheduler will have in flight at once. A poll claims at most
+  # this many due jobs and does not wait for them; further due jobs stay pending
+  # until a slot frees. 8 is headroom above the observed production peak of 6
+  # (#1160), so that peak still runs and growth past it is what the cap bounds.
+  maxInFlight: 8
+
+health:
+  # Thresholds for time-based liveness checks
+  liveness:
+    email_stall_factor: 3      # fail if last poll older than N × pollingIntervalMs
+    scheduler_max_tick_s: 120  # fail if scheduler watchdog last ticked > N seconds ago
+
+  # Cron schedule for the daily credential/dependency canary job (server local time)
+  canary_schedule: "0 6 * * *"
+
+  # Heartbeat URLs — GET on successful canary (Better Stack, Healthchecks.io, Cronitor, etc.)
+  # LLM keys are tier-named so they survive a model_routing provider swap.
+  # Leave empty to skip the ping (canary still runs and logs).
+  heartbeats:
+    llm_fast: ""
+    llm_standard: ""
+    llm_powerful: ""
+    embeddings: ""
+    image_gen: ""
+    nylas: ""
+    nylas_calendar: ""
+    signal: ""
+    google_workspace: ""
+    tavily: ""
+
 # Context bridge TTL configuration.
 # Controls how long outbound context entries remain active before automatic expiry.
 # Auto-registered entries (when the caller doesn't pass explicit context_bridge metadata)
-# use defaultExpiryHours. Entries with explicit delegation hints use explicitExpiryHours.
+# use the channel's entry in channelDefaultExpiryHours, falling back to defaultExpiryHours.
+# Entries with explicit delegation hints use explicitExpiryHours, raised to the channel
+# default when that is longer.
 # A caller-specified expires_in_hours in the context_bridge JSON always overrides these.
 contextBridge:
-  defaultExpiryHours: 6      # auto-registered entries (proactive sends without metadata)
+  defaultExpiryHours: 6      # channels with no entry below (chat-paced: reply within hours)
   explicitExpiryHours: 24    # entries with explicit context_bridge JSON
+  # Per-channel auto-registration windows. Email is measured in business days, not
+  # hours: a late-afternoon send is routinely answered the next morning, and a
+  # Friday ask on Monday — a 6h window expired before either could land (#1816).
+  channelDefaultExpiryHours:
+    email: 72
+
+# Delegated sign-in with external verification (#2017).
+# When a site asks the principal for a code (email, SMS or authenticator app), Curia asks
+# them on the first channel in askChannelOrder that is enabled and has a verified principal
+# identity, never the channel the errand came in on. Valid channels: signal, sms, slack, email.
+verification:
+  askChannelOrder: [signal, sms, slack, email]
+  defaultExpiryMinutes: 10        # a pending verification is treated as expired after this (a hint, not a cliff)
+  recentWindowMinutes: 120        # a closed verification still counts as recent for this long
+  codeTtlMinutesAfterClose: 120   # a tracked code value is kept this long after its verification closes
+  emailWaitSeconds: 180           # how long to wait for an emailed code before asking the principal
+  # Identity providers whose embedded sign-in frame may receive a sign-in code: a child
+  # frame holding the code input becomes the verification's page_domain only on the sign-in
+  # page's own domain (the top page's) or one of these. Kept short and well-known on purpose;
+  # a deployment extends it
+  # by setting this list (the setting replaces the default, so repeat these entries).
+  identityProviderDomains: [b2clogin.com, ciamlogin.com, microsoftonline.com, okta.com, auth0.com, onelogin.com, pingidentity.com, pingone.com, duosecurity.com]
 
 # Meeting debrief agent configuration (spec §17-meeting-debrief.md).
 # Controls the proactive debrief prompt sent after external meetings end.
@@ -163,30 +254,10 @@ debrief:
   contextBridgeTtlHours: 48      # TTL for context bridge entries linking replies to the debrief agent
 
 security:
-  # Layer 1 prompt injection detection (spec §06-audit-and-security.md).
-  #
-  # Additional regex patterns to check beyond the built-in defaults.
-  # Built-in defaults cover: "ignore previous instructions", "ignore all prior
-  # instructions", "you are now", "system:", "[system]", "act as", "disregard your".
-  #
-  # Each entry must have:
-  #   regex  — a valid JavaScript regex string (case-insensitive matching is applied automatically)
-  #   label  — human-readable name that appears in audit log findings
-  #
-  # Example:
-  #   extra_injection_patterns:
-  #     - regex: "forget everything above"
-  #       label: "forget everything above"
-  #     - regex: "new\\s+persona"
-  #       label: "new persona"
-  #
-  # Changes take effect on restart — no code changes required.
-  #
-  # ⚠️  ReDoS warning: avoid patterns with unbounded nested quantifiers such as
-  # (a+)+ or (.+)+ — these can cause catastrophic backtracking on adversarial input
-  # and may freeze the Node.js event loop. Prefer simple bounded patterns (e.g.
-  # "forget\s+everything" rather than "(forget.+)+"). These patterns run in the
-  # main process on every inbound message, so keep them efficient.
+  # Additional prompt-injection regex patterns beyond the built-in defaults.
+  # Each entry: { regex: "...", label: "human-readable name" } — case-insensitive.
+  # ⚠️ Avoid unbounded nested quantifiers (e.g. (a+)+) — ReDoS risk on the hot path.
+  # Changes take effect on restart.
   extra_injection_patterns: []
 
   # Message trust score computation weights (spec §06-audit-and-security.md).
@@ -205,54 +276,38 @@ security:
   # All values must be in [0.0, 1.0]. Startup fails if this block is absent or malformed.
   trust_thresholds:
     information_query: 0.2   # answering questions, summaries
-    scheduling: 0.5           # calendar changes, meeting requests
+    scheduling: 0.3           # calendar changes, meeting requests (0.5 until #2227: a known email contact scores ~0.24 + 0.4 x confidence)
     data_export: 0.8          # sharing files, forwarding records
     financial: 0.8            # payments, financial commitments
 
+  # The principal's own organization's email domains, e.g. [acme.com] (#2227). A verified
+  # (SPF/DKIM/DMARC pass) email sender at one of these, still tier `unknown`, is treated as a
+  # colleague and elevated to `known` before routing. Empty: the domain rule is off. List
+  # only domains the organization controls, never a shared mail provider (gmail.com).
+  principal_org_domains: []
+
+# Bulk export controls (#201) — item-count threshold, destination allowlisting, and
+# sensitivity ceiling for attachments (OutboundGateway) and MCP Drive/Sheets exports.
+# Destination allowlisting applies only to confidential+ exports; internal/public
+# Workspace exports proceed without CEO approval unless another control fires.
+exportControls:
+  confidentialThreshold: 10
+  allowedDestinations:
+    driveFolderIds: []
+    urls: []
+    filePaths: []
+
 pii:
-  # Extra PII patterns to scrub from LLM-facing error strings, beyond the built-in
-  # defaults (spec §06-audit-and-security.md — PII Handling).
-  #
-  # Built-in defaults (sourced from @openredaction/openredaction):
-  #   - Email addresses       → [EMAIL]
-  #   - US-format phone numbers (also matches CA)   → [PHONE]
-  #   - UK phone numbers      → [PHONE]
-  #   - Credit card numbers   → [CREDIT_CARD]
-  #   - US SSNs (keyword-prefixed, e.g. "SSN: 123-45-6789") → [SSN]
-  #
-  # Add custom patterns here for any PII types specific to your deployment
-  # (employee IDs, account numbers, national IDs, etc.).
-  #
-  # Each entry must have:
-  #   regex       — a valid JavaScript regex string (gi flags applied automatically)
-  #   replacement — the placeholder to substitute, e.g. "[EMPLOYEE_ID]"
-  #
-  # Example:
-  #   extra_patterns:
-  #     - regex: "EMP-\\d{6}"
-  #       replacement: "[EMPLOYEE_ID]"
-  #     - regex: "\\b\\d{3}[-\\s]?\\d{3}[-\\s]?\\d{3}\\b"
-  #       replacement: "[CA_SIN]"
-  #
-  # Changes take effect on restart — no code changes required.
-  #
-  # ⚠️  ReDoS warning: avoid patterns with unbounded nested quantifiers such as
-  # (a+)+ or (.+)+ — these can cause catastrophic backtracking on adversarial input.
-  # These patterns run on every LLM-facing error message.
+  # Additional PII patterns to scrub from LLM-facing error strings.
+  # Each entry: { regex: "...", replacement: "[PLACEHOLDER]" } — gi flags applied.
+  # ⚠️ Avoid unbounded nested quantifiers (e.g. (a+)+) — ReDoS risk.
+  # Changes take effect on restart.
   extra_patterns: []
 
-  # Outbound PII redaction policy - controls which PII patterns are redacted
-  # in outbound channel messages (email, Signal replies).
-  #
-  # Detection uses openredaction (same library as the log/LLM scrubber).
-  # This config controls only policy: which detected patterns pass through
-  # on which channels. Patterns not in a channel's allow list are redacted.
-  #
-  # The principal bypass is handled structurally via ceoContactId UUID match
-  # at startup — no trust_override config needed.
-  #
-  # default: 'block' means all detected PII not explicitly allowed is redacted.
-  # Configure exceptions, not rules.
+  # Outbound PII redaction policy for channel messages (email, Signal).
+  # default: 'block' — all detected PII is redacted unless explicitly allowed per channel.
+  # Principal bypass is structural: no redaction only when the principal (a verified
+  # identity) is the sole recipient of the send (principalIsSoleRecipient, #2312).
   outbound_redaction:
     enabled: true
     default: block
@@ -291,33 +346,45 @@ intentDrift:
 filter:
   llmJudge:
     enabled: true
-    # Default works out of the box (claude-haiku-4-5 — smaller/cheaper than the opus coordinator).
-    #
-    # >>> STRONGLY RECOMMENDED <<<: point this at a DIFFERENT vendor/family than the
-    # fast/standard/powerful agent tiers above (e.g. an OpenRouter Gemini or DeepSeek
-    # model such as 'google/gemini-3.1-flash-lite'). Model diversity is the security
-    # value here: an attack crafted to fool the Claude coordinator should not also fool
-    # the reviewer. Requires the corresponding provider API key (e.g. OPENROUTER_API_KEY).
-    model: claude-haiku-4-5
+    # Recommended: use a different vendor/family than the agent tiers for model diversity
+    # (an attack tuned for the coordinator should not also fool the reviewer).
+    model: claude-haiku-5-5
     timeout_ms: 5000
-    # split (default) | open | closed. See src/config.ts for semantics.
-    failMode: split
+    failMode: split   # split (default) | open | closed — see src/config.ts
+  # Identity gate (#1818). A non-principal send is checked for an unconfirmed-name
+  # hedge, or an unresolved name next to an invitation or attendance cue.
+  #   enforce — block the send (default)
+  #   shadow  — log the block and send anyway
+  #   off     — do not inspect the text
+  identityGate: enforce
 
-# Escalation-line policy judge (issue #948).
-# Classifies the sensitivity of outbound disclosures and the consequence of
-# proposed actions, then maps tier × class → allow / escalate.
-# Consumed by the disclosure gate (#949) and action gate (#950).
-#
-# Fail-closed by design: timeout / provider error / malformed verdict all
-# result in 'escalate' — there is no failMode knob.
-#
-# >>> STRONGLY RECOMMENDED <<<: use a DIFFERENT model family than the coordinator
-# for the same model-diversity security value as filter.llmJudge above.
+# Escalation-line policy judge — classifies outbound disclosures and proposed actions,
+# maps tier × class → allow/escalate. Fail-closed by construction: timeout/error → escalate.
+# There is no failMode key — local.yaml overrides are deep-merged but not schema-checked,
+# so an operator-added failMode is silently ignored (see EscalationJudgeConfig).
+# Recommended: use a different model family than the coordinator (model diversity).
 escalation:
   judge:
     enabled: true
-    model: claude-haiku-4-5
+    model: claude-haiku-5-5
     timeout_ms: 5000
+    # The band brief (#2159) reads the drafting turn's evidence; it needs longer than a one-word classification.
+    review_timeout_ms: 15000
+
+# Audit log hardening (spec 10 / #1383).
+# llm_call_archive stores redacted full prompts/responses keyed to llm.call rows.
+# Kill-switch (`enabled: false`) stops new archive writes immediately; hot
+# retention TTL is enforced by DreamEngine's nightly decay pass (DELETE older rows).
+# Encryption-at-rest for this table is a tracked follow-up — treat the store as
+# plaintext JSONB with best-effort redaction until then.
+audit:
+  llmCallArchive:
+    enabled: true
+    hotRetentionDays: 90
+    # Reasoning text can be most of a row (one production call spent ~4k output
+    # tokens on reasoning for a single tool call, #2033). false keeps the token
+    # count and drops the text, without turning the archive off.
+    includeReasoning: true
 
 # Dream engine — background knowledge graph maintenance (issue #27).
 # The decay pass runs on a configurable interval and reduces the confidence of
@@ -354,15 +421,50 @@ dreaming:
     batchSize: 50                 # max rows scored per pass
     minScoredActions: 30          # minimum before any adjustment fires
     halfLifeDays: 30              # time-decay half-life for weighting
-    weakExpiredWeight: 0.3        # reduced weight for 'expired' compatibility signal
     ceoCooldownDays: 7            # days after CEO set-autonomy before auto-adjust resumes
     errorRateThreshold: 0.20      # competence error rate that blocks score increases
+    errorRateWindowDays: 90       # that rate covers the last 30 competence rows, none older than this
+    unparseableAfterDays: 3       # parse failures retry this many days, then dead-letter
+
+# Embedding profiles (ADR-051). The endpoint is set in .env (EMBEDDING_BASE_URL,
+# EMBEDDING_MODEL). The profile for that model gives its vector width, the text put in
+# front of each kind of input, and the three similarity thresholds. Built-in profiles
+# live in src/memory/embedding-profiles.ts. A model with no profile leaves the knowledge
+# graph off. To enable one, add it in config/local.yaml, keyed by the exact
+# EMBEDDING_MODEL value. Thresholds must be calibrated for the model: values copied from
+# another model can merge distinct people and facts.
+#
+# embedding:
+#   profiles:
+#     # Same model under another server's id: `base` copies a built-in profile, and any
+#     # field given beside it overrides that field. Ollama names Qwen3-Embedding-4B this way.
+#     "qwen3-embedding:4b":
+#       base: Qwen3-Embedding-4B
+#     # A model with no built-in profile: give dimensions and all three thresholds.
+#     my-embedding-model:
+#       # At most 2000 (pgvector's HNSW limit). Curia truncates a longer vector from the
+#       # server to this width. That is only valid for a Matryoshka-trained model.
+#       dimensions: 1024
+#       prefixes:                     # optional; each defaults to ""
+#         query: ""                   # put before a search query
+#         document: ""                # put before a stored node label
+#         similarity: ""              # put before a label matched against stored labels
+#       thresholds:
+#         fact_dedup: 0.92            # merge a new fact into an existing one at or above
+#         fuzzy_resolve: 0.90         # resolve a name to an existing entity at or above
+#         fuzzy_ambiguity_floor: 0.75 # ask which entity was meant at or above
 
 # Sensitivity classification rules for KG nodes (issue #200).
 # Rules are evaluated in descending sensitivity order — 'restricted' rules are
 # checked before 'confidential', so the most protective rule always wins.
 # Add patterns in lowercase; matching is case-insensitive substring search across
 # the node label and all string property values.
+#
+# Operator-overridable via config/local.yaml (#1369). Merge semantics are
+# replace, not extend, like every other array in this config: a
+# `sensitivity_rules` list in local.yaml REPLACES this entire list rather than
+# adding to it. To customize, copy the rules you want to keep from here into
+# local.yaml alongside your additions.
 sensitivity_rules:
   # Credentials — blocked from bulk export entirely
   - category: credentials
@@ -487,3 +589,93 @@ tasks:
   heartbeatMaxWakesPerTick: 5
   idleThresholdHours: 4
   staleWaitThresholdHours: 48
+  # Seconds after a paused resumable task before its self-continuation wake fires.
+  # Default 30s loops iterate leaves promptly (seconds → low minutes) instead of waiting
+  # for the BacklogHeartbeat (heartbeatIntervalMinutes, typically 60) or its idle
+  # threshold (idleThresholdHours, typically 4). At most one pending wake per task —
+  # a lost continuation is re-surfaced by the heartbeat once idleThresholdHours elapses.
+  resumableContinuationSeconds: 30
+  # Progress-based circuit breaker for resumable iterate leaves (#1176).
+  # Per-task error_budget may override any key (max_stalls, max_iterations,
+  # max_wallclock_hours, max_cost_usd). A breach fails the task and escalates
+  # via the backlog-surfacing path instead of looping silently.
+  resumableCeilings:
+    maxStalls: 3          # K — consecutive paused slices with no cursor/done advance
+    maxIterations: 100    # hard cap on continuation slices
+    maxWallclockHours: 24 # hours from first processed pause
+    maxCostUsd: 10.00     # aggregate LLM spend across slices (USD)
+    maxPlanDepth: 3       # max plan-decomposition depth per subtree (#1266)
+    maxReplansPerSubtree: 5  # max adaptive re-plans per planned task (#1266)
+    blockedStepHours: 48  # blocked child hours before divergence signal (#1266)
+    throughputDivergenceRatio: 0.5  # measured/implied pace ratio floor (#1266)
+
+# Autonomy authorization (#1125). The bypass ladder governs how much LINEAGE standing a
+# heartbeat-woken/derived task inherits at the live autonomy score. The score can only ever
+# DOWNGRADE inherited standing (woken/derived → propose-only at low trust), never grant it.
+#   < same_task        : woken & derived → downgrade to agent (propose-only)
+#   same_task–derived  : same-task heartbeat wake keeps lineage; derived child → agent
+#   >= derived_child   : same-task wake AND derived child keep lineage standing
+# See docs/specs/14-autonomy-engine.md (Effective standing / bypass ladder).
+autonomy:
+  # Which policy decides when Curia asks first (#2159, ADR-049).
+  #   tier — contact tier gates consequential actions (Gate C) and disclosures (Stage 2.5).
+  #   band — the autonomy band decides; the escalation judge reviews sends for an
+  #          outsider steering Curia, claims in the principal's voice, and grounding.
+  # Ships as tier. Flip to band in local.yaml; the default changes after a clean week.
+  gating: tier
+
+  bypass_ladder:
+    same_task: 70      # posture B floor — must not drop below 60
+    derived_child: 90  # posture D floor
+
+  # Expires pending approvals past expires_at and queues a digest item for each
+  # (#2013, #2159), and emails any approval no agent delivered within 15 minutes.
+  # A system interval: no agent turn, no LLM call.
+  approval_expiry:
+    sweep_interval_minutes: 15
+
+  # Weekly summary of unreported digest items, for installs with no digest job
+  # (#2159). Sends once the oldest unreported item passes max_age_days.
+  report_fallback:
+    max_age_days: 7
+    check_interval_hours: 24
+
+  # Cap on immediate messages to the principal that one outside contact (tier known
+  # or below) can cause (#1320). Over the cap, the relay goes to the digest and the
+  # principal gets one line saying more is waiting. 0 turns the cap off.
+  relay_budget:
+    per_hour: 3
+
+  # Emoji → approval intent for inbound.reaction (#1479). Channel-agnostic —
+  # Slack shortcodes and unicode glyphs both listed. Adapters never map intent.
+  # Skin tones / VS16 are stripped before matching (see normalizeReactionEmoji).
+  reaction_intents:
+    approve:
+      - thumbsup
+      - "+1"
+      - white_check_mark
+      - heavy_check_mark
+      - ok_hand
+      - raised_hands
+      - "100"
+      - ok
+      - "👍"
+      - "✅"
+      - "✔"
+      - "✔️"
+      - "👌"
+      - "🙌"
+      - "💯"
+      - "🆗"
+    reject:
+      - thumbsdown
+      - "-1"
+      - x
+      - no_entry
+      - no_entry_sign
+      - person_gesturing_no
+      - "👎"
+      - "❌"
+      - "🚫"
+      - "⛔"
+      - "🙅"

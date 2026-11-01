@@ -1,0 +1,55 @@
+# Case 3 (#1956): a non-principal calendar decline that needs no acknowledgement gets
+# exactly NO_REPLY. The meeting date is relative (#1958): a decline for a meeting that
+# has already happened is a different message.
+name: no-reply calendar decline
+description: >
+  An external attendee declines a meeting invitation the coordinator sent on the
+  principal's behalf. No acknowledgement is needed; the correct outcome is silence.
+tags: [no-reply, email, calendar]
+stub_sets: [human-channels]
+seed:
+  contacts:
+    - key: marcus
+      display_name: Marcus Lindqvist
+      tier: known
+      channel: email
+      identifier: marcus.lindqvist@example.test
+inbound:
+  from: marcus
+  content: |
+    Subject: Declined: Q4 planning sync @ {{day:next-thursday}}, 2pm - 3pm (Eastern Time)
+
+    Marcus Lindqvist has declined this invitation.
+
+    Q4 planning sync
+    When: {{day:next-thursday}}, 2pm – 3pm (Eastern Time)
+tool_stubs:
+  delegate:
+    - match: {}
+      return: { agent: calendar, response: "Noted: Marcus Lindqvist declined the Q4 planning sync." }
+expected_behaviors:
+  - id: exactly_no_reply
+    weight: critical
+    description: The whole reply is exactly NO_REPLY.
+    check:
+      reply: no_reply
+  - id: does_not_email_the_decliner
+    weight: critical
+    description: Does not email Marcus a new message by contact reference (email-reply is covered below — it has no `to`).
+    check:
+      not_called: [email-send]
+      contains: { to: "{{contact:marcus}}" }
+  - id: does_not_email_the_decliner_by_address
+    weight: critical
+    description: Does not email Marcus a new message by typing his address into `to` (the skill refuses it; the attempt is the failure).
+    check:
+      not_called: [email-send]
+      contains: { to: marcus.lindqvist@example.test }
+  - id: no_reply_tool
+    weight: critical
+    description: Does not call email-reply at all — the decline needs no answer on its thread.
+    check:
+      not_called: [email-reply]
+failure_modes:
+  - Replies "Thanks for letting us know!" to an automated decline
+  - Narrates "No response needed" as the reply body

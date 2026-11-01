@@ -10,15 +10,7 @@ Thank you for your interest in contributing to Curia. This document explains how
 
 ## Development Setup
 
-```bash
-git clone https://github.com/YOUR_USERNAME/curia.git
-cd curia
-cp .env.example .env
-# Edit .env with your API keys
-docker compose up
-```
-
-Requires: Node.js 22+, Docker, PostgreSQL 16+ (via Docker Compose).
+Follow the **Developer Install (Source)** path in the **[Development Setup guide](docs/dev/setup.md#developer-install-source)** — it is the single source of truth for prerequisites (Node, pnpm, Docker versions) and the full step-by-step. Version numbers are deliberately not repeated here so there is only one place to update.
 
 ## Making Changes
 
@@ -39,13 +31,36 @@ fix: prevent infinite retry loop in scheduler
 chore: update pgvector to 0.8.0
 ```
 
+### Sign-off (DCO)
+
+Every commit must be signed off under the [Developer Certificate of Origin](https://developercertificate.org/) (DCO). The sign-off is your assertion that you wrote the change (or otherwise have the right to submit it) under the project's open-source license. This is enforced by the DCO status check on every pull request — a PR with any unsigned commit is blocked until it is remediated.
+
+Add the sign-off automatically with the `-s` flag:
+
+```bash
+git commit -s -m "fix: prevent infinite retry loop in scheduler"
+```
+
+This appends a trailer with your name and email:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
+The name and email must match your `git config user.name` / `user.email`.
+
+**Already-open branch missing sign-offs?** You have two options:
+
+- **Rewrite (simple, but changes SHAs):** `git rebase --signoff main` re-writes each commit with a sign-off, then force-push. This invalidates existing review threads, so prefer it only on branches without review in progress.
+- **Individual remediation (preferred, no force-push):** add a single new commit that retroactively signs off your earlier commits, keeping history and review threads intact. The DCO app accepts this because you — the original author — are still the one making the assertion. See the [DCO app remediation docs](https://github.com/dcoapp/app#how-it-works) for the exact commit-message format.
+
 ### Code Standards
 
 - **TypeScript ESM** — `"type": "module"`, `.js` extensions on imports
 - **No `any` types** — use proper types or generics
 - **Parameterized SQL** — never interpolate variables into SQL strings
 - **Structured error handling** — no empty `catch {}` blocks (see [error recovery spec](docs/specs/05-error-recovery.md))
-- **Structured logging** — use pino, never `console.log`
+- **Structured logging** — use pino, never `console.log` (backend only; the browser apps under `apps/` have no pino and are exempt)
 - **Comment liberally** — explain *why*, not just *what*
 
 ### Testing
@@ -53,6 +68,10 @@ chore: update pgvector to 0.8.0
 - Write tests for new features and bug fixes
 - Run the full test suite before submitting: `pnpm test`
 - Integration tests should use real Postgres (via Docker), not mocks
+
+### Dependencies
+
+Before adding, updating, or pinning a dependency, read the [Dependency Management Policy](docs/dev/dependencies.md). It covers how to evaluate a new dependency, why the committed `pnpm-lock.yaml` is authoritative, how Dependabot and the 7-day cooldown work, and how to pin a transitive dependency for a CVE via the `overrides:` block in `pnpm-workspace.yaml`. Always commit `package.json` and `pnpm-lock.yaml` together.
 
 ### Pull Requests
 
@@ -91,8 +110,9 @@ Use [`docs/adr/template.md`](docs/adr/template.md) and add a row to the index in
 Step-by-step guides for common extension tasks — more detail than the quick references below:
 
 - [**Adding an Agent**](docs/dev/adding-an-agent.md) — full YAML schema reference, skill pinning, autonomy injection, lifecycle hooks
-- [**Adding a Skill**](docs/dev/adding-a-skill.md) — manifest fields, `action_risk` and the autonomy gate, handler interface, secrets, testing checklist
+- [**Adding a Skill**](docs/dev/adding-a-tool.md) — manifest fields, `action_risk` and the autonomy gate, handler interface, secrets, testing checklist
 - [**Smoke Tests**](docs/dev/smoke-tests.md) - how our LLM-based testing works, and how to add more tests
+- [**Setup Wizard Walkthrough**](docs/dev/setup-wizard-e2e.md) - browser run of a fresh install through `/setup`; run it when you change the wizard
 
 ## Adding a New Channel Adapter
 
@@ -103,9 +123,9 @@ Step-by-step guides for common extension tasks — more detail than the quick re
 
 ## Adding a New Skill
 
-See the full [Adding a Skill guide](docs/dev/adding-a-skill.md) for schema details, `action_risk` values, and a pre-PR checklist. Quick reference:
+See the full [Adding a Skill guide](docs/dev/adding-a-tool.md) for schema details, `action_risk` values, and a pre-PR checklist. Quick reference:
 
-1. Create `skills/<name>/` with `skill.json` manifest and `handler.ts`
+1. Create `skills/<name>/` with `tool.json` manifest and `handler.ts`
 2. Write tests in `skills/<name>/handler.test.ts`
 3. Declare `action_risk`, `sensitivity`, permissions, and secrets in the manifest
 
@@ -123,6 +143,10 @@ AI-assisted contributions (Claude Code, Copilot, Codex, etc.) are welcome. We ev
 - **Bugs**: Use the bug report issue template
 - **Features**: Use the feature request issue template
 - **Security vulnerabilities**: See [SECURITY.md](SECURITY.md) — do NOT file a public issue
+
+## Governance
+
+Curia's roles (maintainer, contributor), who holds access to sensitive project resources, and how maintainers are added are documented in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Code of Conduct
 

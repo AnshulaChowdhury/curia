@@ -12,7 +12,8 @@
 //
 // Idempotency is guaranteed by two partial unique indexes added in migration 010:
 //   - idx_kg_nodes_agent_singleton on (properties->>'is_agent') WHERE = 'true'
-//   - idx_contacts_kg_node_unique on (kg_node_id) WHERE kg_node_id IS NOT NULL
+//   - idx_contacts_kg_node_unique on (kg_node_id)
+//     WHERE kg_node_id IS NOT NULL AND kind <> 'organization'  (narrowed by migration 085)
 //
 // The returned contactId is injected into:
 //   - The coordinator's system prompt (so "you" resolves correctly)
@@ -48,10 +49,35 @@ export async function bootstrapAgentIdentity(
   // ON CONFLICT fires when a concurrent INSERT tries to create a second agent node.
   try {
     const nodeResult = await pool.query<{ id: string }>(
-      `INSERT INTO kg_nodes (type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at)
-       VALUES ('person', $1, $2, 1.0, 'permanent', 'bootstrap', now(), now())
+      // identity_source = 'contact' (ADR-040): this node backs the agent's contact row, so
+      // it belongs to the anchored tier. Without it a FRESH install would leave the agent's
+      // node label-keyed while a MIGRATED install anchors it (migration 085 step 2) — and a
+      // label-tier node that is contact-linked is exactly what adoptUnanchoredPersonNode
+      // looks for, so a stranger's contact with the agent's display name could adopt it.
+      `INSERT INTO kg_nodes (type, label, properties, confidence, decay_class, source, created_at, last_confirmed_at, identity_source)
+       VALUES ('person', $1, $2, 1.0, 'permanent', 'bootstrap', now(), now(), 'contact')
        ON CONFLICT ((properties->>'is_agent')) WHERE (properties->>'is_agent') = 'true'
-       DO UPDATE SET label = EXCLUDED.label, last_confirmed_at = now()
+       DO UPDATE SET label = EXCLUDED.label,
+                     -- A vector made from the old name no longer matches the node.
+                     -- Both columns clear together for migration 103's CHECK.
+                     embedding = CASE WHEN kg_nodes.label IS DISTINCT FROM EXCLUDED.label
+                                      THEN NULL ELSE kg_nodes.embedding END,
+                     embedding_model = CASE WHEN kg_nodes.label IS DISTINCT FROM EXCLUDED.label
+                                            THEN NULL ELSE kg_nodes.embedding_model END,
+                     last_confirmed_at = now(),
+                     -- The conflict path must anchor too, not just the insert. An agent
+                     -- node that exists while no contact points at it (a previous boot
+                     -- whose contact INSERT failed) is skipped by migration 085 step 2, so
+                     -- it arrives here still label-tier. Without this the contact upsert
+                     -- below would link a label-tier node — contact-linked but adoptable,
+                     -- which is exactly the invariant ADR-040 exists to hold.
+                     identity_source = 'contact',
+                     -- Anchoring clears any pending warning, for the same reason
+                     -- anchorNode() does: nothing retires an anchored node's warning now
+                     -- that the decay passes, listDecayWarnings and dismissDecayWarning
+                     -- all skip the anchored tier, so it would sit warned forever.
+                     warned_at = NULL,
+                     warn_reason = NULL
        RETURNING id`,
       [
         displayName,
@@ -69,9 +95,11 @@ export async function bootstrapAgentIdentity(
     logger.debug({ kgNodeId, displayName }, 'agent-bootstrap: agent KG node ready');
 
     // Step 2: Find or create the agent's contact record linked to the KG node.
-    // The partial unique index idx_contacts_kg_node_unique (migration 010) ensures
-    // ON CONFLICT fires when a concurrent INSERT tries to create a second contact for
-    // the same KG node.
+    // The partial unique index idx_contacts_kg_node_unique (migration 010, narrowed by
+    // 085) ensures ON CONFLICT fires when a concurrent INSERT tries to create a second
+    // contact for the same KG node. The predicate must be repeated verbatim for Postgres
+    // to infer the index — omit the kind clause and this INSERT fails with 42P10 on every
+    // startup. kind is 'agent' here, so the row is always inside the index.
     //
     // display_name is included in DO UPDATE so renames made via the wizard
     // (PUT /api/identity → version bump → process restart → bootstrap re-runs with
@@ -86,7 +114,7 @@ export async function bootstrapAgentIdentity(
       // Legacy status column not written here (#955).
       `INSERT INTO contacts (kg_node_id, display_name, role, system_role, tier, kind, created_at, updated_at)
        VALUES ($1, $2, 'agent', 'agent', 'known', 'agent', now(), now())
-       ON CONFLICT (kg_node_id) WHERE kg_node_id IS NOT NULL
+       ON CONFLICT (kg_node_id) WHERE kg_node_id IS NOT NULL AND kind <> 'organization'
        DO UPDATE SET display_name = EXCLUDED.display_name, role = 'agent', system_role = 'agent', tier = 'known', kind = 'agent', updated_at = now()
        RETURNING id`,
       [kgNodeId, displayName],
@@ -95,7 +123,7 @@ export async function bootstrapAgentIdentity(
     if (!contactResult.rows[0]) {
       throw new Error(
         `agent-bootstrap: INSERT ... ON CONFLICT returned no rows for kgNodeId="${kgNodeId}" — ` +
-        'check that migration 010 was applied (idx_contacts_kg_node_unique must exist)',
+        'check that migrations 010 and 085 were applied (idx_contacts_kg_node_unique must exist)',
       );
     }
     const contactId = contactResult.rows[0].id;

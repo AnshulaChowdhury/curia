@@ -1,0 +1,90 @@
+# ceo-inbox, delegated mode (#2025). Rule: agents/ceo-inbox.yaml, Operating Mode
+# "Delegated mode" and "Rule Management (delegated mode only)": a request from the
+# coordinator is handled directly, without running the triage protocol. The inbox has
+# unread mail, so a triage would be visible (ceo-inbox-list with unread_only, archives).
+name: inbox delegated rules request runs no triage
+description: >
+  The coordinator hands ceo-inbox the principal's request to list the inbox's standing
+  rules. Two rules are stored, one paused, in the rules document ceo-inbox gets in its pinned
+  context (#2339), with decision tagging on. The inbox also holds unread mail. ceo-inbox
+  should report the rules and the tagging setting from its pinned context, and do nothing
+  else: no triage of the unread mail.
+tags: [ceo-inbox, delegated-mode, specialist, specialist-ceo-inbox]
+agent: ceo-inbox
+stub_sets: [ceo-inbox-office]
+seed:
+  pinned:
+    docs:
+      /shared/inbox/rules.md: |
+        ---
+        type: agent-settings
+        title: Inbox standing rules
+        ---
+        Each rule is a `##` section with When / Do / Status lines. Status is active or paused.
+
+        ## Board mail
+
+        - When: From the board (anyone @board.example.test)
+        - Do: Label BOARD and classify as 🚨 Urgent
+        - Status: active
+
+        ## Substack newsletters
+
+        - When: Newsletters from Substack
+        - Do: Archive (✔️ Cleared)
+        - Status: paused
+    configs:
+      ceo_inbox/decision_tagging: '{"enabled": true}'
+  contacts:
+    - key: sam
+      display_name: Sam Rivera
+      channel: email
+      identifier: sam@example.test
+inbound:
+  from: delegate
+  content: "The principal asked: what inbox rules do I have set up right now? List them."
+tool_stubs:
+  # Writes succeed, so a rules rewrite while listing is scored, not hidden.
+  doc-write:
+    - match: {}
+      return: { action: section-edited, document: { path: /shared/inbox/rules.md, version: 2 } }
+  ceo-inbox-list:
+    - match: {}
+      return:
+        count: 1
+        has_more: false
+        messages:
+          - id: msg-unread-1
+            threadId: thr-unread-1
+            subject: Quick question about Thursday
+            from: [{ name: Sam Rivera, email: sam@example.test }]
+            date: 1790064300
+            unread: true
+            snippet: Are we still on for Thursday?
+expected_behaviors:
+  - id: no_triage
+    weight: critical
+    description: Runs no triage (no unread-mail listing, no archiving, labelling or marking read).
+    check:
+      not_called: [ceo-inbox-list, ceo-inbox-archive, ceo-inbox-label, ceo-inbox-mark-read, ceo-inbox-update-folders]
+  - id: lists_both_rules
+    weight: critical
+    description: >
+      The reply lists both stored rules with their condition and instruction, shows that
+      the Substack rule is paused (inactive) while the board rule is active, and says decision
+      tagging is on.
+  - id: no_rule_changes
+    weight: important
+    description: Writes nothing to the rules document (a list request changes no rule).
+    check:
+      not_called: [doc-write]
+  - id: no_setting_changes
+    weight: important
+    description: Stores nothing to config-store (a list request changes no setting).
+    check:
+      not_called: [config-store]
+      with: { action: store }
+failure_modes:
+  - Starts an inbox triage (lists unread mail, archives or labels it) instead of answering the question
+  - Lists only the active rule, or presents the paused rule as active
+  - Rewrites the rules while listing them

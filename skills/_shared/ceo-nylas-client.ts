@@ -1,9 +1,40 @@
-// Thin Nylas v3 REST API wrapper for CEO inbox skills.
+// Thin Nylas v3 REST API wrapper for principal inbox skills.
 // Uses fetch() directly — no dependency on the core NylasClient or Nylas SDK.
-// This is intentional: the CEO's email is a separate data source accessed via
+// This is intentional: the principal's email is a separate data source accessed via
 // dedicated secrets, not through the core's channel account infrastructure.
 
+import { budgetExpired, remainingMs } from '../../src/util/call-budget.js';
+import type { CallBudget } from '../../src/util/call-budget.js';
+import { markMessageRequestError } from '../../src/channels/email/nylas-message-id.js';
+
 const NYLAS_BASE = 'https://api.us.nylas.com/v3/grants';
+
+// Nylas guidance: requests with limit > 20 on list endpoints trigger concurrent-user 429s.
+export const NYLAS_MAX_LIST_LIMIT = 20;
+// Ceiling for listFolders. Nylas pages folders (default 50); a cursor that never
+// ends must not loop. 500 is the same scan cap listAllDrafts uses.
+const FOLDER_SCAN_LIMIT = 500;
+// Maximum number of retry attempts for 429 / 5xx responses before giving up.
+const NYLAS_MAX_RETRIES = 3;
+// Base backoff delay in ms — doubles each attempt (plus ±25% jitter).
+const NYLAS_BACKOFF_BASE_MS = 500;
+// Upper cap for any computed backoff delay, including a Retry-After header value.
+// Prevents a rogue or misbehaving Retry-After from hanging a skill indefinitely.
+// A client with a CallBudget also refuses any delay that outlasts the budget.
+const NYLAS_MAX_BACKOFF_MS = 30_000;
+// How long a folder list is reused. Label, update-folders and read all need one,
+// and folders change rarely. Five minutes covers a triage run's burst of calls.
+// createFolder drops the entry, so a label it creates is seen at once (#2083).
+const FOLDER_CACHE_TTL_MS = 5 * 60_000;
+
+// Folder lists by grant id. Module-level because handlers build a fresh client
+// on every call.
+const folderCache = new Map<string, { folders: NylasFolder[]; expiresAt: number }>();
+
+/** Drop every cached folder list. For tests. */
+export function clearFolderCache(): void {
+  folderCache.clear();
+}
 
 // ── Response types ──────────────────────────────────────────────────────────
 
@@ -39,6 +70,8 @@ export interface NylasMessageFull extends NylasMessageSummary {
 
 export interface NylasDraft {
   id: string;
+  /** Nylas thread id when the draft is threaded; empty for cold compose. */
+  threadId: string;
   subject: string;
   to: NylasParticipant[];
   cc: NylasParticipant[];
@@ -86,6 +119,8 @@ export interface EmailAttachmentMeta {
   contentType: string;
   /** Size in bytes. */
   size: number;
+  /** True when the attachment is a calendar invite payload (ICS / text/calendar). */
+  isCalendarInvite?: boolean;
 }
 
 /**
@@ -106,6 +141,9 @@ export interface ListMessagesOptions {
   unread?: boolean;
   query?: string;
   receivedAfter?: number;
+  /** Inclusive upper bound (Unix seconds). Nylas returns messages with date <= this. Paired with
+   *  receivedAfter, this bounds a sub-window for oldest-first backlog draining (#1431). */
+  receivedBefore?: number;
 }
 
 // Gmail system labels use specific IDs that don't always match the display
@@ -143,59 +181,155 @@ export class NylasApiError extends Error {
 
 export class CeoNylasClient {
   private readonly baseUrl: string;
+  private readonly grantId: string;
   private readonly headers: Record<string, string>;
   private readonly log: Logger;
+  private readonly budget: CallBudget | undefined;
 
-  constructor(apiKey: string, grantId: string, log: Logger) {
+  /**
+   * @param budget  The tool call's time budget. Handlers pass `ctx`. When it runs
+   *                out, the in-flight request is aborted and no further request
+   *                is sent.
+   */
+  constructor(apiKey: string, grantId: string, log: Logger, budget?: CallBudget) {
     this.baseUrl = `${NYLAS_BASE}/${grantId}`;
+    this.grantId = grantId;
     this.headers = {
       Authorization: `Bearer ${apiKey}`,
       Accept: 'application/json',
       'Content-Type': 'application/json',
     };
     this.log = log;
+    this.budget = budget;
   }
 
   // ── Messages ────────────────────────────────────────────────────────────
 
   async listMessages(options: ListMessagesOptions = {}): Promise<NylasMessageSummary[]> {
+    const { messages } = await this.listMessagesPage(options);
+    return messages;
+  }
+
+  // One page of listMessages, plus Nylas's `next_cursor` so callers can keep
+  // paging. A follow-up page re-sends the in/unread/received_* filters with
+  // `page_token`: the cursor does NOT carry them, and a token-only request
+  // pages through the whole mailbox (#2377). A search_query_native follow-up
+  // stays token-only; re-sending filters there is rejected.
+  async listMessagesPage(
+    options: ListMessagesOptions & { pageToken?: string } = {},
+  ): Promise<{ messages: NylasMessageSummary[]; nextCursor?: string }> {
     const params = new URLSearchParams();
-    if (options.limit !== undefined) params.set('limit', String(options.limit));
+    params.set('limit', String(Math.min(options.limit ?? NYLAS_MAX_LIST_LIMIT, NYLAS_MAX_LIST_LIMIT)));
+    if (options.pageToken) {
+      params.set('page_token', options.pageToken);
+    }
     if (options.query) {
-      // Nylas v3: search_query_native cannot be combined with any other filter
-      // param except limit and page_token — sending in/unread/received_after
-      // alongside it returns HTTP 400 "invalid_request_error".
-      if (options.folder || options.unread !== undefined || options.receivedAfter !== undefined) {
-        this.log.warn(
-          { suppressedOptions: { folder: options.folder, unread: options.unread, receivedAfter: options.receivedAfter } },
-          'nylas: listMessages — folder/unread/receivedAfter ignored because search_query_native is set (Nylas v3 limitation)',
-        );
-      }
-      params.set('search_query_native', options.query);
-    } else {
-      if (options.folder) {
-        const normalized = GMAIL_FOLDER_ALIASES[options.folder] ?? options.folder;
-        if (normalized !== options.folder) {
-          this.log.info(
-            { original: options.folder, normalized },
-            'nylas: listMessages — normalized folder alias to Gmail label ID',
+      if (!options.pageToken) {
+        // Nylas v3: search_query_native cannot be combined with any other filter
+        // param except limit and page_token — sending in/unread/received_after
+        // alongside it returns HTTP 400 "invalid_request_error".
+        if (options.folder || options.unread !== undefined || options.receivedAfter !== undefined || options.receivedBefore !== undefined) {
+          this.log.warn(
+            { suppressedOptions: { folder: options.folder, unread: options.unread, receivedAfter: options.receivedAfter, receivedBefore: options.receivedBefore } },
+            'nylas: listMessages — folder/unread/receivedAfter/receivedBefore ignored because search_query_native is set (Nylas v3 limitation)',
           );
         }
-        params.set('in', normalized);
+        params.set('search_query_native', options.query);
       }
-      if (options.unread !== undefined) params.set('unread', String(options.unread));
-      if (options.receivedAfter !== undefined) params.set('received_after', String(options.receivedAfter));
+    } else {
+      this.setMessageFilters(params, options, !options.pageToken);
     }
 
     const url = `${this.baseUrl}/messages?${params}`;
-    const data = await this.request<NylasApiMessage[]>('GET', url, 'listMessages');
+    const { data, nextCursor } = await this.requestWithCursor<NylasApiMessage[]>('GET', url, 'listMessages');
 
-    return data.map(normalizeMessageSummary);
+    return { messages: data.map(normalizeMessageSummary), nextCursor };
+  }
+
+  // The in/unread/received_* filters for a /messages request. Sent on every
+  // page, follow-ups included, because Nylas's cursor does not carry them.
+  private setMessageFilters(
+    params: URLSearchParams,
+    options: ListMessagesOptions,
+    logAlias: boolean,
+  ): void {
+    if (options.folder) {
+      const normalized = GMAIL_FOLDER_ALIASES[options.folder] ?? options.folder;
+      if (logAlias && normalized !== options.folder) {
+        this.log.info(
+          { original: options.folder, normalized },
+          'nylas: listMessages — normalized folder alias to Gmail label ID',
+        );
+      }
+      params.set('in', normalized);
+    }
+    if (options.unread !== undefined) params.set('unread', String(options.unread));
+    if (options.receivedAfter !== undefined) params.set('received_after', String(options.receivedAfter));
+    if (options.receivedBefore !== undefined) params.set('received_before', String(options.receivedBefore));
+  }
+
+  // Exhaustively list messages by following Nylas's `next_cursor`, up to `maxScan`
+  // total messages. Nylas returns messages newest-first, so a single fixed-limit
+  // listMessages() call silently drops everything past the first page — on a busy
+  // Sent folder that means lost observations (issue: #1429 review). This walks all
+  // pages so a watermark-scoped poll actually sees every message in the window.
+  //
+  // Filters (in/unread/received_after/received_before) are re-sent with every
+  // page_token: Nylas's cursor does not carry them, so a token-only follow-up
+  // pages through the whole mailbox (#2377). `truncated` is true when the maxScan
+  // ceiling was hit with more pages still available — callers must NOT treat the
+  // window as fully drained in that case.
+  async listAllMessages(
+    options: ListMessagesOptions & { maxScan?: number } = {},
+  ): Promise<{ messages: NylasMessageSummary[]; truncated: boolean }> {
+    const maxScan = options.maxScan ?? 500;
+    const pageSize = Math.min(options.limit ?? NYLAS_MAX_LIST_LIMIT, NYLAS_MAX_LIST_LIMIT);
+
+    const messages: NylasMessageSummary[] = [];
+    let pageToken: string | undefined;
+    let truncated = false;
+
+    for (;;) {
+      const params = new URLSearchParams();
+      params.set('limit', String(pageSize));
+      if (pageToken) params.set('page_token', pageToken);
+      this.setMessageFilters(params, options, false);
+      const url = `${this.baseUrl}/messages?${params}`;
+
+      const { data, nextCursor } = await this.requestWithCursor<NylasApiMessage[]>(
+        'GET',
+        url,
+        'listAllMessages',
+      );
+      messages.push(...data.map(normalizeMessageSummary));
+
+      // An empty page with a cursor would otherwise spin forever — bail out, but
+      // treat a lingering cursor as truncation so the caller doesn't mistake an
+      // incomplete walk for a fully-drained window.
+      if (data.length === 0) {
+        truncated = Boolean(nextCursor);
+        break;
+      }
+      if (messages.length >= maxScan) {
+        truncated = Boolean(nextCursor);
+        break;
+      }
+      if (!nextCursor) break;
+      pageToken = nextCursor;
+    }
+
+    // slice() defends against a final page overshooting maxScan when maxScan is not a
+    // multiple of pageSize; if it actually trims anything, that's a truncation too even
+    // if the last page carried no cursor.
+    const capped = messages.slice(0, maxScan);
+    return { messages: capped, truncated: truncated || capped.length < messages.length };
   }
 
   async getMessage(messageId: string): Promise<NylasMessageFull> {
     const url = `${this.baseUrl}/messages/${encodeURIComponent(messageId)}`;
-    const data = await this.request<NylasApiMessage>('GET', url, 'getMessage');
+    const data = await this.request<NylasApiMessage>('GET', url, 'getMessage').catch((err: unknown) => {
+      throw markMessageRequestError(err);
+    });
     return normalizeMessageFull(data);
   }
 
@@ -222,6 +356,7 @@ export class CeoNylasClient {
     const data = await this.requestDraft(url, 'createDraftReply', messagePayload, options.attachments);
     return {
       id: data.id,
+      threadId: data.thread_id ?? '',
       subject: data.subject ?? '',
       to: (data.to ?? []).map(normParticipant),
       cc: (data.cc ?? []).map(normParticipant),
@@ -230,7 +365,7 @@ export class CeoNylasClient {
 
   // Create a brand-new draft (cold compose, no reply thread).
   // Unlike createDraftReply, this omits reply_to_message_id so the draft
-  // lands in the CEO's Drafts folder as a fresh outbound email.
+  // lands in the principal's Drafts folder as a fresh outbound email.
   async createDraft(options: {
     subject: string;
     body: string;
@@ -250,6 +385,7 @@ export class CeoNylasClient {
     const data = await this.requestDraft(url, 'createDraft', messagePayload, options.attachments);
     return {
       id: data.id,
+      threadId: data.thread_id ?? '',
       subject: data.subject ?? '',
       to: (data.to ?? []).map(normParticipant),
       cc: (data.cc ?? []).map(normParticipant),
@@ -263,7 +399,7 @@ export class CeoNylasClient {
   // filter here — callers must not apply inbox watermarks to drafts.
   async listDrafts(options: { limit?: number } = {}): Promise<NylasDraftSummary[]> {
     const params = new URLSearchParams();
-    if (options.limit !== undefined) params.set('limit', String(options.limit));
+    params.set('limit', String(Math.min(options.limit ?? NYLAS_MAX_LIST_LIMIT, NYLAS_MAX_LIST_LIMIT)));
     const url = `${this.baseUrl}/drafts?${params}`;
     const data = await this.request<NylasApiDraftFull[]>('GET', url, 'listDrafts');
     return data.map(normalizeDraftSummary);
@@ -276,10 +412,15 @@ export class CeoNylasClient {
   // draft doesn't exist" failure this work is fixing (issue #1000). `truncated`
   // is true when the ceiling was hit with more pages still available.
   async listAllDrafts(
-    options: { maxScan?: number; pageSize?: number } = {},
+    options: {
+      maxScan?: number;
+      pageSize?: number;
+      /** Return after the page that contains a matching draft. The match is included. */
+      stopWhen?: (draft: NylasDraftSummary) => boolean;
+    } = {},
   ): Promise<{ drafts: NylasDraftSummary[]; truncated: boolean }> {
     const maxScan = options.maxScan ?? 500;
-    const pageSize = options.pageSize ?? 100;
+    const pageSize = Math.min(options.pageSize ?? NYLAS_MAX_LIST_LIMIT, NYLAS_MAX_LIST_LIMIT);
 
     const drafts: NylasDraftSummary[] = [];
     let pageToken: string | undefined;
@@ -292,7 +433,16 @@ export class CeoNylasClient {
       const url = `${this.baseUrl}/drafts?${params}`;
 
       const { data, nextCursor } = await this.requestWithCursor<NylasApiDraftFull[]>('GET', url, 'listAllDrafts');
+      const pageStart = drafts.length;
       drafts.push(...data.map(normalizeDraftSummary));
+
+      // Stop on the page that contains the caller's match so a thread lookup
+      // does not scan the rest of the mailbox. truncated stays false: the match
+      // was found, the unread remainder was not a ceiling hit.
+      const stopWhen = options.stopWhen;
+      if (stopWhen && drafts.slice(pageStart).some((draft) => stopWhen(draft))) {
+        return { drafts, truncated: false };
+      }
 
       // An empty page with a cursor would otherwise spin forever — bail out.
       if (data.length === 0) break;
@@ -316,7 +466,7 @@ export class CeoNylasClient {
 
   // Update an existing draft (PUT /drafts/{id}). Only the provided fields are
   // sent; omitted fields are preserved server-side. This is the capability that
-  // lets the CEO fix a wrong-recipient or wrong-body draft without recreating it.
+  // lets the principal fix a wrong-recipient or wrong-body draft without recreating it.
   async updateDraft(draftId: string, updates: UpdateDraftOptions): Promise<NylasDraftFull> {
     const url = `${this.baseUrl}/drafts/${encodeURIComponent(draftId)}`;
     const payload: Record<string, unknown> = {};
@@ -332,12 +482,16 @@ export class CeoNylasClient {
 
   async markAsRead(messageId: string): Promise<void> {
     const url = `${this.baseUrl}/messages/${encodeURIComponent(messageId)}`;
-    await this.request<NylasApiMessage>('PUT', url, 'markAsRead', { unread: false });
+    await this.request<NylasApiMessage>('PUT', url, 'markAsRead', { unread: false }).catch((err: unknown) => {
+      throw markMessageRequestError(err);
+    });
   }
 
   async markAsStarred(messageId: string, starred = true): Promise<void> {
     const url = `${this.baseUrl}/messages/${encodeURIComponent(messageId)}`;
-    await this.request<NylasApiMessage>('PUT', url, 'markAsStarred', { starred });
+    await this.request<NylasApiMessage>('PUT', url, 'markAsStarred', { starred }).catch((err: unknown) => {
+      throw markMessageRequestError(err);
+    });
   }
 
   async updateMessageFolders(
@@ -346,22 +500,56 @@ export class CeoNylasClient {
   ): Promise<{ id: string; folders: string[] }> {
     const url = `${this.baseUrl}/messages/${encodeURIComponent(messageId)}`;
     const payload = { folders };
-    const data = await this.request<NylasApiMessage>('PUT', url, 'updateMessageFolders', payload);
+    const data = await this.request<NylasApiMessage>('PUT', url, 'updateMessageFolders', payload).catch(
+      (err: unknown) => {
+        throw markMessageRequestError(err);
+      },
+    );
     return { id: data.id, folders: data.folders ?? [] };
   }
 
   // ── Folders ─────────────────────────────────────────────────────────────
 
+  // Cached per grant for FOLDER_CACHE_TTL_MS. Returns a copy, so a caller that
+  // edits the array cannot change what the next caller sees.
   async listFolders(): Promise<NylasFolder[]> {
-    const url = `${this.baseUrl}/folders`;
-    const data = await this.request<NylasApiFolder[]>('GET', url, 'listFolders');
-    return data.map((f) => ({ id: f.id, name: f.name ?? '' }));
+    const cached = folderCache.get(this.grantId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return [...cached.folders];
+    }
+
+    const folders: NylasFolder[] = [];
+    let pageToken: string | undefined;
+
+    for (;;) {
+      const params = new URLSearchParams();
+      params.set('limit', String(NYLAS_MAX_LIST_LIMIT));
+      if (pageToken) params.set('page_token', pageToken);
+      const url = `${this.baseUrl}/folders?${params}`;
+      const { data, nextCursor } = await this.requestWithCursor<NylasApiFolder[]>('GET', url, 'listFolders');
+      folders.push(...data.map((f) => ({ id: f.id, name: f.name ?? '' })));
+
+      // An empty page with a cursor would otherwise spin forever.
+      if (data.length === 0 || !nextCursor) break;
+      if (folders.length >= FOLDER_SCAN_LIMIT) {
+        this.log.warn(
+          { cap: FOLDER_SCAN_LIMIT },
+          'nylas: listFolders hit the scan cap with more pages remaining',
+        );
+        break;
+      }
+      pageToken = nextCursor;
+    }
+
+    folderCache.set(this.grantId, { folders, expiresAt: Date.now() + FOLDER_CACHE_TTL_MS });
+    return [...folders];
   }
 
   async createFolder(name: string): Promise<NylasFolder> {
     const url = `${this.baseUrl}/folders`;
     const payload = { name };
     const data = await this.request<NylasApiFolder>('POST', url, 'createFolder', payload);
+    folderCache.delete(this.grantId);
     return { id: data.id, name: data.name ?? name };
   }
 
@@ -378,6 +566,7 @@ export class CeoNylasClient {
   async downloadAttachment(attachmentId: string, messageId: string): Promise<Buffer> {
     const url = `${this.baseUrl}/attachments/${encodeURIComponent(attachmentId)}/download?message_id=${encodeURIComponent(messageId)}`;
     this.log.debug({ operation: 'downloadAttachment' }, 'nylas: downloadAttachment');
+    this.throwIfCancelled('downloadAttachment');
 
     let res: Response;
     try {
@@ -390,8 +579,10 @@ export class CeoNylasClient {
           Authorization: this.headers.Authorization!,
           Accept: 'application/octet-stream',
         },
+        signal: this.budget?.signal,
       });
     } catch (err) {
+      this.throwIfCancelled('downloadAttachment');
       this.log.error({ err }, 'nylas: downloadAttachment fetch failed');
       throw new NylasApiError(0, 'downloadAttachment', `Fetch failed: ${String(err)}`);
     }
@@ -465,10 +656,17 @@ export class CeoNylasClient {
 
     // Omit Content-Type — fetch sets it automatically with the multipart boundary.
     const { 'Content-Type': _ct, ...headersWithoutContentType } = this.headers;
+    this.throwIfCancelled(operation);
     let res: Response;
     try {
-      res = await fetch(url, { method: 'POST', headers: headersWithoutContentType, body: form });
+      res = await fetch(url, {
+        method: 'POST',
+        headers: headersWithoutContentType,
+        body: form,
+        signal: this.budget?.signal,
+      });
     } catch (err) {
+      this.throwIfCancelled(operation);
       this.log.error({ err, operation }, `nylas: ${operation} fetch failed`);
       throw new NylasApiError(0, operation, `Fetch failed: ${String(err)}`);
     }
@@ -495,6 +693,19 @@ export class CeoNylasClient {
 
   // Same as request<T>, but also surfaces Nylas's `next_cursor` for paginated
   // list endpoints. request<T> delegates here and drops the cursor.
+  //
+  // 429 is retried regardless of HTTP method (the request was rejected before
+  // processing, so there's no duplicate-action risk). 5xx is retried only for
+  // GET — POST/PUT mutations may have been processed before the gateway returned
+  // 502/503, so retrying them risks duplicate sends or double-writes.
+  //
+  // Backoff honors the Retry-After header (capped at NYLAS_MAX_BACKOFF_MS) and
+  // falls back to exponential + ±25% jitter. After NYLAS_MAX_RETRIES attempts,
+  // a typed NylasApiError is thrown with an explicit message so downstream
+  // agents never misread a rate-limit as an auth/credential failure.
+  //
+  // With a budget, a delay that would end after the deadline is not slept: the
+  // call fails at once with the same status, marked transient (#2083).
   private async requestWithCursor<T>(
     method: string,
     url: string,
@@ -503,27 +714,129 @@ export class CeoNylasClient {
   ): Promise<{ data: T; nextCursor?: string }> {
     this.log.debug({ operation, method }, `nylas: ${operation}`);
 
-    const init: RequestInit = { method, headers: this.headers };
+    const init: RequestInit = { method, headers: this.headers, signal: this.budget?.signal };
     if (body !== undefined) {
       init.body = JSON.stringify(body);
     }
 
-    let res: Response;
-    try {
-      res = await fetch(url, init);
-    } catch (err) {
-      this.log.error({ err, operation }, `nylas: ${operation} fetch failed`);
-      throw new NylasApiError(0, operation, `Fetch failed: ${String(err)}`);
-    }
+    const isGet = method.toUpperCase() === 'GET';
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '(unreadable body)');
-      this.log.error({ status: res.status, operation }, `nylas: ${operation} API error`);
-      throw new NylasApiError(res.status, operation, `Nylas ${operation}: HTTP ${res.status} — ${text}`);
-    }
+    let attempt = 0;
+    for (;;) {
+      this.throwIfCancelled(operation);
+      let res: Response;
+      try {
+        res = await fetch(url, init);
+      } catch (err) {
+        this.throwIfCancelled(operation);
+        this.log.error({ err, operation }, `nylas: ${operation} fetch failed`);
+        throw new NylasApiError(0, operation, `Fetch failed: ${String(err)}`);
+      }
 
-    const json = (await res.json()) as { data: T; next_cursor?: string };
-    return { data: json.data, nextCursor: json.next_cursor };
+      // 429 is always retriable (rejected before processing). 5xx only on GET
+      // (POST/PUT may have been processed before the gateway returned 5xx).
+      const isRetriable = res.status === 429 || (res.status >= 500 && isGet);
+      if (isRetriable && attempt < NYLAS_MAX_RETRIES) {
+        // Discard the body to release the connection slot before sleeping.
+        await res.body?.cancel();
+
+        const retryAfterRaw = res.headers.get('Retry-After');
+        const retryAfterSeconds = retryAfterRaw !== null ? Number(retryAfterRaw) : NaN;
+        let baseDelayMs: number;
+        if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+          baseDelayMs = retryAfterSeconds * 1000;
+          if (baseDelayMs > NYLAS_MAX_BACKOFF_MS) {
+            this.log.warn(
+              { retryAfterSeconds, operation },
+              `nylas: Retry-After exceeds cap — clamping to ${NYLAS_MAX_BACKOFF_MS}ms`,
+            );
+            baseDelayMs = NYLAS_MAX_BACKOFF_MS;
+          }
+        } else {
+          if (retryAfterRaw !== null) {
+            // Header present but not a plain-integer delta-seconds value (e.g. HTTP-date
+            // format). Log it and fall back to exponential backoff.
+            this.log.warn({ retryAfterRaw, operation }, 'nylas: unparseable Retry-After header — using backoff');
+          }
+          baseDelayMs = Math.min(NYLAS_BACKOFF_BASE_MS * 2 ** attempt, NYLAS_MAX_BACKOFF_MS);
+        }
+        // ±25% jitter to spread concurrent retries from multiple ceo-inbox skills.
+        const delayMs = Math.round(baseDelayMs * (0.75 + Math.random() * 0.5));
+        const leftMs = remainingMs(this.budget);
+        if (delayMs >= leftMs) {
+          this.log.warn(
+            { status: res.status, operation, attempt, delayMs, leftMs },
+            `nylas: ${operation} transient error — retry delay outlasts the call's budget, failing fast`,
+          );
+          const what = res.status === 429 ? 'rate limited (HTTP 429)' : `HTTP ${res.status}`;
+          throw new NylasApiError(
+            res.status,
+            operation,
+            `Nylas ${operation}: ${what}. The retry wait (${delayMs}ms) is longer than the ` +
+              `${Math.max(0, leftMs)}ms this call has left. Transient, not an auth/credential failure: retry shortly.`,
+          );
+        }
+        this.log.warn(
+          { status: res.status, operation, attempt, delayMs },
+          `nylas: ${operation} transient error — retrying after ${delayMs}ms`,
+        );
+        await this.sleep(delayMs);
+        attempt++;
+        continue;
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '(unreadable body)');
+        if (res.status === 429) {
+          // Retries exhausted on a rate-limit. Throw a message that unambiguously
+          // identifies this as transient congestion, not an auth/credential problem,
+          // so agents cannot misnarrate it as "OAuth token expired."
+          this.log.error(
+            { status: 429, operation, totalAttempts: attempt + 1 },
+            `nylas: ${operation} rate limited — retries exhausted`,
+          );
+          throw new NylasApiError(
+            429,
+            operation,
+            `Nylas ${operation}: rate limited (HTTP 429) — transient, not an auth/credential failure. ${text}`,
+          );
+        }
+        this.log.error({ status: res.status, operation, totalAttempts: attempt + 1 }, `nylas: ${operation} API error`);
+        throw new NylasApiError(res.status, operation, `Nylas ${operation}: HTTP ${res.status} — ${text}`);
+      }
+
+      const json = (await res.json()) as { data?: T; next_cursor?: string } | null;
+      if (json == null || json.data === undefined) {
+        this.log.error({ status: res.status, operation }, `nylas: ${operation} response missing data envelope`);
+        throw new NylasApiError(res.status, operation, `Nylas ${operation}: response missing data envelope`);
+      }
+      return { data: json.data, nextCursor: json.next_cursor };
+    }
+  }
+
+  // Refuse to send once the tool call has timed out. The execution layer has
+  // given up on the call, so a request sent now is a write nobody waits for.
+  private throwIfCancelled(operation: string): void {
+    if (budgetExpired(this.budget)) {
+      this.log.warn({ operation }, `nylas: ${operation} cancelled — the tool call timed out`);
+      throw new NylasApiError(0, operation, `Nylas ${operation}: cancelled because the tool call timed out`);
+    }
+  }
+
+  // A backoff sleep that ends early when the tool call times out. The caller's
+  // next throwIfCancelled() then stops the retry.
+  private sleep(ms: number): Promise<void> {
+    const signal = this.budget?.signal;
+    if (signal?.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      signal?.addEventListener('abort', done, { once: true });
+    });
   }
 }
 
@@ -554,6 +867,7 @@ interface NylasApiMessage {
 
 interface NylasApiDraft {
   id: string;
+  thread_id?: string;
   subject?: string;
   to?: NylasApiParticipant[];
   cc?: NylasApiParticipant[];
@@ -611,7 +925,17 @@ function normalizeAttachments(raw?: NylasApiAttachment[]): EmailAttachmentMeta[]
       filename: a.filename ?? 'unnamed',
       contentType: a.content_type,
       size: a.size ?? 0,
+      ...(isCalendarInviteAttachment(a.filename, a.content_type) ? { isCalendarInvite: true } : {}),
     }));
+}
+
+function isCalendarInviteAttachment(filename: string | undefined, contentType: string | undefined): boolean {
+  const lowerType = (contentType?.split(';', 1)[0] ?? '').trim().toLowerCase();
+  const lowerName = filename?.toLowerCase() ?? '';
+  return lowerType === 'text/calendar' ||
+    lowerType === 'application/ics' ||
+    lowerType === 'text/x-vcalendar' ||
+    lowerName.endsWith('.ics');
 }
 
 function normalizeMessageSummary(msg: NylasApiMessage): NylasMessageSummary {
@@ -659,6 +983,25 @@ function normalizeMessageFull(msg: NylasApiMessage): NylasMessageFull {
     bcc: (msg.bcc ?? []).map(normParticipant),
     body: msg.body ?? '',
     labels: msg.labels ?? msg.folders ?? [],
+  };
+}
+
+/**
+ * The subject and sender of a message, for tools that report what they touched. The
+ * spot-check pool (#2159) shows these to the principal so a triage sample is gradable.
+ * The sender renders as "Name (email)", or just the email when there is no display name;
+ * a missing or empty part is left out so callers can spread the result into their output.
+ * Not "Name <email>": every skill result passes through sanitizeObjectOutput, which strips
+ * "<...>" as a tag, so the address would never reach the agent or the digest.
+ */
+export function describeMessage(msg: Pick<NylasMessageSummary, 'subject' | 'from'>): { subject?: string; from?: string } {
+  const sender = msg.from[0];
+  const from = sender
+    ? (sender.name?.trim() ? `${sender.name.trim()} (${sender.email})` : sender.email)
+    : '';
+  return {
+    ...(msg.subject ? { subject: msg.subject } : {}),
+    ...(from ? { from } : {}),
   };
 }
 

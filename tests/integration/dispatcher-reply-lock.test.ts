@@ -1,7 +1,7 @@
 /**
  * Integration tests for the dispatcher reply-lock feature (#847).
  *
- * These tests exercise the full in-process flow: skill.result fires → reply-lock
+ * These tests exercise the full in-process flow: tool.result fires → reply-lock
  * flag is set on the routing entry → handleAgentResponse sees the flag and
  * suppresses the duplicate outbound.message.
  *
@@ -14,12 +14,14 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+import type { TaskOriginator } from '../../src/contacts/types.js';
 import { Dispatcher } from '../../src/dispatch/dispatcher.js';
 import type { EventBus } from '../../src/bus/bus.js';
 import type { Logger } from '../../src/logger.js';
+import { BullpenService } from '../../src/memory/bullpen.js';
 import {
   createAgentResponse,
-  createSkillResult,
+  createToolResult,
   type BusEvent,
   type OutboundMessageEvent,
   type OutboundSuppressedDuplicateEvent,
@@ -55,7 +57,7 @@ function makeStubs() {
   return { dispatcher, publishedEvents, subscribeHandlers };
 }
 
-/** Seeds the routing map (without humanReplySent so handleSkillResult must set it). */
+/** Seeds the routing map (without humanReplySent so handleToolResult must set it). */
 function seedRouting(
   dispatcher: Dispatcher,
   taskEventId: string,
@@ -74,32 +76,32 @@ function seedRouting(
   });
 }
 
-async function fireSkillResult(
+async function fireToolResult(
   subscribeHandlers: Map<string, (event: BusEvent) => void | Promise<void>>,
   {
     agentId,
     conversationId,
-    skillName,
+    toolName,
     to,
     invokeEventId = 'invoke-1',
   }: {
     agentId: string;
     conversationId: string;
-    skillName: string;
+    toolName: string;
     to: string;
     invokeEventId?: string;
   },
 ) {
-  const event = createSkillResult({
+  const event = createToolResult({
     agentId,
     conversationId,
-    skillName,
+    toolName,
     result: { success: true, data: { message_id: 'msg-1', to, subject: 'Re: Test' } },
     durationMs: 100,
     parentEventId: invokeEventId,
   });
-  const handler = subscribeHandlers.get('skill.result');
-  if (!handler) throw new Error('No skill.result handler registered');
+  const handler = subscribeHandlers.get('tool.result');
+  if (!handler) throw new Error('No tool.result handler registered');
   await handler(event);
 }
 
@@ -128,11 +130,11 @@ describe('Dispatcher reply-lock — integration', () => {
         senderId: 'client@example.com',
       });
 
-      // Coordinator called email-reply — skill.result fires before agent.response
-      await fireSkillResult(subscribeHandlers, {
+      // Coordinator called email-reply — tool.result fires before agent.response
+      await fireToolResult(subscribeHandlers, {
         agentId: 'coordinator',
         conversationId: 'email:thread-abc',
-        skillName: 'email-reply',
+        toolName: 'email-reply',
         to: 'client@example.com',
       });
 
@@ -157,16 +159,16 @@ describe('Dispatcher reply-lock — integration', () => {
       });
 
       // email-reply failed — should not trigger reply-lock
-      const failEvent = createSkillResult({
+      const failEvent = createToolResult({
         agentId: 'coordinator',
         conversationId: 'email:conv-fail',
-        skillName: 'email-reply',
+        toolName: 'email-reply',
         result: { success: false, error: 'Gateway rejected' },
         durationMs: 50,
         parentEventId: 'invoke-fail',
       });
-      const skillHandler = subscribeHandlers.get('skill.result');
-      if (!skillHandler) throw new Error('No skill.result handler registered');
+      const skillHandler = subscribeHandlers.get('tool.result');
+      if (!skillHandler) throw new Error('No tool.result handler registered');
       await skillHandler(failEvent);
 
       await fireAgentResponse(subscribeHandlers, {
@@ -188,10 +190,10 @@ describe('Dispatcher reply-lock — integration', () => {
       });
 
       // email-reply in a DIFFERENT conversation — should not affect this routing entry
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'coordinator',
         conversationId: 'email:thread-different',
-        skillName: 'email-reply',
+        toolName: 'email-reply',
         to: 'client@example.com',
       });
 
@@ -214,10 +216,10 @@ describe('Dispatcher reply-lock — integration', () => {
       });
 
       // email-reply to a different person in the same conversation
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'coordinator',
         conversationId: 'email:thread-abc',
-        skillName: 'email-reply',
+        toolName: 'email-reply',
         to: 'someone-else@example.com',
       });
 
@@ -240,10 +242,10 @@ describe('Dispatcher reply-lock — integration', () => {
         senderId: 'client@example.com',
       });
 
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'coordinator',
         conversationId: 'email:thread-send',
-        skillName: 'email-send',
+        toolName: 'email-send',
         to: 'client@example.com',
       });
 
@@ -267,10 +269,10 @@ describe('Dispatcher reply-lock — integration', () => {
         senderId: 'client@example.com',
       });
 
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'coordinator',
         conversationId: 'email:thread-multi',
-        skillName: 'email-send',
+        toolName: 'email-send',
         // Simulate email-send returning comma-joined recipients
         to: 'client@example.com, ops@example.com',
       });
@@ -296,12 +298,12 @@ describe('Dispatcher reply-lock — integration', () => {
         senderId: 'reconciliation@client.com',
       });
 
-      // T2125 specialist calls email-reply — skill.result fires with specialist agentId
+      // T2125 specialist calls email-reply — tool.result fires with specialist agentId
       // but same conversationId as the coordinator's routing entry
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'T2125-expense-tracker',
         conversationId: 'email:reconciliation-thread',
-        skillName: 'email-reply',
+        toolName: 'email-reply',
         to: 'reconciliation@client.com',
       });
 
@@ -338,10 +340,10 @@ describe('Dispatcher reply-lock — integration', () => {
       });
 
       // Specialist fires email-reply for conv-A only
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'specialist',
         conversationId: 'email:conv-A',
-        skillName: 'email-reply',
+        toolName: 'email-reply',
         to: 'alice@example.com',
       });
 
@@ -374,7 +376,7 @@ describe('Dispatcher reply-lock — integration', () => {
         senderId: 'user@example.com',
       });
 
-      // No skill.result fires — coordinator responds via agent.response only
+      // No tool.result fires — coordinator responds via agent.response only
       await fireAgentResponse(subscribeHandlers, {
         taskEventId: 'task-normal',
         conversationId: 'email:thread-normal',
@@ -393,10 +395,10 @@ describe('Dispatcher reply-lock — integration', () => {
         senderId: 'user@example.com',
       });
 
-      await fireSkillResult(subscribeHandlers, {
+      await fireToolResult(subscribeHandlers, {
         agentId: 'coordinator',
         conversationId: 'email:thread-cal',
-        skillName: 'list-calendar',
+        toolName: 'list-calendar',
         to: 'user@example.com',
       });
 
@@ -408,5 +410,213 @@ describe('Dispatcher reply-lock — integration', () => {
       expect(publishedEvents.filter(isOutboundMessage)).toHaveLength(1);
       expect(publishedEvents.filter(isOutboundSuppressedDuplicate)).toHaveLength(0);
     });
+  });
+});
+
+describe('Dispatcher reply-lock — delegated Signal send (#1860)', () => {
+  it('keeps the coordinator narration off Signal and files it on the bullpen', async () => {
+    const publishedEvents: BusEvent[] = [];
+    const subscribeHandlers = new Map<string, (event: BusEvent) => void | Promise<void>>();
+    const bus = {
+      subscribe: vi.fn((eventType: string, _layer: string, handler: (e: BusEvent) => void | Promise<void>) => {
+        subscribeHandlers.set(eventType, handler);
+      }),
+      publish: vi.fn(async (_layer: string, event: BusEvent) => {
+        publishedEvents.push(event);
+      }),
+    } as unknown as EventBus;
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+    const bullpen = BullpenService.createInMemory();
+    const openThread = vi.spyOn(bullpen, 'openThread');
+    const dispatcher = new Dispatcher({ bus, logger, bullpenService: bullpen });
+    dispatcher.register();
+
+    seedRouting(dispatcher, 'task-signal', {
+      conversationId: 'signal:+15551212',
+      senderId: '+15551212',
+    });
+
+    const toolHandler = subscribeHandlers.get('tool.result');
+    if (!toolHandler) throw new Error('No tool.result handler registered');
+    await toolHandler(createToolResult({
+      agentId: 'social-media',
+      conversationId: 'delegate-abc',
+      originConversationId: 'signal:+15551212',
+      toolName: 'signal-send',
+      result: { success: true, data: { delivered_to: '+15551212', channel: 'signal' } },
+      durationMs: 20,
+      parentEventId: 'invoke-signal',
+    }));
+
+    const narration = 'Sent, boss. Trimmed k8m5 is on Signal for your call.';
+    const responseHandler = subscribeHandlers.get('agent.response');
+    if (!responseHandler) throw new Error('No agent.response handler registered');
+    const response = createAgentResponse({
+      agentId: 'coordinator',
+      conversationId: 'signal:+15551212',
+      content: narration,
+      parentEventId: 'task-signal',
+    });
+    await responseHandler(response);
+
+    expect(publishedEvents.filter(isOutboundMessage)).toHaveLength(0);
+    expect(publishedEvents.filter(isOutboundSuppressedDuplicate)).toHaveLength(1);
+    expect(openThread).toHaveBeenCalledTimes(1);
+    const opened = await openThread.mock.results[0]!.value as { thread: { id: string; status: string } };
+    const stored = await bullpen.getThread(opened.thread.id);
+    expect(stored?.thread.status).toBe('closed');
+    expect(stored?.messages[0]?.content).toContain(narration);
+    expect(stored?.thread.participants).toEqual(['coordinator']);
+  });
+
+  it('does not lock when the specialist texted someone else', async () => {
+    const { dispatcher, subscribeHandlers, publishedEvents } = makeStubs();
+    dispatcher.register();
+    seedRouting(dispatcher, 'task-signal-other', {
+      conversationId: 'signal:+15551212',
+      senderId: '+15551212',
+    });
+
+    const toolHandler = subscribeHandlers.get('tool.result');
+    if (!toolHandler) throw new Error('No tool.result handler registered');
+    await toolHandler(createToolResult({
+      agentId: 'social-media',
+      conversationId: 'delegate-xyz',
+      originConversationId: 'signal:+15551212',
+      toolName: 'signal-send',
+      result: { success: true, data: { delivered_to: '+19998888', channel: 'signal' } },
+      durationMs: 20,
+      parentEventId: 'invoke-other',
+    }));
+
+    await fireAgentResponse(subscribeHandlers, {
+      taskEventId: 'task-signal-other',
+      conversationId: 'signal:+15551212',
+    });
+
+    expect(publishedEvents.filter(isOutboundMessage)).toHaveLength(1);
+    expect(publishedEvents.filter(isOutboundSuppressedDuplicate)).toHaveLength(0);
+  });
+
+  it('locks only the task that sent, not another task in the same conversation', async () => {
+    const { dispatcher, subscribeHandlers, publishedEvents } = makeStubs();
+    dispatcher.register();
+    seedRouting(dispatcher, 'task-a', { conversationId: 'signal:+15551212', senderId: '+15551212' });
+    seedRouting(dispatcher, 'task-b', { conversationId: 'signal:+15551212', senderId: '+15551212' });
+
+    const toolHandler = subscribeHandlers.get('tool.result');
+    if (!toolHandler) throw new Error('No tool.result handler registered');
+    await toolHandler(createToolResult({
+      agentId: 'social-media',
+      conversationId: 'delegate-abc',
+      originConversationId: 'signal:+15551212',
+      routingTaskId: 'task-a',
+      toolName: 'signal-send',
+      result: { success: true, data: { delivered_to: '+15551212', channel: 'signal' } },
+      durationMs: 10,
+      parentEventId: 'invoke-a',
+    }));
+
+    await fireAgentResponse(subscribeHandlers, {
+      taskEventId: 'task-a',
+      conversationId: 'signal:+15551212',
+    });
+    await fireAgentResponse(subscribeHandlers, {
+      taskEventId: 'task-b',
+      conversationId: 'signal:+15551212',
+    });
+
+    expect(publishedEvents.filter(isOutboundSuppressedDuplicate)).toHaveLength(1);
+    expect(publishedEvents.filter(isOutboundMessage)).toHaveLength(1);
+  });
+
+  it('locks an email task when Signal reaches another verified identity of that contact', async () => {
+    const publishedEvents: BusEvent[] = [];
+    const subscribeHandlers = new Map<string, (event: BusEvent) => void | Promise<void>>();
+    const bus = {
+      subscribe: vi.fn((eventType: string, _layer: string, handler: (e: BusEvent) => void | Promise<void>) => {
+        subscribeHandlers.set(eventType, handler);
+      }),
+      publish: vi.fn(async (_layer: string, event: BusEvent) => {
+        publishedEvents.push(event);
+      }),
+    } as unknown as EventBus;
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+    const contactService = {
+      getIdentitiesForContact: vi.fn(async () => [
+        { verified: true, status: 'active', channelIdentifier: '+15551212' },
+        { verified: false, status: 'active', channelIdentifier: '+15559999' },
+      ]),
+    };
+    const dispatcher = new Dispatcher({
+      bus,
+      logger,
+      contactService: contactService as unknown as ConstructorParameters<typeof Dispatcher>[0]['contactService'],
+    });
+    dispatcher.register();
+    seedRouting(dispatcher, 'task-email', {
+      conversationId: 'email:thread-1',
+      senderId: 'ceo@example.com',
+    });
+    (dispatcher as unknown as {
+      taskRouting: Map<string, { originator?: TaskOriginator }>;
+    }).taskRouting.get('task-email')!.originator = {
+      contactId: 'ceo',
+      systemRole: 'principal',
+      channel: 'email',
+      initiatedAt: 't',
+      // Principal tier lets Gate C allow the relay. Without it the missing-tier
+      // fail-closed path withholds outbound.message before reply-lock is observable.
+      tier: 'principal',
+    };
+
+    const toolHandler = subscribeHandlers.get('tool.result');
+    if (!toolHandler) throw new Error('No tool.result handler registered');
+    await toolHandler(createToolResult({
+      agentId: 'social-media',
+      conversationId: 'delegate-cross',
+      originConversationId: 'email:thread-1',
+      routingTaskId: 'task-email',
+      toolName: 'signal-send',
+      result: { success: true, data: { delivered_to: '+15551212', channel: 'signal' } },
+      durationMs: 10,
+      parentEventId: 'invoke-cross',
+    }));
+    await fireAgentResponse(subscribeHandlers, {
+      taskEventId: 'task-email',
+      conversationId: 'email:thread-1',
+    });
+    expect(publishedEvents.filter(isOutboundSuppressedDuplicate)).toHaveLength(1);
+    expect(publishedEvents.filter(isOutboundMessage)).toHaveLength(0);
+
+    seedRouting(dispatcher, 'task-email-other', {
+      conversationId: 'email:thread-1',
+      senderId: 'ceo@example.com',
+    });
+    (dispatcher as unknown as {
+      taskRouting: Map<string, { originator?: TaskOriginator }>;
+    }).taskRouting.get('task-email-other')!.originator = {
+      contactId: 'ceo',
+      systemRole: 'principal',
+      channel: 'email',
+      initiatedAt: 't',
+      tier: 'principal',
+    };
+    await toolHandler(createToolResult({
+      agentId: 'social-media',
+      conversationId: 'delegate-unverified',
+      originConversationId: 'email:thread-1',
+      routingTaskId: 'task-email-other',
+      toolName: 'signal-send',
+      result: { success: true, data: { delivered_to: '+15559999', channel: 'signal' } },
+      durationMs: 10,
+      parentEventId: 'invoke-unverified',
+    }));
+    await fireAgentResponse(subscribeHandlers, {
+      taskEventId: 'task-email-other',
+      conversationId: 'email:thread-1',
+    });
+    expect(publishedEvents.filter(isOutboundSuppressedDuplicate)).toHaveLength(1);
+    expect(publishedEvents.filter(isOutboundMessage)).toHaveLength(1);
   });
 });

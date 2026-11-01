@@ -18,8 +18,20 @@
 // callers (ContactService, EntityMemory) call after mutations.
 //
 // assembleMany() wraps each per-ID call in its own try/catch so that a DB error
-// on one entity doesn't abort the entire batch — failed IDs are logged and placed
-// in the `unresolved` array rather than propagating.
+// on one entity doesn't abort the entire batch — errored IDs are logged and placed
+// in the `failed` array rather than propagating.
+//
+// Misses are reported in three separate buckets, because they mean different things
+// (#1694 / ADR-040, #1702, #1707):
+//   unresolved — the ID matched no contact and no live KG node.
+//   nodeless   — the ID matched a real contact that cannot carry context. Either it
+//                never had a KG node (`cause: 'missing'`), or its node was archived
+//                (`cause: 'archived'`) — decay retirement, or contact deletion under
+//                ADR-040. Both are structurally unable to carry facts, relationships,
+//                or context. Collapsing either into `unresolved` made an agent read
+//                "cannot hold knowledge" as "we know nothing about them".
+//   failed     — assembly threw. Classified as retryable or not; never evidence the
+//                contact is unknown (#1702).
 
 import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
@@ -34,6 +46,53 @@ interface CacheEntry {
   context: EntityContext;
   expiresAt: number;
 }
+
+/** Why a real contact cannot carry context. */
+export type NodelessCause = 'missing' | 'archived';
+
+/** A contact that exists but cannot carry context. */
+export interface NodelessContact {
+  /** The string the caller passed in (contact UUID or email), so it can correlate results. */
+  inputId: string;
+  contactId: string;
+  displayName: string;
+  /**
+   * `missing` — `kg_node_id` is NULL; the contact never had a stored profile.
+   * `archived` — `kg_node_id` points at a node with `archived_at` set; the profile
+   * was retired (dream-engine decay, or contact deletion under ADR-040).
+   */
+  cause: NodelessCause;
+}
+
+/** An ID whose assembly threw — classified for retry, not a miss. */
+export interface AssembleManyFailedEntry {
+  /** The string the caller passed in (contact UUID, KG node ID, or email). */
+  inputId: string;
+  /** True when the error is likely transient (timeout, connection limit, reset). */
+  retryable: boolean;
+}
+
+export interface AssembleManyResult {
+  entities: EntityContext[];
+  /** IDs that matched no contact and no KG node. */
+  unresolved: string[];
+  /** Contacts that exist but cannot hold knowledge (no node, or archived node). Disjoint from `unresolved`. */
+  nodeless: NodelessContact[];
+  /** IDs whose assembly errored. Disjoint from `unresolved` and `nodeless`. */
+  failed: AssembleManyFailedEntry[];
+}
+
+/** Outcome of resolving a caller-supplied ID to something assemblable. */
+type ResolvedInput =
+  | { kind: 'node'; kgNodeId: string }
+  | { kind: 'nodeless'; contactId: string; displayName: string; cause: NodelessCause }
+  | { kind: 'unknown' };
+
+/** Outcome of a single assembly attempt, with the reason for a miss preserved. */
+type AssembleOutcome =
+  | { kind: 'assembled'; context: EntityContext }
+  | { kind: 'nodeless'; entry: NodelessContact }
+  | { kind: 'unknown' };
 
 /**
  * Assembles EntityContext payloads from the database.
@@ -53,12 +112,14 @@ export class EntityContextAssembler {
    * Resolve one or more IDs to EntityContext payloads.
    *
    * Resolution priority for each ID:
-   *   1. Matches a contacts.id → look up kg_node_id, assemble from that KG node
-   *   2. Matches a kg_nodes.id directly → assemble from that KG node
-   *   3. No match → included in `unresolved` (not a hard error)
+   *   1. Matches a contacts.id with a live kg_node_id → assemble from that KG node
+   *   2. Matches a contacts.id with no node, or whose node is archived → `nodeless`
+   *   3. Matches a live kg_nodes.id directly → assemble from that KG node
+   *   4. Matches an archived kg_nodes.id owned by a contact → `nodeless` (cause archived)
+   *   5. No match → included in `unresolved` (not a hard error)
    *
-   * Each ID is assembled independently; a DB error on one ID logs a warning and
-   * adds the ID to `unresolved` without aborting the remaining IDs in the batch.
+   * Each ID is assembled independently; a DB error on one ID logs at error and
+   * adds the ID to `failed` without aborting the remaining IDs in the batch.
    *
    * @param ids   Array of contact IDs or KG node IDs to resolve.
    * @param includeRelationships  If false, the relationships field is skipped.
@@ -66,41 +127,67 @@ export class EntityContextAssembler {
   async assembleMany(
     ids: string[],
     options: { includeRelationships?: boolean } = {},
-  ): Promise<{ entities: EntityContext[]; unresolved: string[] }> {
+  ): Promise<AssembleManyResult> {
     const includeRelationships = options.includeRelationships ?? true;
     const entities: EntityContext[] = [];
     const unresolved: string[] = [];
+    const nodeless: NodelessContact[] = [];
+    const failed: AssembleManyFailedEntry[] = [];
 
     for (const id of ids) {
       // Cache stores full payloads (with relationships) only. Skipping the cache for
       // includeRelationships=false requests prevents a partial payload from being served
       // to a later caller that wants the full payload (and vice versa).
-      const cached = includeRelationships ? this.getFromCache(id) : undefined;
-      if (cached) {
-        entities.push(cached);
-        continue;
-      }
-
       try {
-        const ctx = await this.assembleOne(id, includeRelationships);
-        if (ctx) {
-          if (includeRelationships) {
-            this.putInCache(id, ctx);
+        const cached = includeRelationships ? this.getFromCache(id) : undefined;
+        if (cached) {
+          // Archival is a correctness boundary (#1707): a payload cached before
+          // DreamEngine (or contact deletion) archived the node must not be served.
+          // One indexed lookup per hit; if the node is gone, drop every alias and
+          // fall through to assembleOneClassified so the caller gets `nodeless`.
+          if (await this.isLiveKgNode(cached.entityId)) {
+            entities.push(cached);
+            continue;
           }
-          entities.push(ctx);
+          this.clearCacheForEntity(cached.entityId);
+        }
+
+        const outcome = await this.assembleOneClassified(id, includeRelationships);
+        if (outcome.kind === 'assembled') {
+          if (includeRelationships) {
+            this.putInCache(id, outcome.context);
+          }
+          entities.push(outcome.context);
+        } else if (outcome.kind === 'nodeless') {
+          // Deliberately not cached: a backfill or a contact merge can give this
+          // contact a node at any time, and a cached verdict would keep it
+          // context-free for the rest of the TTL.
+          //
+          // warn, not debug: prod runs at LOG_LEVEL=info, so a debug line here would
+          // never fire and this whole diagnostic would be invisible in the one place
+          // it matters. Same reasoning already applied to the 22P02 branch below —
+          // operators need a searchable signal. This is the standing production
+          // record that a real contact was addressed with no context available.
+          this.logger.warn(
+            { contactId: outcome.entry.contactId, cause: outcome.entry.cause },
+            outcome.entry.cause === 'archived'
+              ? 'entity-context: contact KG node is archived — cannot carry facts, relationships, or context'
+              : 'entity-context: contact holds no KG node — cannot carry facts, relationships, or context',
+          );
+          nodeless.push(outcome.entry);
         } else {
           this.logger.debug({ entityId: id }, 'entity-context: ID could not be resolved to a KG node');
           unresolved.push(id);
         }
       } catch (err) {
         // Per-ID failure is non-fatal for the batch — log with full context and
-        // treat as unresolved so the caller gets partial results instead of nothing.
-        this.logger.error({ err, entityId: id }, 'entity-context: assembleOne failed — treating as unresolved');
-        unresolved.push(id);
+        // place in `failed` so the caller can retry instead of reading absence.
+        this.logger.error({ err, entityId: id }, 'entity-context: assembleOne failed — treating as failed');
+        failed.push({ inputId: id, retryable: isRetryableAssemblyError(err) });
       }
     }
 
-    return { entities, unresolved };
+    return { entities, unresolved, nodeless, failed };
   }
 
   /**
@@ -108,15 +195,52 @@ export class EntityContextAssembler {
    * Throws on DB errors — callers should wrap in try/catch or use assembleMany().
    */
   async assembleOne(id: string, includeRelationships = true): Promise<EntityContext | undefined> {
+    const result = await this.assembleOneClassified(id, includeRelationships);
+    return result.kind === 'assembled' ? result.context : undefined;
+  }
+
+  /**
+   * assembleOne with the reason for a miss preserved.
+   *
+   * `assembleOne` collapses every miss to `undefined`, which loses the distinction
+   * between "no such entity" and "this contact exists but cannot hold knowledge".
+   * assembleMany needs that distinction to fill its `nodeless` bucket, and gets it
+   * here without issuing a second query or changing the public signature (#1694).
+   */
+  private async assembleOneClassified(
+    id: string,
+    includeRelationships = true,
+  ): Promise<AssembleOutcome> {
     try {
       // Step 1: Resolve the input ID to a KG node.
       // Try contact ID first, then fall back to direct KG node ID.
-      const kgNodeId = await this.resolveKgNodeId(id);
-      if (!kgNodeId) return undefined;
+      const resolved = await this.resolveInput(id);
+      if (resolved.kind === 'unknown') return { kind: 'unknown' };
+      if (resolved.kind === 'nodeless') {
+        return {
+          kind: 'nodeless',
+          entry: {
+            inputId: id,
+            contactId: resolved.contactId,
+            displayName: resolved.displayName,
+            cause: resolved.cause,
+          },
+        };
+      }
+      const kgNodeId = resolved.kgNodeId;
 
       // Step 2: Load the KG node
       const nodeRow = await this.getKgNode(kgNodeId);
-      if (!nodeRow) return undefined;
+      if (!nodeRow) {
+        // contacts.kg_node_id carries an FK, so a set pointer with no target row
+        // should be unreachable. If it happens, a real contact is being reported as
+        // unknown — log loudly rather than letting it look like an ordinary miss.
+        this.logger.warn(
+          { entityId: id, kgNodeId },
+          'entity-context: kg_node_id points at a missing node — referential integrity issue',
+        );
+        return { kind: 'unknown' };
+      }
 
       // Steps 3-6: Run assembly pipeline in parallel where safe.
       // Contact lookup + connected accounts depend on each other (need contactId),
@@ -181,7 +305,7 @@ export class EntityContextAssembler {
         relationships,
       };
 
-      return ctx;
+      return { kind: 'assembled', context: ctx };
     } catch (err) {
       // Re-throw with the entity ID stamped in the error for upstream diagnostic logs.
       // assembleMany() catches this and logs `{ err, entityId: id }`.
@@ -223,6 +347,17 @@ export class EntityContextAssembler {
       this.cache.delete(key);
       this.entityToCacheKeys.delete(key);
     }
+  }
+
+  /**
+   * Drop every cached payload. Called after DreamEngine archives nodes or edges
+   * so a fact/relationship retired on a still-live entity does not keep assembling
+   * from a TTL hit. Per-entity invalidation cannot see parent entity IDs from a
+   * bulk `UPDATE kg_nodes SET archived_at`.
+   */
+  clearCache(): void {
+    this.cache.clear();
+    this.entityToCacheKeys.clear();
   }
 
   // -- Private helpers --
@@ -298,61 +433,110 @@ export class EntityContextAssembler {
    * LLMs pass raw email addresses from CC preambles or inbox triage rather than
    * resolving to a contact UUID first.
    */
-  private async resolveKgNodeId(id: string): Promise<string | undefined> {
+  private async resolveInput(id: string): Promise<ResolvedInput> {
     try {
       // Email address detection: if the input looks like an email address (local-part @
       // domain with at least one dot), resolve via contact_channel_identities instead of
       // UUID columns. This handles CC flows and ceo-inbox triage where the LLM passes a
       // raw email rather than a contact UUID.
       if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(id)) {
-        const emailResult = await this.pool.query<{ contact_id: string; kg_node_id: string | null }>(
-          `SELECT c.id AS contact_id, c.kg_node_id
+        const emailResult = await this.pool.query<{
+          contact_id: string;
+          kg_node_id: string | null;
+          display_name: string;
+          node_archived: boolean | null;
+        }>(
+          `SELECT c.id AS contact_id, c.kg_node_id, c.display_name,
+                  (n.archived_at IS NOT NULL) AS node_archived
            FROM contact_channel_identities cci
            JOIN contacts c ON c.id = cci.contact_id
+           LEFT JOIN kg_nodes n ON n.id = c.kg_node_id
            WHERE cci.channel = 'email' AND LOWER(cci.channel_identifier) = LOWER($1)`,
           [id],
         );
         if (emailResult.rows.length > 0) {
-          const row = emailResult.rows[0];
-          const kgNodeId = row?.kg_node_id;
-          if (!kgNodeId) {
+          const row = emailResult.rows[0]!;
+          const nodeless = classifyLinkedNode(row.kg_node_id, row.node_archived);
+          if (nodeless) {
             // Use inputKind rather than the raw email — 'email' is on the pino redact list.
-            this.logger.debug({ inputKind: 'email', contactId: row?.contact_id }, 'entity-context: email resolved to contact with no linked KG node');
-            return undefined;
+            this.logger.debug(
+              { inputKind: 'email', contactId: row.contact_id, cause: nodeless },
+              nodeless === 'archived'
+                ? 'entity-context: email resolved to contact whose KG node is archived'
+                : 'entity-context: email resolved to contact with no linked KG node',
+            );
+            return { kind: 'nodeless', contactId: row.contact_id, displayName: row.display_name, cause: nodeless };
           }
-          return kgNodeId;
+          return { kind: 'node', kgNodeId: row.kg_node_id! };
         }
         // Email not found in contact_channel_identities — unregistered contact
         this.logger.debug({ inputKind: 'email' }, 'entity-context: email not found in contact_channel_identities — treating as unresolved');
-        return undefined;
+        return { kind: 'unknown' };
       }
 
       // Try as a contact ID first
-      const contactResult = await this.pool.query<{ kg_node_id: string | null }>(
-        'SELECT kg_node_id FROM contacts WHERE id = $1',
+      const contactResult = await this.pool.query<{
+        kg_node_id: string | null;
+        display_name: string;
+        node_archived: boolean | null;
+      }>(
+        `SELECT c.kg_node_id, c.display_name,
+                (n.archived_at IS NOT NULL) AS node_archived
+         FROM contacts c
+         LEFT JOIN kg_nodes n ON n.id = c.kg_node_id
+         WHERE c.id = $1`,
         [id],
       );
       if (contactResult.rows.length > 0) {
-        const row = contactResult.rows[0];
-        const kgNodeId = row?.kg_node_id;
-        // Contact found but has no linked KG node — return undefined (unresolved)
-        if (!kgNodeId) {
-          this.logger.debug({ contactId: id }, 'entity-context: contact has no linked KG node');
-          return undefined;
+        const row = contactResult.rows[0]!;
+        const nodeless = classifyLinkedNode(row.kg_node_id, row.node_archived);
+        // Contact exists but cannot carry context — a different answer from "no such
+        // contact", and the caller needs to be able to tell them apart (#1694, #1707).
+        if (nodeless) {
+          this.logger.debug(
+            { contactId: id, cause: nodeless },
+            nodeless === 'archived'
+              ? 'entity-context: contact KG node is archived'
+              : 'entity-context: contact has no linked KG node',
+          );
+          return { kind: 'nodeless', contactId: id, displayName: row.display_name, cause: nodeless };
         }
-        return kgNodeId;
+        return { kind: 'node', kgNodeId: row.kg_node_id! };
       }
 
-      // Try as a KG node ID directly
-      const nodeResult = await this.pool.query<{ id: string }>(
-        'SELECT id FROM kg_nodes WHERE id = $1',
+      // Try as a KG node ID directly. Live nodes assemble. Archived nodes look up
+      // the owning contact (agents routinely reuse `entities[].entityId` across
+      // turns) and land in `nodeless` with cause archived — the same #1694 silence
+      // class as the contactIds path. Unanchored archived nodes stay unresolved.
+      const nodeResult = await this.pool.query<{ id: string; archived: boolean }>(
+        'SELECT id, (archived_at IS NOT NULL) AS archived FROM kg_nodes WHERE id = $1',
         [id],
       );
       if (nodeResult.rows.length > 0) {
-        return nodeResult.rows[0]?.id;
+        const nodeRow = nodeResult.rows[0]!;
+        if (!nodeRow.archived) return { kind: 'node', kgNodeId: nodeRow.id };
+
+        const owner = await this.pool.query<{ id: string; display_name: string }>(
+          'SELECT id, display_name FROM contacts WHERE kg_node_id = $1',
+          [id],
+        );
+        if (owner.rows.length > 0) {
+          const contact = owner.rows[0]!;
+          this.logger.debug(
+            { kgNodeId: id, contactId: contact.id },
+            'entity-context: archived KG node is owned by a contact',
+          );
+          return {
+            kind: 'nodeless',
+            contactId: contact.id,
+            displayName: contact.display_name,
+            cause: 'archived',
+          };
+        }
+        return { kind: 'unknown' };
       }
 
-      return undefined;
+      return { kind: 'unknown' };
     } catch (err) {
       // PostgreSQL error 22P02 = invalid_text_representation: the ID is not a valid UUID.
       // This happens when the LLM passes a hallucinated or synthetic string (e.g.
@@ -367,8 +551,8 @@ export class EntityContextAssembler {
         // Warn rather than debug: after the contact-resolver fix ships, this path should be
         // unreachable in production. If it fires, something upstream is still leaking a
         // synthetic/hallucinated ID and operators need a searchable signal to trace it.
-        this.logger.warn({ id }, 'entity-context: non-UUID id passed to resolveKgNodeId — treating as unresolved');
-        return undefined;
+        this.logger.warn({ id }, 'entity-context: non-UUID id passed to resolveInput — treating as unresolved');
+        return { kind: 'unknown' };
       }
       throw err;
     }
@@ -376,10 +560,19 @@ export class EntityContextAssembler {
 
   private async getKgNode(id: string): Promise<KgNodeRow | undefined> {
     const result = await this.pool.query<KgNodeRow>(
-      'SELECT id, type, label, properties FROM kg_nodes WHERE id = $1',
+      'SELECT id, type, label, properties FROM kg_nodes WHERE id = $1 AND archived_at IS NULL',
       [id],
     );
     return result.rows[0];
+  }
+
+  /** True when the node exists and has not been archived. Used to reject stale cache hits. */
+  private async isLiveKgNode(id: string): Promise<boolean> {
+    const result = await this.pool.query<{ id: string }>(
+      'SELECT id FROM kg_nodes WHERE id = $1 AND archived_at IS NULL',
+      [id],
+    );
+    return result.rows.length > 0;
   }
 
   /**
@@ -396,13 +589,17 @@ export class EntityContextAssembler {
        WHERE e.source_node_id = $1
          AND e.type = 'relates_to'
          AND n.type = 'fact'
+         AND e.archived_at IS NULL
+         AND n.archived_at IS NULL
        UNION ALL
        SELECT n.label, n.properties, n.confidence, n.last_confirmed_at
        FROM kg_edges e
        JOIN kg_nodes n ON n.id = e.source_node_id
        WHERE e.target_node_id = $1
          AND e.type = 'relates_to'
-         AND n.type = 'fact'`,
+         AND n.type = 'fact'
+         AND e.archived_at IS NULL
+         AND n.archived_at IS NULL`,
       [entityNodeId],
     );
 
@@ -492,6 +689,8 @@ export class EntityContextAssembler {
        JOIN kg_nodes n ON n.id = e.target_node_id
        WHERE e.source_node_id = $1
          AND n.type != 'fact'
+         AND e.archived_at IS NULL
+         AND n.archived_at IS NULL
        UNION ALL
        SELECT
          e.type AS edge_type,
@@ -502,7 +701,9 @@ export class EntityContextAssembler {
        FROM kg_edges e
        JOIN kg_nodes n ON n.id = e.source_node_id
        WHERE e.target_node_id = $1
-         AND n.type != 'fact'`,
+         AND n.type != 'fact'
+         AND e.archived_at IS NULL
+         AND n.archived_at IS NULL`,
       [entityNodeId],
     );
 
@@ -573,6 +774,22 @@ interface RelationshipRow {
 }
 
 /**
+ * Classify a contact's linked KG node for the nodeless bucket.
+ * `nodeArchived` is the SQL `(n.archived_at IS NOT NULL)` boolean from the LEFT JOIN.
+ * An unmatched join (dangling `kg_node_id`) yields `false`, not null — both are
+ * treated as live so the miss still falls through to getKgNode's referential-integrity
+ * warning. `true` is the only archived signal.
+ */
+function classifyLinkedNode(
+  kgNodeId: string | null | undefined,
+  nodeArchived: boolean | null | undefined,
+): NodelessCause | null {
+  if (!kgNodeId) return 'missing';
+  if (nodeArchived === true) return 'archived';
+  return null;
+}
+
+/**
  * Returns true when the ContactRow column that backs the given ContactCanonicalFields key
  * is non-null (i.e., the value has been persisted on the contact record).
  * Used by the fact filter: only suppress a canonical-keyed KG fact when its corresponding
@@ -597,4 +814,44 @@ function isContactRowColumnPopulated(
     case 'bio':           return row.bio != null;
     case 'birthday':      return row.birthday != null;
   }
+}
+
+/**
+ * Classify whether a thrown assembly error is likely transient.
+ * The handler owns LLM-facing wording; this only supplies the retry signal.
+ */
+export function isRetryableAssemblyError(err: unknown): boolean {
+  if (err !== null && typeof err === 'object' && 'code' in err) {
+    const code = (err as { code: string }).code;
+    switch (code) {
+      // Transient: pool pressure, timeouts, connection loss, deadlocks
+      case '53300': // too_many_connections
+      case '57014': // query_canceled (statement timeout)
+      case '08000': // connection_exception
+      case '08003': // connection_does_not_exist
+      case '08006': // connection_failure
+      case '40001': // serialization_failure
+      case '40P01': // deadlock_detected
+      case '57P03': // cannot_connect_now
+        return true;
+      // Permanent: schema drift, missing objects, privilege
+      case '42703': // undefined_column
+      case '42P01': // undefined_table
+      case '42501': // insufficient_privilege
+        return false;
+    }
+  }
+  if (err instanceof TypeError) return false;
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase();
+    if (
+      msg.includes('econnreset')
+      || msg.includes('connection reset')
+      || msg.includes('pool timeout')
+    ) {
+      return true;
+    }
+  }
+  // Unknown errors: do not invite a retry loop
+  return false;
 }

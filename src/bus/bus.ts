@@ -2,6 +2,33 @@ import type { BusEvent, EventType, Layer } from './events.js';
 import { canPublish, canSubscribe } from './permissions.js';
 import type { Logger } from '../logger.js';
 
+/**
+ * An `agent.task` whose target id is not in the agent registry.
+ * Thrown before the write-ahead audit hook, so a retry of the same event id
+ * stays this error instead of becoming an audit primary-key collision.
+ * Subscribers are not invoked. (#1898)
+ */
+export class UnownedAgentTaskError extends Error {
+  readonly agentId: string;
+  readonly layer: Layer;
+  readonly eventId: string;
+  readonly originatingEventId: string | undefined;
+
+  constructor(
+    agentId: string,
+    layer: Layer,
+    eventId: string,
+    originatingEventId: string | undefined,
+  ) {
+    super(`agent.task targets '${agentId}' which no registered agent owns`);
+    this.name = 'UnownedAgentTaskError';
+    this.agentId = agentId;
+    this.layer = layer;
+    this.eventId = eventId;
+    this.originatingEventId = originatingEventId;
+  }
+}
+
 type EventHandler = (event: BusEvent) => void | Promise<void>;
 
 // The onEvent hook runs before subscriber delivery — this is intentional.
@@ -14,12 +41,22 @@ type OnEventHook = (event: BusEvent) => void | Promise<void>;
 // signalling that delivery was attempted for all registered handlers.
 type OnDeliveredHook = (eventId: string) => void | Promise<void>;
 
+/**
+ * A write-ahead that has not started subscriber delivery.
+ * `deliver()` starts it once; a second call returns the same promise.
+ */
+export interface StagedDelivery {
+  deliver(): Promise<void>;
+}
+
 export class EventBus {
   // Keyed by EventType so dispatch is O(1) lookup rather than scanning all subscribers.
   private subscribers = new Map<EventType, EventHandler[]>();
   private logger: Logger;
   private onEvent?: OnEventHook;
   private onDelivered?: OnDeliveredHook;
+  /** When set, an agent.task for an id this returns false for is an error, not a delivery. */
+  private ownsAgent?: (agentId: string) => boolean;
 
   constructor(logger: Logger, onEvent?: OnEventHook, onDelivered?: OnDeliveredHook) {
     this.logger = logger;
@@ -43,14 +80,102 @@ export class EventBus {
     this.logger.debug({ layer, eventType }, 'Subscriber registered');
   }
 
+  /**
+   * Wire the live agent-ownership check once the registry is populated.
+   * Until this is called, agent.task delivery is unchanged — unit tests that
+   * publish tasks without a registry keep working. Production sets it. (#1898)
+   */
+  setAgentOwner(ownsAgent: (agentId: string) => boolean): void {
+    this.ownsAgent = ownsAgent;
+  }
+
   async publish(layer: Layer, event: BusEvent): Promise<void> {
-    // Enforce publish permissions — the layer claiming ownership of an event type
-    // must match the allowlist so rogue components can't inject arbitrary events.
+    await this.writeAhead(layer, event);
+    await this.deliver(event);
+  }
+
+  /**
+   * Persist the event, then hand subscriber delivery to the background.
+   * Resolves once the write-ahead hook has succeeded (or immediately when no
+   * hook is set). Authorization failures and a throwing write-ahead reject
+   * before any subscriber runs, same as {@link publish}.
+   *
+   * Subscriber and acknowledgement errors are logged on the detached chain.
+   * They do not reject this call. `publish()` still waits for every subscriber
+   * — voice `async-offramp` uses this so a spoken turn is not held for the
+   * coordinator's whole task (#2265).
+   */
+  async publishDetached(layer: Layer, event: BusEvent): Promise<void> {
+    await this.writeAhead(layer, event);
+    void this.deliver(event).catch((err: unknown) => {
+      this.logger.error(
+        { err, eventType: event.type, eventId: event.id },
+        'Detached subscriber delivery failed',
+      );
+    });
+  }
+
+  /**
+   * Persist the event, then hand back delivery for the caller to start.
+   * Resolves once the write-ahead hook has succeeded and does not invoke
+   * subscribers. Authorization failures and a throwing write-ahead reject
+   * before any subscriber runs, same as {@link publish}.
+   *
+   * {@link StagedDelivery.deliver} starts subscriber delivery once and returns
+   * that promise. Subscriber errors are swallowed inside delivery, so the
+   * promise still resolves; they are logged. `publishDetached` is the wrong
+   * tool when the caller must know when delivery settles: it starts delivery
+   * immediately and does not return the promise. Email inbound uses this split
+   * so the poll can persist `inbound.message` before the watermark moves, while
+   * the agent turn stays detached and ordered (#2254).
+   */
+  async stagePublish(layer: Layer, event: BusEvent): Promise<StagedDelivery> {
+    await this.writeAhead(layer, event);
+    let started: Promise<void> | undefined;
+    return {
+      deliver: () => {
+        started ??= this.deliver(event);
+        return started;
+      },
+    };
+  }
+
+  /**
+   * Publish permission and the unowned-agent check. Shared by the write-ahead
+   * path and {@link deliverPersisted} so a change to either rule covers both.
+   */
+  private authorize(layer: Layer, event: BusEvent): void {
     if (!canPublish(layer, event.type)) {
       throw new Error(
         `Layer '${layer}' is not authorized to publish '${event.type}'`,
       );
     }
+
+    const unowned = this.unownedAgentTask(layer, event);
+    if (!unowned) return;
+    this.logger.error(
+      {
+        agentId: unowned.agentId,
+        layer: unowned.layer,
+        eventId: unowned.eventId,
+        originatingEventId: unowned.originatingEventId,
+      },
+      'agent.task published for an agent no registered agent owns',
+    );
+    throw unowned;
+  }
+
+  /**
+   * Permission check plus the audit write-ahead. Throws before any subscriber
+   * runs. A write-ahead failure must not look like a delivered event.
+   */
+  private async writeAhead(layer: Layer, event: BusEvent): Promise<void> {
+    // Throw before onEvent. publishLateWake treats a primary-key collision
+    // on audit_log as proof this event id was already delivered and closes
+    // the handle. Writing the row and then throwing would make the retry
+    // look already-published. The error log is the signal; subscribers are
+    // not invoked. (#1898)
+    this.authorize(layer, event);
 
     this.logger.debug(
       { layer, eventType: event.type, eventId: event.id },
@@ -63,11 +188,32 @@ export class EventBus {
     if (this.onEvent) {
       await this.onEvent(event);
     }
+  }
 
-    // Deliver to subscribers sequentially — awaited so the full chain completes
-    // before publish() resolves, which makes test assertions straightforward.
-    // Subscriber errors are caught and logged individually so one bad subscriber
-    // cannot block delivery to subsequent subscribers.
+  /**
+   * Deliver an event that is already in the audit log. Does not call the
+   * write-ahead hook, so replaying an unacknowledged `inbound.message` does
+   * not insert a second row for the same id. Subscribers and the
+   * acknowledgement hook still run (#2254).
+   */
+  async deliverPersisted(event: BusEvent): Promise<void> {
+    this.authorize(event.sourceLayer, event);
+
+    this.logger.debug(
+      { layer: event.sourceLayer, eventType: event.type, eventId: event.id },
+      'Delivering persisted event',
+    );
+    await this.deliver(event);
+  }
+
+  /**
+   * Deliver to subscribers sequentially. Subscriber errors are caught and
+   * logged individually so one bad subscriber cannot block the rest.
+   * `publish()` awaits this. `publishDetached()` does not. `stagePublish()`
+   * returns it so the caller can await delivery later. `deliverPersisted()`
+   * awaits it without a new write-ahead row.
+   */
+  private async deliver(event: BusEvent): Promise<void> {
     const handlers = this.subscribers.get(event.type) ?? [];
     for (const handler of handlers) {
       try {
@@ -99,5 +245,16 @@ export class EventBus {
         );
       }
     }
+  }
+
+  private unownedAgentTask(layer: Layer, event: BusEvent): UnownedAgentTaskError | undefined {
+    if (event.type !== 'agent.task' || !this.ownsAgent) return undefined;
+    if (this.ownsAgent(event.payload.agentId)) return undefined;
+    return new UnownedAgentTaskError(
+      event.payload.agentId,
+      layer,
+      event.id,
+      event.parentEventId,
+    );
   }
 }

@@ -15,8 +15,10 @@
  */
 import { describe, it, expect, vi, type MockedFunction } from 'vitest';
 import { WorkingMemory, type SummarizationConfig } from '../../../src/memory/working-memory.js';
+import { LLM_FAILURE_TURN_CONTENT, LLM_FAILURE_USER_MESSAGE } from '../../../src/memory/llm-failure-turn.js';
 import type { LLMProvider } from '../../../src/agents/llm/provider.js';
 import type { DbPool } from '../../../src/db/connection.js';
+import { NO_REASONING } from '../../../src/agents/llm/sampling-options.js';
 
 // ---------------------------------------------------------------------------
 // Minimal mock pool builder
@@ -136,7 +138,7 @@ describe('WorkingMemory — context summarization', () => {
     };
 
     const pool = buildMockPool(queryHandler);
-    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: mockProvider };
+    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: mockProvider, model: 'claude-3-5-haiku-20241022' };
     const memory = WorkingMemory.createWithPostgres(pool, { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never, config);
 
     await memory.addTurn(CONV, AGENT, { role: 'user', content: 'Hello' });
@@ -149,7 +151,7 @@ describe('WorkingMemory — context summarization', () => {
   it('calls LLM when active count exceeds threshold', async () => {
     const { pool, mockProvider } = buildPool(21, 11); // 21 active, keep 10, archive 11
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
-    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: mockProvider };
+    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: mockProvider, model: 'claude-3-5-haiku-20241022' };
 
     const memory = WorkingMemory.createWithPostgres(pool, logger, config);
     await memory.addTurn(CONV, AGENT, { role: 'user', content: 'Trigger turn' });
@@ -160,13 +162,56 @@ describe('WorkingMemory — context summarization', () => {
     const promptContent = callArg.messages[0]!.content as string;
     expect(promptContent).toContain('Turn 0');
     expect(promptContent).toContain('Condense');
+    // Summarization is infrastructure: it never inherits reasoning (ADR-048 §3).
+    expect(callArg.options).toEqual({ reasoning: NO_REASONING });
+  });
+
+  it('rewrites LLM failure markers in the summarization transcript (#1767)', async () => {
+    const now = new Date('2026-01-01T12:00:00Z');
+    const archivedRows = [
+      { id: makeId(0), role: 'user', content: 'failed question', created_at: now },
+      {
+        id: makeId(1),
+        role: 'assistant',
+        content: LLM_FAILURE_TURN_CONTENT,
+        created_at: new Date(now.getTime() + 1000),
+      },
+    ];
+    const mockProvider = buildMockProvider();
+    const queryHandler = (sql: string): QueryResult<unknown> => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('INSERT INTO working_memory')) return { rows: [] };
+      if (normalized.startsWith('SELECT COUNT(*)')) return { rows: [{ count: '21' }] };
+      if (normalized.startsWith('SELECT id, role, content, created_at')) return { rows: archivedRows };
+      if (normalized.startsWith('SELECT created_at')) {
+        return { rows: [{ created_at: new Date(now.getTime() + 2000) }] };
+      }
+      return { rows: [] };
+    };
+    const pool = buildMockPool(queryHandler);
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const config: SummarizationConfig = {
+      threshold: 20,
+      keepWindow: 10,
+      provider: mockProvider,
+      model: 'claude-3-5-haiku-20241022',
+    };
+    const memory = WorkingMemory.createWithPostgres(pool, logger, config);
+    await memory.addTurn(CONV, AGENT, { role: 'user', content: 'Trigger turn' });
+
+    expect(mockProvider.chat).toHaveBeenCalledOnce();
+    const callArg = (mockProvider.chat as MockedFunction<LLMProvider['chat']>).mock.calls[0]![0];
+    const promptContent = callArg.messages[0]!.content as string;
+    expect(promptContent).toContain('failed question');
+    expect(promptContent).toContain(LLM_FAILURE_USER_MESSAGE);
+    expect(promptContent).not.toContain('_curia_protocol');
   });
 
   it('archives old turns and inserts synthetic summary in a transaction', async () => {
     const toArchiveCount = 11;
     const { pool, mockProvider } = buildPool(21, toArchiveCount);
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
-    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: mockProvider };
+    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: mockProvider, model: 'claude-3-5-haiku-20241022' };
 
     const memory = WorkingMemory.createWithPostgres(pool, logger, config);
     await memory.addTurn(CONV, AGENT, { role: 'user', content: 'Trigger turn' });
@@ -175,7 +220,7 @@ describe('WorkingMemory — context summarization', () => {
     const client = await (pool as unknown as { connect(): Promise<{ query: MockedFunction<() => unknown>; release: () => void }> }).connect();
 
     // BEGIN and COMMIT must have been called
-    const clientCalls = (client.query as MockedFunction<() => unknown>).mock.calls.map((c) => (c[0] as string).trim());
+    const clientCalls = (client.query as MockedFunction<() => unknown>).mock.calls.map((c) => ((c as unknown[])[0] as string).trim());
     expect(clientCalls).toContain('BEGIN');
     expect(clientCalls).toContain('COMMIT');
 
@@ -189,11 +234,11 @@ describe('WorkingMemory — context summarization', () => {
 
     // Verify the summary content is the LLM's response
     const insertParams = (client.query as MockedFunction<() => unknown>).mock.calls.find(
-      (c) => (c[0] as string).startsWith('INSERT INTO working_memory'),
+      (c) => ((c as unknown[])[0] as string).startsWith('INSERT INTO working_memory'),
     );
     // Third parameter ($3) is the summary content
-    expect((insertParams![1] as string[])[2]).toContain('[Conversation summary]');
-    expect((insertParams![1] as string[])[2]).toContain('SUMMARY: key decisions made.');
+    expect(((insertParams as unknown as unknown[])[1] as string[])[2]).toContain('[Conversation summary]');
+    expect(((insertParams as unknown as unknown[])[1] as string[])[2]).toContain('SUMMARY: key decisions made.');
   });
 
   it('get() excludes archived rows (queries with archived = false)', async () => {
@@ -255,7 +300,7 @@ describe('WorkingMemory — context summarization', () => {
 
     const pool = buildMockPool(queryHandler);
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
-    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: errorProvider };
+    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: errorProvider, model: 'claude-3-5-haiku-20241022' };
 
     const memory = WorkingMemory.createWithPostgres(pool, logger, config);
 
@@ -284,10 +329,266 @@ describe('WorkingMemory — context summarization', () => {
 
     const pool = buildMockPool(queryHandler);
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
-    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: throwingProvider };
+    const config: SummarizationConfig = { threshold: 20, keepWindow: 10, provider: throwingProvider, model: 'claude-3-5-haiku-20241022' };
 
     const memory = WorkingMemory.createWithPostgres(pool, logger, config);
     await expect(memory.addTurn(CONV, AGENT, { role: 'user', content: 'Message' })).resolves.toBeUndefined();
     expect((logger as unknown as { error: MockedFunction<() => void> }).error).toHaveBeenCalledOnce();
+  });
+
+  it('runs two background passes for one conversation one at a time (#2266)', async () => {
+    const release: Record<string, () => void> = {};
+    const gates: Record<string, Promise<void>> = {};
+    const started: string[] = [];
+    let inFlightA = 0;
+    let maxInFlightA = 0;
+
+    const openGate = (which: string): Promise<void> => {
+      if (!gates[which]) {
+        gates[which] = new Promise<void>(resolve => {
+          release[which] = resolve;
+        });
+      }
+      return gates[which];
+    };
+
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async (params) => {
+        const raw = params.messages[0]?.content;
+        const prompt = typeof raw === 'string' ? raw : '';
+        const which = prompt.includes('archived-conv-a')
+          ? 'a'
+          : prompt.includes('archived-conv-b')
+            ? 'b'
+            : 'other';
+        started.push(which);
+        if (which === 'a') {
+          inFlightA += 1;
+          maxInFlightA = Math.max(maxInFlightA, inFlightA);
+          await openGate('a');
+          inFlightA -= 1;
+        }
+        return {
+          type: 'text' as const,
+          content: 'summary',
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheCreationInputTokens: 0,
+            cacheReadInputTokens: 0,
+          },
+          provenance: { requestedModel: 'fake', actualModel: 'fake', providerRequestId: 'req_sum' },
+        };
+      },
+    };
+
+    const queryHandler = (sql: string, params?: unknown[]): QueryResult<unknown> => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      const conversationId = typeof params?.[0] === 'string' ? params[0] : '';
+      if (normalized.startsWith('INSERT INTO working_memory')) return { rows: [] };
+      if (normalized.startsWith('SELECT COUNT(*)')) return { rows: [{ count: '21' }] };
+      if (normalized.startsWith('SELECT id, role, content, created_at')) {
+        return {
+          rows: [{
+            id: makeId(conversationId === 'conv-b' ? 2 : 1),
+            role: 'user',
+            content: `archived-${conversationId}`,
+            created_at: new Date('2026-01-01T12:00:00Z'),
+          }],
+        };
+      }
+      if (normalized.startsWith('SELECT created_at')) {
+        return { rows: [{ created_at: new Date('2026-01-01T12:00:10Z') }] };
+      }
+      return { rows: [] };
+    };
+
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(
+      buildMockPool(queryHandler),
+      logger,
+      { threshold: 20, keepWindow: 10, provider, model: 'claude-3-5-haiku-20241022' },
+    );
+    const voice = { summarize: 'background' as const };
+
+    await memory.addTurn('conv-a', AGENT, { role: 'user', content: 'first' }, voice);
+    await vi.waitFor(() => expect(started).toEqual(['a']));
+
+    await memory.addTurn('conv-a', AGENT, { role: 'user', content: 'second' }, voice);
+    for (let i = 0; i < 30; i += 1) await Promise.resolve();
+    expect(started).toEqual(['a']);
+    expect(maxInFlightA).toBe(1);
+
+    // A different conversation is not held behind conv-a's pass.
+    await memory.addTurn('conv-b', AGENT, { role: 'user', content: 'other' }, voice);
+    await vi.waitFor(() => expect(started).toContain('b'));
+    expect(started.filter(id => id === 'a')).toHaveLength(1);
+
+    release['a']!();
+    await vi.waitFor(() => expect(started.filter(id => id === 'a')).toHaveLength(2));
+    expect(maxInFlightA).toBe(1);
+  });
+
+  it('logs a failed background pass at warn and still returns the turn (#2266)', async () => {
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: vi.fn().mockRejectedValue(new Error('summarizer down')),
+    };
+    const queryHandler = (sql: string): QueryResult<unknown> => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('INSERT INTO working_memory')) return { rows: [] };
+      if (normalized.startsWith('SELECT COUNT(*)')) return { rows: [{ count: '21' }] };
+      if (normalized.startsWith('SELECT id, role')) {
+        return { rows: [{ id: makeId(0), role: 'user', content: 'Old', created_at: new Date() }] };
+      }
+      return { rows: [] };
+    };
+    const warn = vi.fn();
+    const error = vi.fn();
+    const logger = { debug: vi.fn(), info: vi.fn(), warn, error } as never;
+    const memory = WorkingMemory.createWithPostgres(
+      buildMockPool(queryHandler),
+      logger,
+      { threshold: 20, keepWindow: 10, provider, model: 'claude-3-5-haiku-20241022' },
+    );
+
+    await expect(
+      memory.addTurn(CONV, AGENT, { role: 'user', content: 'Message' }, { summarize: 'background' }),
+    ).resolves.toBeUndefined();
+
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce());
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: CONV }),
+      expect.stringContaining('background summarization failed'),
+    );
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  function overThresholdPool(): DbPool {
+    const queryHandler = (sql: string): QueryResult<unknown> => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith('INSERT INTO working_memory')) return { rows: [] };
+      if (normalized.startsWith('SELECT COUNT(*)')) return { rows: [{ count: '21' }] };
+      if (normalized.startsWith('SELECT id, role')) {
+        return { rows: [{ id: makeId(0), role: 'user', content: 'Old', created_at: new Date() }] };
+      }
+      if (normalized.startsWith('SELECT created_at')) {
+        return { rows: [{ created_at: new Date('2026-01-01T12:00:10Z') }] };
+      }
+      return { rows: [] };
+    };
+    return buildMockPool(queryHandler);
+  }
+
+  const summaryResponse = {
+    type: 'text' as const,
+    content: 'summary',
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+    },
+    provenance: { requestedModel: 'fake', actualModel: 'fake', providerRequestId: 'req_sum' },
+  };
+
+  it('keeps a voice-channel write inline unless summarize is background', async () => {
+    let releaseChat: () => void = () => {};
+    const gate = new Promise<void>(resolve => { releaseChat = resolve; });
+    let chats = 0;
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async () => {
+        chats += 1;
+        await gate;
+        return summaryResponse;
+      },
+    };
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(overThresholdPool(), logger, {
+      threshold: 20,
+      keepWindow: 10,
+      provider,
+      model: 'claude-3-5-haiku-20241022',
+    });
+
+    let settled = false;
+    const pending = memory.addTurn(
+      CONV,
+      AGENT,
+      { role: 'user', content: 'hi' },
+      { channelId: 'voice' },
+    ).then(() => { settled = true; });
+    await vi.waitFor(() => expect(chats).toBe(1));
+    expect(settled).toBe(false);
+    releaseChat();
+    await pending;
+    expect(settled).toBe(true);
+  });
+
+  it('drainSummarization waits for an in-flight background pass', async () => {
+    let releaseChat: () => void = () => {};
+    const gate = new Promise<void>(resolve => { releaseChat = resolve; });
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async () => {
+        await gate;
+        return summaryResponse;
+      },
+    };
+    const info = vi.fn();
+    const logger = { debug: vi.fn(), info, warn: vi.fn(), error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(overThresholdPool(), logger, {
+      threshold: 20,
+      keepWindow: 10,
+      provider,
+      model: 'claude-3-5-haiku-20241022',
+    });
+
+    await memory.addTurn(CONV, AGENT, { role: 'user', content: 'hi' }, { summarize: 'background' });
+    const draining = memory.drainSummarization(2_000);
+    let drainSettled = false;
+    void draining.then(() => { drainSettled = true; });
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(drainSettled).toBe(false);
+
+    releaseChat();
+    await draining;
+    expect(info.mock.calls.some(call => call[1] === 'working_memory: summarization complete')).toBe(true);
+  });
+
+  it('drainSummarization warns when a pass outlasts the timeout', async () => {
+    let releaseChat: () => void = () => {};
+    const gate = new Promise<void>(resolve => { releaseChat = resolve; });
+    let started = false;
+    const provider: LLMProvider = {
+      id: 'mock',
+      chat: async () => {
+        started = true;
+        await gate;
+        return summaryResponse;
+      },
+    };
+    const warn = vi.fn();
+    const info = vi.fn();
+    const logger = { debug: vi.fn(), info, warn, error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(overThresholdPool(), logger, {
+      threshold: 20,
+      keepWindow: 10,
+      provider,
+      model: 'claude-3-5-haiku-20241022',
+    });
+
+    await memory.addTurn(CONV, AGENT, { role: 'user', content: 'hi' }, { summarize: 'background' });
+    await vi.waitFor(() => expect(started).toBe(true));
+    await memory.drainSummarization(20);
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ pending: 1 }),
+      expect.stringContaining('summarization drain timed out'),
+    );
+
+    releaseChat();
+    await vi.waitFor(() => expect(info).toHaveBeenCalled());
   });
 });

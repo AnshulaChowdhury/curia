@@ -2,15 +2,21 @@ import { useState, useEffect } from 'react';
 import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
+import { MoonrayRings } from '../components/MoonrayRings.js';
 import { useTheme } from '../hooks/useTheme.js';
 import { ChatThread } from './chat/ChatThread.js';
 import { ChatComposer } from './chat/ChatComposer.js';
 import { useChatSession } from './chat/useChatSession.js';
+import { useVoiceCall } from './chat/useVoiceCall.js';
+import { VoiceCallBar } from './chat/VoiceCallBar.js';
+import { useHandedOffQuestion } from './chat/ask-handoff.js';
 
 export default function ChatPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const { messages, sending, hasMore, loadingHistory, send, loadMore } = useChatSession();
+  const voiceCall = useVoiceCall();
+  useHandedOffQuestion(send);
 
   useEffect(() => {
     if (mobileOpen) {
@@ -26,15 +32,19 @@ export default function ChatPage() {
       <div className="app-root">
         <Sidebar activeView="chat" theme={theme} onThemeChange={setTheme} />
         <main className="main">
-          <Topbar crumb="Curia" title="Chat" />
+          <Topbar crumb="Moonray Ventures OS" title="Chat" />
           <div className="chat-page">
+            <MoonrayRings />
             <ChatThread
               messages={messages}
               hasMore={hasMore}
               loadingHistory={loadingHistory}
               loadMore={loadMore}
             />
-            <ChatComposer disabled={sending} onSend={send} />
+            <div className="chat-input-area">
+              <VoiceCallBar {...voiceCall} />
+              <ChatComposer disabled={sending} onSend={send} />
+            </div>
           </div>
         </main>
       </div>

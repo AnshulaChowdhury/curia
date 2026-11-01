@@ -1,18 +1,16 @@
 // http-adapter.ts — Fastify-based HTTP channel adapter.
 //
-// Provides REST + SSE endpoints for external clients (dashboards, mobile apps,
-// integrations). Uses the EventRouter (shared subscriber pattern) to avoid
-// per-request bus subscriber leaks.
+// Serves the console, health, and session-authenticated APIs. Console chat is
+// /api/chat/* (channel `web`). The bearer message routes (/api/messages) were
+// removed (ADR-057). Uses the EventRouter so SSE does not leak bus subscribers.
 //
-// Endpoints:
-//   POST   /api/messages        — send a message, get response
-//   GET    /api/messages/stream — SSE real-time event stream
+// Endpoints called out here:
 //   GET    /api/health          — system health check
 //   GET    /api/agents/status   — agent registry snapshot
 //
 // The adapter subscribes to the bus at startup via EventRouter:
 //   - 'channel' layer for outbound.message (respects permission model)
-//   - 'system' layer for skill.invoke/skill.result (observability — documented
+//   - 'system' layer for tool.invoke/tool.result (observability — documented
 //     privilege escalation for the HTTP channel since SSE needs to stream these)
 
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -23,35 +21,82 @@ import type { EventBus } from '../../bus/bus.js';
 import type { Logger } from '../../logger.js';
 import type { Pool } from 'pg';
 import type { AgentRegistry } from '../../agents/agent-registry.js';
-import { validateBearerToken } from './auth.js';
+import { bypassesBearerAuth, validateBearerToken } from './auth.js';
 import { registerSecurityHeaders } from './security-headers.js';
 import { EventRouter } from './event-router.js';
 import type { SchedulerService } from '../../scheduler/scheduler-service.js';
+import { HealthService } from '../../health/health-service.js';
+import { DEFAULT_CONSOLE_EDIT_MAX_BYTES, DEFAULT_HEALTH_CONFIG } from '../../config.js';
 import { healthRoutes } from './routes/health.js';
 import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
-import { messageRoutes } from './routes/messages.js';
+import { antfarmRoutes } from './routes/antfarm.js';
+import { activityRoutes } from './routes/activity.js';
+import { dashboardRoutes } from './routes/dashboard.js';
+import { antfarmStaticRoutes } from './routes/antfarm-static.js';
+import { antfarmAssetsRoutes } from './routes/antfarm-assets.js';
 import { consoleRoutes } from './routes/console.js';
 import { knowledgeGraphRoutes } from './routes/kg.js';
+import { taskRoutes } from './routes/tasks.js';
+import { contactRoutes } from './routes/contacts.js';
+import { chatRoutes } from './routes/chat.js';
+import { legacyKgAliasRoutes } from './routes/legacy-kg-aliases.js';
+import { documentsRoutes } from './routes/documents.js';
 import { identityRoutes } from './routes/identity.js';
 import { executiveRoutes } from './routes/executive.js';
 import { autonomyRoutes } from './routes/autonomy.js';
+import {
+  memoryRetentionRoutes,
+  type MemoryRetentionSnapshot,
+} from './routes/memory-retention.js';
+import {
+  RESTART_MAX,
+  RESTART_WINDOW_MS,
+  systemRoutes,
+  type SystemSnapshot,
+} from './routes/system.js';
 import { registryRoutes } from './routes/registry.js';
 import { channelRegistryRoutes } from './routes/channel-registry.js';
+import { mcpRegistryRoutes } from './routes/mcp-registry.js';
 import { vaultRoutes } from './routes/vault.js';
+import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
-import { quickbooksRoutes } from './routes/quickbooks.js';
-import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
-import { PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
+import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { setupRoutes } from './routes/setup.js';
+import { smsWebhookRoutes } from '../sms/webhook-route.js';
+import { SmsWebhookBridge } from '../sms/webhook-bridge.js';
+import { voiceSessionRoutes } from '../voice/session-routes.js';
+import { VoiceSessionBridge } from '../voice/session-bridge.js';
 import type { OfficeIdentityService } from '../../identity/service.js';
 import type { ExecutiveProfileService } from '../../executive/service.js';
 import type { ContactService } from '../../contacts/contact-service.js';
 import type { AutonomyService } from '../../autonomy/autonomy-service.js';
 import { type SessionStore } from './session-auth.js';
 import type { Channel } from '../channel.js';
+import type { AuditLogRepo } from '../../audit/audit-log-repo.js';
+import { DEFAULT_SCRATCH_DOC_TTL_DAYS } from '../../agents/document-workspace.js';
+
+/**
+ * Minimal HealthService for boot paths where a full HealthService wasn't provided
+ * (e.g. test startup or degraded initialization). Only the db probe works;
+ * all others are skipped because the optional adapter deps are absent.
+ */
+function createFallbackHealthService(pool: Pool, logger: Logger): HealthService {
+  return new HealthService({
+    db: pool,
+    bus: null as never,    // bus not available here — bus check will report skipped/fail
+    logger,
+    scheduler: { lastTickAt: null },
+    mcpSessions: [],
+    modelRoutingConfig: {
+      tiers: { fast: { model: '' }, standard: { model: '' }, powerful: { model: '' } },
+      default_tier: 'standard',
+    },
+    config: DEFAULT_HEALTH_CONFIG,
+  } as never);
+}
 
 export interface HttpAdapterConfig {
   bus: EventBus;
@@ -63,16 +108,22 @@ export interface HttpAdapterConfig {
   webAppBootstrapSecret: string | undefined;
   appOrigin: string | undefined;
   agentNames: string[];
-  skillNames: string[];
+  toolNames: string[];
   schedulerService?: SchedulerService;
+  healthService?: HealthService;
   identityService?: OfficeIdentityService;
   executiveProfileService?: ExecutiveProfileService;
   contactService: ContactService;
+  /** Backs POST /api/kg/nodes/merge and GET /api/kg/nodes/:id/merge-candidates (#2233). */
+  nodeMergeService?: import('../../kg-merge/service.js').NodeMergeApi;
   autonomyService?: AutonomyService;
   registryService?: import('../../registry/registry-service.js').RegistryService;
   /** Backs the /api/registry/channels/* routes (channel install/enable lifecycle). Mounted
    *  only when webAppBootstrapSecret is also configured. */
   channelRegistryService?: import('../../registry/channel-registry-service.js').ChannelRegistryService;
+  /** Backs the /api/registry/mcp/* routes (MCP server install/enable lifecycle).
+   *  Mounted only when webAppBootstrapSecret is also configured. */
+  mcpRegistryService?: import('../../registry/mcp-registry-service.js').McpRegistryService;
   /** Backs the /api/vault/* routes (secrets status + skill-secret entry). Mounted only
    *  alongside registryService, which scopes which secret names may be written. */
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
@@ -93,6 +144,59 @@ export interface HttpAdapterConfig {
    * the supervisor brings the new process up). Exposed via GET /api/setup/status.
    */
   bootStartedAt: string;
+  /**
+   * Constrained LLM access for POST /api/setup/suggest-name (wizard starter-name
+   * suggestion, #799). Optional — the endpoint degrades to "unavailable" when absent.
+   */
+  infraLlmService?: import('../../skills/infra-llm.js').InfraLlmService;
+  /**
+   * KG fact store for principal profile endpoints (#392). Optional — only available
+   * when OPENAI_API_KEY is configured (entity memory requires embeddings). Passed
+   * through to setupRoutes; working-hours fact storage is skipped gracefully when absent
+   * (timezone/email/name writes still succeed).
+   */
+  entityMemory?: import('../../memory/entity-memory.js').EntityMemory;
+  /** Backs GET /api/antfarm/timeline (replay window queries). */
+  auditLogRepo?: AuditLogRepo;
+  /** Backs GET /api/activity, the console home's job-level feed (#2251). */
+  activityFeed?: import('../../activity/activity-service.js').ActivityFeedSource;
+  /** Backs the principal home: waiting items, stats, histogram, bullpen (#2340). */
+  briefing?: import('../../dashboard/briefing-service.js').BriefingService;
+  /** Status changes on PATCH /api/tasks/:id go through TaskRepo (#2340). */
+  taskRepo?: import('../../db/task-repo.js').TaskRepo;
+  /**
+   * Telnyx SMS webhook bridge — HttpAdapter mounts POST /api/webhooks/telnyx/sms
+   * and delegates to the handler installed by SmsAdapter.start() (ADR-036).
+   */
+  smsWebhookBridge?: import('../sms/webhook-bridge.js').SmsWebhookBridge;
+  /**
+   * Effective boot-time KG/memory retention knobs for GET /api/memory/retention
+   * (console Memory settings, #1376). Read-only snapshot — not hot-reloaded.
+   */
+  memoryRetention?: MemoryRetentionSnapshot;
+  /**
+   * OKF working-document store for the console Memory → Documents page (#1821).
+   * Mounted only alongside the bootstrap secret, like the KG routes.
+   */
+  workingDocsRepo?: import('../../db/working-docs-repo.js').WorkingDocsRepo;
+  /** `documentWorkspace.consoleEditMaxBytes` — documents above it are read-only in the console (#1822). */
+  documentsEditMaxBytes?: number;
+  /**
+   * Read-only system/environment snapshot for GET /api/system (console System
+   * settings, #1376). Boot-time facts only — version, runtime, timezone, models.
+   */
+  system?: SystemSnapshot;
+  /**
+   * Triggers graceful process shutdown for POST /api/system/restart (#1765).
+   * Defaults to SIGTERM so the existing shutdown(0) handler in src/index.ts
+   * runs. Tests inject a spy to avoid killing the process.
+   */
+  scheduleShutdown?: () => void;
+  /**
+   * Voice session bridge — HttpAdapter mounts /api/voice/* and delegates to the
+   * handler installed by VoiceAdapter.start() (ADR-037).
+   */
+  voiceSessionBridge?: import('../voice/session-bridge.js').VoiceSessionBridge;
 }
 
 export class HttpAdapter implements Channel {
@@ -119,8 +223,6 @@ export class HttpAdapter implements Channel {
       agentRegistry,
       port,
       apiToken,
-      agentNames,
-      skillNames,
       webAppBootstrapSecret,
       appOrigin,
     } = this.config;
@@ -176,26 +278,10 @@ export class HttpAdapter implements Channel {
       const requestPath = (request.url ?? '').split('?')[0] ?? '';
       if (!isApiPath(routeUrl) && !isApiPath(requestPath)) return;
 
-      // These API routes use session-cookie auth and bypass bearer token enforcement.
-      // /api/setup/* is included because the onboarding wizard runs in the browser
-      // with the same curia_session cookie / x-web-bootstrap-secret pair as the
-      // identity routes; without this entry, requests get rejected at this hook
-      // before assertSecret ever runs.
-      if (
-        routeUrl === '/api/health' ||
-        routeUrl.startsWith('/api/kg') ||
-        routeUrl.startsWith('/api/identity') ||
-        routeUrl.startsWith('/api/executive') ||
-        routeUrl.startsWith('/api/jobs') ||
-        routeUrl.startsWith('/api/autonomy') ||
-        routeUrl.startsWith('/api/registry') ||
-        routeUrl.startsWith('/api/vault') ||
-        routeUrl.startsWith('/api/connections') ||
-        // Secret-capture routes are token-authed (the single-use token in the URL is the
-        // capability), so they bypass bearer auth and self-authorize via the token (#971).
-        routeUrl.startsWith('/api/secret-capture') ||
-        routeUrl.startsWith('/api/setup')
-      ) return;
+      // Session-cookie, capability-token and webhook-signature routes authenticate
+      // themselves and bypass bearer token enforcement. A new console route must be
+      // added to the list in auth.ts, or this hook rejects it before assertSecret runs.
+      if (bypassesBearerAuth(routeUrl)) return;
 
       if (!validateBearerToken(request.headers.authorization, apiToken)) {
         // Audit-log the failure: IP, route, and whether a token was even provided.
@@ -275,10 +361,11 @@ export class HttpAdapter implements Channel {
     }, 60_000);
     pruneInterval.unref();
 
-    // Register routes — message routes receive the eventRouter, not raw bus
-    await this.app.register(healthRoutes, { pool, logger, agentNames, skillNames });
+    await this.app.register(healthRoutes, {
+      healthService: this.config.healthService ?? createFallbackHealthService(pool, logger),
+      logger,
+    });
     await this.app.register(agentRoutes, { agentRegistry });
-    await this.app.register(messageRoutes, { bus, logger, eventRouter: this.eventRouter });
 
     if (this.config.schedulerService) {
       // Job routes use session-cookie auth (same as KG routes) so the dashboard can
@@ -288,8 +375,46 @@ export class HttpAdapter implements Channel {
         schedulerService: this.config.schedulerService,
         webAppBootstrapSecret,
         sessions,
+        // Needed so console-created jobs carry principal lineage (#1127).
+        contactService: this.config.contactService,
+        logger,
       });
     }
+
+    if (this.config.auditLogRepo) {
+      await this.app.register(antfarmRoutes, {
+        auditLogRepo: this.config.auditLogRepo,
+        eventRouter: this.eventRouter,
+        webAppBootstrapSecret,
+        sessions,
+        logger,
+      });
+    }
+
+    if (this.config.activityFeed) {
+      await this.app.register(activityRoutes, {
+        activity: this.config.activityFeed,
+        webAppBootstrapSecret,
+        sessions,
+        logger,
+      });
+    }
+
+    if (webAppBootstrapSecret && this.config.briefing) {
+      await this.app.register(dashboardRoutes, {
+        briefing: this.config.briefing,
+        webAppBootstrapSecret,
+        sessions,
+        logger,
+      });
+    }
+
+    // Licensed Ant Farm art — auth-gated so LimeZu sheets are never world-downloadable.
+    // Independent of auditLogRepo: art serving does not need the timeline data source.
+    await this.app.register(antfarmAssetsRoutes, {
+      webAppBootstrapSecret,
+      sessions,
+    });
 
     // Identity routes — only registered when the bootstrap secret is configured.
     // Uses the same auth pattern as KG routes (x-web-bootstrap-secret header).
@@ -328,6 +453,9 @@ export class HttpAdapter implements Channel {
         scheduleProcessExit: (delayMs) => {
           setTimeout(() => process.exit(0), delayMs);
         },
+        infraLlmService: this.config.infraLlmService,
+        contactService: this.config.contactService,
+        entityMemory: this.config.entityMemory,
       });
     }
 
@@ -350,6 +478,58 @@ export class HttpAdapter implements Channel {
       });
     }
 
+    // Memory retention (read-only) — console Memory settings page (#1376).
+    if (webAppBootstrapSecret && this.config.memoryRetention) {
+      await this.app.register(memoryRetentionRoutes, {
+        retention: this.config.memoryRetention,
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
+
+    // Documents — console Memory → Documents page over the OKF store (#1821).
+    if (webAppBootstrapSecret && this.config.workingDocsRepo) {
+      await this.app.register(documentsRoutes, {
+        workingDocs: this.config.workingDocsRepo,
+        logger,
+        webAppBootstrapSecret,
+        sessions,
+        // Same effective value DreamEngine purges with, so the derived expiry is honest.
+        scratchTtlDays: this.config.memoryRetention?.scratchTtlDays ?? DEFAULT_SCRATCH_DOC_TTL_DAYS,
+        editMaxBytes: this.config.documentsEditMaxBytes ?? DEFAULT_CONSOLE_EDIT_MAX_BYTES,
+        bus,
+      });
+    }
+
+    // System snapshot + restart — console System page (#1376, #1765).
+    if (webAppBootstrapSecret && this.config.system) {
+      const auditLogRepo = this.config.auditLogRepo;
+      await this.app.register(systemRoutes, {
+        system: this.config.system,
+        webAppBootstrapSecret,
+        sessions,
+        bus,
+        logger,
+        // SIGTERM is the same path Docker stop / `docker restart` already take
+        // (`process.on('SIGTERM', () => void shutdown())` in src/index.ts).
+        scheduleShutdown: this.config.scheduleShutdown ?? (() => {
+          process.kill(process.pid, 'SIGTERM');
+        }),
+        // Durable half of the 3/5min restart cap: count system.restart rows in
+        // audit_log so the window survives the process exit Fastify's in-memory
+        // limiter does not. Skip when the repo is not wired (tests).
+        countRecentRestarts: auditLogRepo
+          ? async () => {
+              const page = await auditLogRepo.findByEventTypes(['system.restart'], {
+                from: new Date(Date.now() - RESTART_WINDOW_MS),
+                limit: RESTART_MAX,
+              });
+              return page.rows.length;
+            }
+          : undefined,
+      });
+    }
+
     // Registry routes — session-auth for the skill/agent management UI.
     if (webAppBootstrapSecret && this.config.registryService) {
       await this.app.register(registryRoutes, {
@@ -357,18 +537,23 @@ export class HttpAdapter implements Channel {
         webAppBootstrapSecret,
         sessions,
       });
+    }
 
-      // Vault routes — secrets status + skill-secret entry for the registry UI's
-      // install-time gate. Requires both services: registryService scopes which
-      // secret names may be written.
-      if (this.config.secretsService) {
-        await this.app.register(vaultRoutes, {
-          secretsService: this.config.secretsService,
-          registryService: this.config.registryService,
-          webAppBootstrapSecret,
-          sessions,
-        });
-      }
+    // Vault routes — secrets status + credential entry for skill and MCP console UIs.
+    // Mounted whenever either the skill registry OR the MCP registry is present, so the
+    // credential-save endpoint works for MCP-only deployments (without a skill registry).
+    if (
+      webAppBootstrapSecret &&
+      this.config.secretsService &&
+      (this.config.registryService || this.config.mcpRegistryService)
+    ) {
+      await this.app.register(vaultRoutes, {
+        secretsService: this.config.secretsService,
+        registryService: this.config.registryService,
+        mcpRegistryService: this.config.mcpRegistryService,
+        webAppBootstrapSecret,
+        sessions,
+      });
     }
 
     // Channel registry routes — the channel install/enable lifecycle for the console UI.
@@ -382,28 +567,75 @@ export class HttpAdapter implements Channel {
       });
     }
 
-    // Only register KG routes when the secret is configured — if unset, the routes
-    // don't exist at all (404) rather than leaking a 503 that reveals the feature exists.
+    // MCP registry routes — the MCP server install/enable lifecycle for the console UI.
+    // Guards on the bootstrap secret + its own service, same pattern as channel registry.
+    if (webAppBootstrapSecret && this.config.mcpRegistryService) {
+      await this.app.register(mcpRegistryRoutes, {
+        mcpRegistryService: this.config.mcpRegistryService,
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
+
+    // Email accounts routes — CRUD for the email_accounts table + per-account Nylas
+    // grant writes. Requires the bootstrap secret + secretsService (to write grant IDs
+    // to the vault). The /api/registry/* auth bypass in the onRequest hook above covers
+    // these routes so they never reach the Bearer-token gate.
+    if (webAppBootstrapSecret && this.config.secretsService) {
+      await this.app.register(emailAccountsRoutes, {
+        pool,
+        secretsService: this.config.secretsService,
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
+
+    // Only register console session-authed routes when the secret is configured —
+    // if unset, the routes don't exist at all (404) rather than leaking a 503 that
+    // reveals the feature exists. Tasks/contacts/chat live under /api/* (#872);
+    // /api/kg/* keeps graph primitives only.
     if (webAppBootstrapSecret) {
       // secureCookies: true only when serving over HTTPS (i.e. APP_ORIGIN is https://).
       // In local dev (no APP_ORIGIN), cookies are set without the Secure flag so they
       // work on plain http://localhost.
       const secureCookies = appOrigin?.startsWith('https://') ?? false;
+      const consoleBase = { pool, logger, webAppBootstrapSecret, sessions };
       await this.app.register(knowledgeGraphRoutes, {
-        pool,
-        logger,
-        webAppBootstrapSecret,
+        ...consoleBase,
         secureCookies,
-        // bus + eventRouter are passed through for the KG chat endpoints
-        // (POST /api/kg/chat/messages, GET /api/kg/chat/stream). The chat routes
-        // reuse the shared EventRouter subscriptions set up above so we don't leak
-        // per-request bus subscribers.
+        contactService: this.config.contactService,
+        nodeMergeService: this.config.nodeMergeService,
+      });
+      await this.app.register(taskRoutes, {
+        ...consoleBase,
+        contactService: this.config.contactService,
+        taskRepo: this.config.taskRepo,
+      });
+      await this.app.register(contactRoutes, {
+        ...consoleBase,
+        contactService: this.config.contactService,
+      });
+      // Chat reuses the shared EventRouter subscriptions set up above so we don't
+      // leak per-request bus subscribers (POST /api/chat/messages, GET /api/chat/stream).
+      await this.app.register(chatRoutes, {
+        ...consoleBase,
         bus,
         eventRouter: this.eventRouter,
-        contactService: this.config.contactService,
-        sessions,
       });
+      // One-release 308 aliases so a stale console tab keeps working across deploy (#872).
+      await this.app.register(legacyKgAliasRoutes);
     }
+
+    // Voice session mint/end routes are always mounted. GET /api/voice/status reports
+    // enabled=false until VoiceAdapter.start() installs the handler; create/end still
+    // require the same console session auth as KG routes.
+    await this.app.register(voiceSessionRoutes, {
+      bridge: this.config.voiceSessionBridge ?? new VoiceSessionBridge(),
+      logger,
+      webAppBootstrapSecret,
+      sessions,
+      contactService: this.config.contactService,
+    });
 
     // Secret-capture routes (#971) — public, token-authed form for agent-initiated secret
     // capture. Independent of the bootstrap secret: the single-use token IS the credential,
@@ -422,12 +654,24 @@ export class HttpAdapter implements Channel {
     // the vault per request. Needs the vault; without it the route isn't mounted.
     if (this.config.secretsService) {
       const secrets = this.config.secretsService;
+      // Lives as long as the process: remembers each mailbox's last good answer and any rate-limit cool-down.
+      const phoneInboxCache = new PhoneInboxCache();
       await this.app.register(phoneInboxRoutes, {
         logger,
         getToken: () => secrets.get('phone_inbox_token'),
-        getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger),
+        getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger, undefined, phoneInboxCache),
       });
     }
+    // Telnyx SMS webhook — always mounted; SmsAdapter installs the handler on start.
+    // Authenticates via Ed25519 (bearer-exempt above). Returns 503 when SMS is not started.
+    await this.app.register(smsWebhookRoutes, {
+      bridge: this.config.smsWebhookBridge ?? new SmsWebhookBridge(),
+      logger,
+    });
+
+    // Ant Farm SPA — registered before the console wildcard so /antfarm/* resolves
+    // to this static bundle instead of the console /* fallback.
+    await this.app.register(antfarmStaticRoutes);
 
     // Books (MowMow bookkeeping) — QuickBooks connection and the narrow API the Mac mini uses. Curia holds the
     // QuickBooks tokens in the vault; the books token (BOOKS_API_TOKEN) reaches these routes only.

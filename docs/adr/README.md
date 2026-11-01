@@ -14,6 +14,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 
 ## Status values
 
+- **Proposed** — under consideration; not yet in force
 - **Accepted** — in force; the current approach
 - **Deprecated** — no longer relevant but kept for historical record
 - **Superseded by ADR-NNN** — replaced by a later decision
@@ -29,7 +30,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [005](005-node-pg-migrate-over-knex.md) | node-pg-migrate over Knex for migrations | Accepted |
 | [006](006-custom-framework-over-existing-agents.md) | Build custom framework over adopting existing agent frameworks | Accepted |
 | [007](007-anthropic-primary-llm-provider-agnostic-interface.md) | Anthropic as primary LLM with provider-agnostic interface | Accepted |
-| [008](008-openai-embeddings-for-knowledge-graph.md) | OpenAI text-embedding-3-small for knowledge graph embeddings | Accepted |
+| [008](008-openai-embeddings-for-knowledge-graph.md) | OpenAI text-embedding-3-small for knowledge graph embeddings | Superseded by ADR-051 |
 | [009](009-nylas-for-email.md) | Nylas as email integration layer | Accepted |
 | [010](010-signal-over-telegram.md) | Signal as high-trust messaging channel, rejecting Telegram | Accepted |
 | [011](011-score-based-autonomy-engine.md) | Score-based autonomy engine over capability-based permissions | Accepted |
@@ -44,6 +45,41 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [020](020-secrets-vault.md) | Application-layer AES-256-GCM secrets vault in PostgreSQL — structural typing, per-invocation pre-warm cache, env-var fallback for incremental migration | Accepted |
 | [021](021-vault-only-secret-resolution.md) | Vault-only secret resolution — remove the env fallback; only the four vault-bootstrap values stay in `.env`, everything else seeds via `seed-vault` | Accepted |
 | [022](022-skill-agent-registry.md) | DB-gated skill/agent registry — install/enable lifecycle with startup reconciliation and restart-based enforcement | Accepted |
+| [023](023-bullpen-consult-and-resume.md) | Async bullpen consult-and-resume convention — tap/park/resume over existing bullpen primitives, no new event types | Accepted |
+| [024](024-plan-rows-direct.md) | Plan primitive writes child rows directly (rows-direct) — not coordinator-proposed trees | Accepted |
+| [025](025-conversation-id-reversible-text-key.md) | `conversation_id` is a reversible TEXT key, not a UUID v5 — reject the #16 migration, reconcile specs to reality | Accepted |
+| [027](027-structured-secret-subfield-addressing.md) | Structured secrets with schema-tagged sub-field addressing — `secret_ref#field` projections gated to a registered schema, shipping `credit_card` first | Accepted |
+| [028](028-shared-unbound-agent-memory.md) | Shared, unbound agent memory — remove the inert `memory.scopes` field; govern access by capability gating + sensitivity tiers + provenance, not per-agent scopes | Accepted |
+| [029](029-passive-email-observation-and-counterfactual-competence.md) | Passive email observation — reuse existing stores, no new memory types; counterfactual (shadow) drafts are judged and recorded but no longer feed the Phase 3 score (#2191) | Accepted |
+| [030](030-per-task-warm-browser-session.md) | Opt-in, per-task warm browser session (`keep_warm`) — reject a global canonical session (collision); profile-level warmth stays always-on | Accepted |
+| [031](031-tools-vs-skills-vocabulary.md) | Tools vs skills vocabulary — atom rename to **tool**; free **skill** for collections (Phase 1 of #1436) | Accepted |
+| [032](032-polymorphic-pins-and-mcp-as-skill.md) | Polymorphic capability pins (skill \| tool \| future MCP) + MCP servers project skills into `SkillRegistry` — prerequisites for #1494 | Accepted |
+| [033](033-slack-channel-socket-mode.md) | Slack via Socket Mode — workspace-owned app, DMs + @mentions + in-thread continuation, sender-identity trust, `inbound.reaction` | Accepted |
+| [034](034-channel-contributed-principal-carveout-registry.md) | Channel-contributed principal carve-out registry — Gate C opt-in without scattering fail-closed logic | Accepted |
+| [035](035-channel-owned-outbound-recipient-projection.md) | Channel-owned outbound recipient projection — request variants + `extractRecipients` so the gateway needs no per-channel projection edit | Accepted |
+| [036](036-telnyx-sms-channel.md) | Telnyx SMS on a dedicated office DID — medium trust, new-DID-only, carrier STOP (no app ledger), voice Phase 2 SIP note | Accepted |
+| [037](037-voice-channel-livekit-duplex.md) | Duplex voice via self-hosted LiveKit cascade (console WebRTC); STT/TTS provider seams; Phase 2 Signal/PSTN deferred | Accepted |
+| [038](038-voice-brain-shared-hardening.md) | Voice brain parity via shared-hardening prompt modules — reject full coordinator consolidation; text may use `stream()` (#1563) | Accepted |
+| [039](039-decisions-in-the-ledger-not-the-knowledge-graph.md) | Operational decisions live in the relational ledger, not the KG — dedup exclusions move to `contact_dedup_exclusions` (#1625) | Accepted |
+| [040](040-contact-anchored-kg-node-identity.md) | Contact-anchored KG node identity — a contact's node is keyed on the contact, not its label; unanchored nodes stay label-keyed (#1694) | Accepted |
+| [041](041-aws-bedrock-llm-provider.md) | AWS Bedrock as a third `LLMProvider` via the Converse API; opt-in, tiers mapped in `local.yaml` (#1766, from #1349) | Proposed |
+| [042](042-email-sender-attribution-from-the-audit-log.md) | Recover email sender attribution from the audit log rather than accepting the pre-090 recall gap (#1887) | Accepted |
+| [043](043-bullpen-pending-window.md) | Bullpen pending-thread injection looks back seven days, in minutes end to end (#1899) | Accepted |
+| [044](044-delegate-wait-clamp-ceiling.md) | Delegate wait clamp stays at 895s; runs past it are late-delivery-only (#1857) | Accepted |
+| [045](045-delegated-specialist-trust.md) | Delegated specialist trust is decided upstream; requester identity is not a permission input (#1859) | Accepted |
+| [046](046-agent-behavior-fix-placement.md) | Agent behavior fixes go on the highest rung that works (code → trigger injection → tool description → playbook → always-on prompt); CI budgets the always-on prompt and local tool definitions (#1961) | Accepted |
+| [047](047-send-skills-address-recipients-by-reference.md) | Send skills address recipients by contact reference or the `principal` alias, with no raw-address path (cold outreach creates a contact first); agent-entered addresses are `agent_stated`, verified after a duplicate check; a `#label` hint selects a secondary address; a near-miss principal check is rejected; an `email-reply` verifies its recipient only when mail authentication passed, the address is not Curia's, and no likely duplicate exists (#2033, #2041, #2047, #2071) | Accepted |
+| [048](048-reasoning-policy.md) | Reasoning policy — reasoning passes back within a tool loop on every provider; one provider-neutral `reasoning.effort` per tier (unset = provider default) covers OpenRouter and Anthropic adaptive thinking; non-agent call sites state `none`; stale Anthropic thinking is dropped after a prefix change; agent calls send no temperature; `llm.call` records reasoning tokens, effort and upstream endpoint (#2044; amended 2026-10-20 and 2026-10-21) | Accepted |
+| [049](049-band-driven-autonomy.md) | The autonomy band decides when Curia asks first; contact tier only flags an outsider steering Curia, judged per send with the drafting turn's evidence; integrity rules stay deterministic; `autonomy.gating` rolls back (#2159) | Accepted |
+| [050](050-external-verifications-as-first-class-state.md) | External verifications are first-class state — a `verifications` record per site, per-turn injection over always-on prompt, tracked sign-in codes replaced by `[sign-in code]` in every tool input except `web-browser`, in-memory single-process tracker (#2017) | Accepted |
+| [051](051-knowledge-graph-embeddings-from-a-configurable-endpoint.md) | Knowledge graph embeddings come from any OpenAI-compatible endpoint, with a per-model profile (width, prefixes, thresholds), vectors stamped with their model, a boot gate and `pnpm reembed:kg` (#2023) | Accepted |
+| [052](052-knowledge-graph-node-merge.md) | Knowledge-graph node merge — previewed, plan-token-gated, single-transaction console merge; the survivor's type is the result type; the absorbed node is archived as a tombstone; contacts fold by survivor type; contact merges re-point calendars, grants and task/message references (#2233) | Accepted |
+| [053](053-turn-lanes-and-mid-turn-injection.md) | Turn lanes and mid-turn injection — one coordinator turn at a time per human conversation; only a live follow-up from that turn's resolved contact may join it; synthetic wakes wait (#2018; amended 2026-10-26) | Accepted |
+| [054](054-authority-aware-pii-disclosure.md) | Authority-aware PII disclosure — the band judge rules on each personal detail, code computes who authorized it, no cut-and-send, outreach links and asks instead of refusals (#2312) | Accepted |
+| [055](055-phone-app-as-an-installable-pwa.md) | Phone app as an installable PWA — HTTPS-only with a stated fallback; QR-paired per-device sessions with 90-day sliding expiry; one server-owned web thread; web push as a principal-only `web` channel that agents choose, with code enforcing availability and dead-subscription fallback (#2341) | Accepted |
+| [056](056-pinned-context.md) | Agents declare the documents and settings they work from (`pinned_context`) — `/shared/` documents and single config keys injected fresh every turn; declaring a `/shared/` path is the permission to write it; `/shared/` is durable by prefix (#2338) | Accepted |
+| [057](057-two-http-chat-surfaces.md) | Retire bearer `/api/messages` and `/api/messages/stream`; console chat on `/api/chat` is the only message ingress. The HTTP adapter, `API_TOKEN`, and catalog entry stay (#999) | Accepted |
+| [058](058-knowledge-graph-view-on-xyflow.md) | Knowledge Graph view drawn with xyflow, laid out by d3-force in a Web Worker; less detail when zoomed out, memoised nodes; same neighbourhood-at-a-time flow | Accepted |
 
 ## Adding new ADRs
 

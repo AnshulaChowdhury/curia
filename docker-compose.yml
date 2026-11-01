@@ -1,8 +1,6 @@
 services:
   postgres:
-    build:
-      context: .
-      dockerfile: docker/postgres.Dockerfile
+    image: ghcr.io/josephfung/curia-postgres:${CURIA_POSTGRES_TAG:-pg16}
     restart: unless-stopped
     # POSTGRES_PORT is parameterized so a second stack can coexist on the same
     # host (e.g. testing a fresh `pnpm run setup` against a sibling clone while
@@ -11,8 +9,6 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # pgAudit init script runs on first database creation only
-      - ./docker/postgres-init-pgaudit.sql:/docker-entrypoint-initdb.d/10-pgaudit.sql:ro
     environment:
       POSTGRES_DB: curia
       POSTGRES_USER: ${DB_USER:-your-db-user}
@@ -35,10 +31,29 @@ services:
       timeout: 5s
       retries: 5
 
+  livekit:
+    # Opt-in: plain `docker compose up` must not publish LiveKit ports or start
+    # a --dev server. Enable with `docker compose --profile voice up -d livekit`.
+    profiles:
+      - voice
+    image: livekit/livekit-server:${LIVEKIT_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # Local/dev default under the voice profile. LiveKit --dev uses known
+    # credentials (devkey / secret) — never expose that on a public interface.
+    # Production must set LIVEKIT_COMMAND to a real config (e.g.
+    # "--config /etc/livekit.yaml") with keys matching Settings → Channels → Voice,
+    # plus a bind mount of ./docker/livekit.yaml:/etc/livekit.yaml:ro.
+    command: ${LIVEKIT_COMMAND:---dev --bind 0.0.0.0}
+    ports:
+      # HTTP/WebSocket signaling. Use wss://<host> when served behind TLS.
+      - "${LIVEKIT_HTTP_PORT:-7880}:7880"
+      # WebRTC TCP fallback.
+      - "${LIVEKIT_RTC_TCP_PORT:-7881}:7881"
+      # WebRTC UDP. Open this on the host firewall/NAT.
+      - "${LIVEKIT_RTC_UDP_PORT:-7882}:7882/udp"
+
   curia:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/josephfung/curia:${CURIA_IMAGE_TAG:-latest}
     # No explicit container_name — Docker Compose generates `<project>-curia-1`,
     # which is namespaced by COMPOSE_PROJECT_NAME. The previous `container_name: curia`
     # was global to the Docker daemon and made it impossible to run a second curia

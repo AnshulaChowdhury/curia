@@ -1,0 +1,22 @@
+{
+  "name": "resolve-learning-digest",
+  "description": "Resolve a learning-digest item: approve/dismiss a voice proposal, undo or dismiss an auto-completed task, or confirm/dismiss a task-completion candidate. dismiss_completion drops either kind and does not change the task. Its detail says whether the task was left done (undo) or left incomplete (confirm).",
+  "version": "0.4.0",
+  "sensitivity": "normal",
+  "action_risk": "medium",
+  "inputs": {
+    "action": "string (approve_voice | dismiss_voice | undo_completion | confirm_completion | dismiss_completion)",
+    "number": "number? (N from the notification's 'confirm/undo/dismiss task N', e.g. 2)",
+    "task_id": "string? (alternative to number: full UUID or unique prefix)"
+  },
+  "outputs": {
+    "resolved": "boolean",
+    "detail": "string",
+    "kind": "string? (undo | confirm — set on dismiss_completion; undo means the task was left done)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 20000,
+  "capabilities": ["executiveProfileService", "entityMemory", "taskRepo"],
+  "allowed_callers": ["coordinator"]
+}

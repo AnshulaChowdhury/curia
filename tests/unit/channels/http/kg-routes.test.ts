@@ -6,6 +6,14 @@ import type { Logger } from '../../../../src/logger.js';
 import type { ContactService } from '../../../../src/contacts/contact-service.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { knowledgeGraphRoutes } from '../../../../src/channels/http/routes/kg.js';
+import { taskRoutes } from '../../../../src/channels/http/routes/tasks.js';
+import { contactRoutes } from '../../../../src/channels/http/routes/contacts.js';
+import { chatRoutes } from '../../../../src/channels/http/routes/chat.js';
+import { legacyKgAliasRoutes } from '../../../../src/channels/http/routes/legacy-kg-aliases.js';
+import { LLM_FAILURE_TURN_CONTENT, LLM_FAILURE_USER_MESSAGE } from '../../../../src/memory/llm-failure-turn.js';
+import { VOICE_GREETING_USER_MESSAGE } from '../../../../src/channels/voice/greeting.js';
+import type { EventBus } from '../../../../src/bus/bus.js';
+import type { EventRouter } from '../../../../src/channels/http/event-router.js';
 
 function createLogger(): Logger {
   return {
@@ -19,7 +27,7 @@ function createLogger(): Logger {
 }
 
 // Minimal ContactService stub. The canonical-field validation in
-// POST /api/kg/contacts runs before any service call, so for the email-format
+// POST /api/contacts runs before any service call, so for the email-format
 // tests below createContact must never be reached.
 function createContactService(): ContactService {
   return {
@@ -32,8 +40,13 @@ function createContactService(): ContactService {
     setRole: vi.fn(),
     updateContactFields: vi.fn(),
     validatePrimaryEmail: vi.fn(),
+    // Resolves the principal so console-created tasks carry principal lineage (#1127).
+    findContactBySystemRole: vi.fn().mockResolvedValue({ id: PRINCIPAL_CONTACT_ID }),
   } as unknown as ContactService;
 }
+
+// The principal contact id resolveConsoleOriginator() stamps on console-created tasks (#1127).
+const PRINCIPAL_CONTACT_ID = 'contact-principal';
 
 // Creates a pool mock that also supports pool.connect() for transaction tests.
 function createTransactionalPool(client: Partial<PoolClient>): Pick<Pool, 'query' | 'connect'> {
@@ -42,6 +55,80 @@ function createTransactionalPool(client: Partial<PoolClient>): Pick<Pool, 'query
     connect: vi.fn().mockResolvedValue(client),
   } as unknown as Pick<Pool, 'query' | 'connect'>;
 }
+
+// Minimal EventBus stub — chat history/messages routes need bus + eventRouter.
+function createMockBus(): EventBus {
+  return {
+    publish: vi.fn().mockResolvedValue(undefined),
+    subscribe: vi.fn(),
+  } as unknown as EventBus;
+}
+
+// Minimal EventRouter stub for the same reason.
+function createMockEventRouter(): EventRouter {
+  return {
+    waitForResponse: vi.fn(),
+    cancelPending: vi.fn(),
+    addSseClient: vi.fn().mockReturnValue(() => { /* cleanup noop */ }),
+    setupSubscriptions: vi.fn(),
+  } as unknown as EventRouter;
+}
+
+
+/** Register the console route plugins a test needs. Defaults to all four. */
+async function registerConsoleRoutes(
+  app: ReturnType<typeof Fastify>,
+  opts: {
+    pool: Pool;
+    logger: Logger;
+    webAppBootstrapSecret: string | undefined;
+    sessions: Map<string, number>;
+    contactService: ContactService;
+    bus?: EventBus;
+    eventRouter?: EventRouter;
+    taskRepo?: { updateTask: ReturnType<typeof vi.fn> };
+    include?: Array<'kg' | 'tasks' | 'contacts' | 'chat' | 'aliases'>;
+  },
+): Promise<void> {
+  const include = new Set(opts.include ?? ['kg', 'tasks', 'contacts', 'chat', 'aliases']);
+  const consoleBase = {
+    pool: opts.pool,
+    logger: opts.logger,
+    webAppBootstrapSecret: opts.webAppBootstrapSecret,
+    sessions: opts.sessions,
+  };
+  if (include.has('kg')) {
+    await app.register(knowledgeGraphRoutes, {
+      ...consoleBase,
+      secureCookies: false,
+      contactService: opts.contactService,
+    });
+  }
+  if (include.has('tasks')) {
+    await app.register(taskRoutes, {
+      ...consoleBase,
+      contactService: opts.contactService,
+      taskRepo: opts.taskRepo,
+    });
+  }
+  if (include.has('contacts')) {
+    await app.register(contactRoutes, {
+      ...consoleBase,
+      contactService: opts.contactService,
+    });
+  }
+  if (include.has('chat')) {
+    await app.register(chatRoutes, {
+      ...consoleBase,
+      bus: opts.bus ?? createMockBus(),
+      eventRouter: opts.eventRouter ?? createMockEventRouter(),
+    });
+  }
+  if (include.has('aliases')) {
+    await app.register(legacyKgAliasRoutes);
+  }
+}
+
 
 // A minimal valid Contact shape returned by contactService.getContact() stubs.
 function makeContact(overrides: Record<string, unknown> = {}) {
@@ -76,23 +163,63 @@ function makeContact(overrides: Record<string, unknown> = {}) {
   };
 }
 
-describe('knowledgeGraphRoutes', () => {
+describe('console routes (kg / tasks / contacts / chat)', () => {
   const pool = {
     query: vi.fn(),
-  } as unknown as Pick<Pool, 'query'>;
+  } as unknown as Pool;
 
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('rejects API requests without x-web-bootstrap-secret', async () => {
+
+  it('308-redirects legacy /api/kg/{tasks,contacts,chat} paths to /api/* (#872)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+    // Catch-all like the console SPA — aliases must win over it for both GET and POST.
+    app.get('/*', async () => ({ spa: true }));
+    app.post('/*', async () => ({ spa: true }));
+
+    const cases: Array<{ method: 'GET' | 'POST' | 'PATCH'; url: string; location: string }> = [
+      { method: 'GET', url: '/api/kg/tasks', location: '/api/tasks' },
+      { method: 'POST', url: '/api/kg/tasks', location: '/api/tasks' },
+      { method: 'PATCH', url: '/api/kg/tasks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', location: '/api/tasks/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+      { method: 'GET', url: '/api/kg/contacts', location: '/api/contacts' },
+      { method: 'POST', url: '/api/kg/chat/messages', location: '/api/chat/messages' },
+      { method: 'GET', url: '/api/kg/chat/stream', location: '/api/chat/stream' },
+      { method: 'GET', url: '/api/kg/chat/history?conversationId=c1', location: '/api/chat/history?conversationId=c1' },
+      { method: 'GET', url: '/api/kg/grant-recommendations', location: '/api/grant-recommendations' },
+      // Raw URL slice preserves percent-encoding (decoded `*` params would not).
+      { method: 'GET', url: '/api/kg/contacts/a%2Fb', location: '/api/contacts/a%2Fb' },
+      { method: 'GET', url: '/api/kg/contacts/x%3Fy', location: '/api/contacts/x%3Fy' },
+      { method: 'GET', url: '/api/kg/contacts/%C3%A9', location: '/api/contacts/%C3%A9' },
+    ];
+    for (const { method, url, location } of cases) {
+      const res = await app.inject({ method, url });
+      expect(res.statusCode, `${method} ${url}`).toBe(308);
+      expect(res.headers.location).toBe(location);
+    }
+    await app.close();
+  });
+
+  it('rejects API requests without x-web-bootstrap-secret', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
     });
 
     const response = await app.inject({ method: 'GET', url: '/api/kg/nodes' });
@@ -102,7 +229,7 @@ describe('knowledgeGraphRoutes', () => {
   });
 
   it('returns node results when authenticated', async () => {
-    pool.query.mockResolvedValueOnce({
+    (pool.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       rows: [
         {
           id: '11111111-1111-1111-1111-111111111111',
@@ -119,12 +246,14 @@ describe('knowledgeGraphRoutes', () => {
     });
 
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
     });
 
     const response = await app.inject({
@@ -143,12 +272,13 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 404 at / (console app handles that route, not kg.ts)', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      include: ['kg'],
     });
 
     const response = await app.inject({ method: 'GET', url: '/' });
@@ -159,12 +289,13 @@ describe('knowledgeGraphRoutes', () => {
 
   it('returns 400 for a malformed node_id UUID', async () => {
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      include: ['kg'],
     });
 
     const response = await app.inject({
@@ -181,17 +312,198 @@ describe('knowledgeGraphRoutes', () => {
     await app.close();
   });
 
+  // #1879 replaced this route's local RFC-strict regex (v1-v5 + [89ab] variant)
+  // with the shared shape-only matcher. Pin the widened boundary here, where the
+  // behaviour actually changed: a v7 id is a legitimate identifier that the old
+  // regex would have 400'd with no visible cause. The check still exists — it
+  // only stops being an RFC conformance test.
+  it('accepts a v7 node_id that the old strict regex would have rejected', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    const v7Id = '018f3a9c-7b21-7d4e-8f6a-1c2b3d4e5f60';
+    const nodeRow = {
+      id: v7Id,
+      type: 'person',
+      label: 'V7',
+      properties: {},
+      confidence: 1,
+      decay_class: 'stable',
+      source: 'test',
+      created_at: '2026-01-01T00:00:00Z',
+      last_confirmed_at: '2026-01-01T00:00:00Z',
+      sensitivity: 'normal',
+    };
+    (pool.query as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ rows: [nodeRow], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/kg/graph?node_id=${v7Id}`,
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    // Assert the success status, not merely "not 400" — a 500 after pool.query was
+    // invoked would satisfy the weaker form. And assert the id actually bound to the
+    // query, so this fails if the value is dropped or rewritten on the way through.
+    expect(response.statusCode).toBe(200);
+    expect(pool.query).toHaveBeenCalled();
+    const [, params] = (pool.query as ReturnType<typeof vi.fn>).mock.calls[0] as [string, unknown[]];
+    expect(params[0]).toBe(v7Id);
+
+    await app.close();
+  });
+
+  it('returns 404 when node_id names no row (#1881)', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    (pool.query as ReturnType<typeof vi.fn>).mockResolvedValue({ rows: [] });
+
+    const missingId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/kg/graph?node_id=${missingId}`,
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error).toBe(`Node not found: ${missingId}`);
+    // Only the traversal query — no edge fetch after an empty anchor.
+    expect(pool.query).toHaveBeenCalledTimes(1);
+
+    await app.close();
+  });
+
+  it('returns 404 for the nil UUID when it names no row (#1881)', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    (pool.query as ReturnType<typeof vi.fn>).mockResolvedValue({ rows: [] });
+
+    const nilId = '00000000-0000-0000-0000-000000000000';
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/kg/graph?node_id=${nilId}`,
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json().error).toBe(`Node not found: ${nilId}`);
+    expect(pool.query).toHaveBeenCalled();
+
+    await app.close();
+  });
+
+  it('returns 200 with the node and empty edges for an isolated node (#1881)', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    const isolatedId = '11111111-2222-4333-8444-555555555555';
+    const isolatedNode = {
+      id: isolatedId,
+      type: 'person',
+      label: 'Isolated',
+      properties: {},
+      confidence: 1,
+      decay_class: 'stable',
+      source: 'test',
+      created_at: '2026-01-01T00:00:00Z',
+      last_confirmed_at: '2026-01-01T00:00:00Z',
+      sensitivity: 'normal',
+    };
+    (pool.query as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ rows: [isolatedNode], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/kg/graph?node_id=${isolatedId}`,
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { nodes: Array<{ id: string }>; edges: unknown[] };
+    expect(body.nodes).toHaveLength(1);
+    expect(body.nodes[0]!.id).toBe(isolatedId);
+    expect(body.edges).toEqual([]);
+    expect(pool.query).toHaveBeenCalledTimes(2);
+
+    await app.close();
+  });
+
+  it('returns 200 with empty arrays when no node_id and the graph is empty (#1881)', async () => {
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    (pool.query as ReturnType<typeof vi.fn>).mockResolvedValue({ rows: [] });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/kg/graph',
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ nodes: [], edges: [] });
+
+    await app.close();
+  });
+
   it('returns 503 when the secret is not configured', async () => {
     // This exercises the defensive assertSecret path. In normal operation the
     // http-adapter does not register the routes when the secret is absent, but
     // the guard is kept inside the route handler as a belt-and-suspenders check.
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: undefined,
-      secureCookies: false,
       sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
     });
 
     const response = await app.inject({ method: 'GET', url: '/api/kg/nodes' });
@@ -209,13 +521,13 @@ describe('knowledgeGraphRoutes', () => {
   it('rejects a ReDoS-crafted primaryEmail quickly, before any service call', async () => {
     const contactService = createContactService();
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService,
+      include: ['contacts'],
     });
 
     // Trailing '@' makes the address invalid, forcing the matcher to explore
@@ -225,7 +537,7 @@ describe('knowledgeGraphRoutes', () => {
     const start = performance.now();
     const response = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { 'x-web-bootstrap-secret': 'secret-1' },
       payload: { displayName: 'Test Contact', primaryEmail: evilEmail },
     });
@@ -243,18 +555,18 @@ describe('knowledgeGraphRoutes', () => {
   it('accepts a well-formed primaryEmail through to the contact service', async () => {
     const contactService = createContactService();
     const app = Fastify();
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
       contactService,
+      include: ['contacts'],
     });
 
     const response = await app.inject({
       method: 'POST',
-      url: '/api/kg/contacts',
+      url: '/api/contacts',
       headers: { 'x-web-bootstrap-secret': 'secret-1' },
       payload: { displayName: 'Test Contact', primaryEmail: 'first.last@sub.example.co.uk' },
     });
@@ -272,29 +584,32 @@ describe('knowledgeGraphRoutes', () => {
     await app.close();
   });
 
-  // Regression for CodeQL #98 (js/missing-rate-limiting). GET /api/kg/chat/history
-  // reads from the working_memory table and was the only KG route missing the
-  // KG_RATE (60/min) per-route override — leaving it covered only by the looser
-  // global limit. We register @fastify/rate-limit with a deliberately high global
-  // cap (1000) so the route's own 60/min ceiling is the ONLY thing that can trip a
-  // 429: without the override all 61 requests would pass the limiter and return
-  // 401 at the secret guard; with it, the 61st is rejected by the limiter first.
-  it('rate-limits GET /api/kg/chat/history with the KG per-route cap', async () => {
+  // Regression for CodeQL #98 (js/missing-rate-limiting). GET /api/chat/history
+  // reads from the working_memory table and must carry the shared CONSOLE_RATE
+  // (60/min) per-route override — leaving it covered only by the looser
+  // global limit would be wrong. We register @fastify/rate-limit with a deliberately
+  // high global cap (1000) so the route's own 60/min ceiling is the ONLY thing that
+  // can trip a 429: without the override all 61 requests would pass the limiter and
+  // return 401 at the secret guard; with it, the 61st is rejected by the limiter first.
+  it('rate-limits GET /api/chat/history with the console per-route cap', async () => {
     const app = Fastify();
     await app.register(rateLimit, { max: 1000, timeWindow: '1 minute' });
-    await app.register(knowledgeGraphRoutes, {
+    await registerConsoleRoutes(app, {
       pool,
       logger: createLogger(),
       webAppBootstrapSecret: 'secret-1',
-      secureCookies: false,
       sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+      include: ['chat'],
     });
 
     // The rate-limit onRequest hook runs before the handler's assertSecret check,
     // so it increments on every (unauthenticated) request. Fire a handful past the
     // 60/min cap rather than pinning the assertion to the exact 61st request — the
     // boundary index isn't what we're testing, only that the per-route cap engages.
-    const url = '/api/kg/chat/history?conversationId=c1';
+    const url = '/api/chat/history?conversationId=c1';
     const statuses: number[] = [];
     for (let i = 0; i < 65; i++) {
       const res: LightMyRequestResponse = await app.inject({ method: 'GET', url });
@@ -306,15 +621,105 @@ describe('knowledgeGraphRoutes', () => {
     // limiter and not some blanket rejection.
     expect(statuses[0]).toBe(401);
     // A 429 within 65 requests can only come from the route's own 60/min override:
-    // the global cap is 1000, so without KG_RATE none of these would be throttled.
+    // the global cap is 1000, so without CONSOLE_RATE none of these would be throttled.
     expect(statuses).toContain(429);
 
     await app.close();
   });
 
+  it('rewrites LLM failure marker turns to the user-facing error in chat history (#1767)', async () => {
+    (pool.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      rows: [
+        { id: '4', role: 'assistant', content: 'Hi', created_at: new Date('2026-01-01T00:00:03Z'), created_at_iso: '2026-01-01T00:00:03.000000Z' },
+        { id: '3', role: 'user', content: 'Retry', created_at: new Date('2026-01-01T00:00:02Z'), created_at_iso: '2026-01-01T00:00:02.000000Z' },
+        { id: '2', role: 'assistant', content: LLM_FAILURE_TURN_CONTENT, created_at: new Date('2026-01-01T00:00:01Z'), created_at_iso: '2026-01-01T00:00:01.000000Z' },
+        { id: '1', role: 'user', content: 'Hello', created_at: new Date('2026-01-01T00:00:00Z'), created_at_iso: '2026-01-01T00:00:00.000000Z' },
+      ],
+    });
+
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/chat/history?conversationId=c1',
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { messages: Array<{ role: string; content: string }> };
+    expect(body.messages.map((m) => m.content)).toEqual(['Hello', LLM_FAILURE_USER_MESSAGE, 'Retry', 'Hi']);
+    expect(body.messages.some((m) => m.content === LLM_FAILURE_TURN_CONTENT)).toBe(false);
+
+    await app.close();
+  });
+
+  it('keeps scanning when a raw page is entirely filtered so older display messages remain reachable (#1775)', async () => {
+    const cueRows = Array.from({ length: 6 }, (_, i) => ({
+      id: `cue-${i}`,
+      role: 'user',
+      content: VOICE_GREETING_USER_MESSAGE,
+      created_at: new Date(`2026-01-01T00:01:0${i}Z`),
+      created_at_iso: `2026-01-01T00:01:0${i}.000000Z`,
+    }));
+    const older = [
+      { id: 'keep-2', role: 'assistant', content: 'hi', created_at: new Date('2026-01-01T00:00:01Z'), created_at_iso: '2026-01-01T00:00:01.000000Z' },
+      { id: 'keep-1', role: 'user', content: 'hello', created_at: new Date('2026-01-01T00:00:00Z'), created_at_iso: '2026-01-01T00:00:00.000000Z' },
+    ];
+    const allNewestFirst = [...cueRows].reverse().concat(older);
+
+    (pool.query as ReturnType<typeof vi.fn>).mockImplementation((_sql: string, params: unknown[]) => {
+      const before = params[1] as string | null;
+      const beforeId = params[2] as string | null;
+      const fetchLimit = params[3] as number;
+      const filtered = before
+        ? allNewestFirst.filter((r) => {
+          if (r.created_at_iso < before) return true;
+          if (r.created_at_iso > before) return false;
+          return beforeId != null && r.id < beforeId;
+        })
+        : allNewestFirst;
+      return { rows: filtered.slice(0, fetchLimit) };
+    });
+
+    const app = Fastify();
+    await registerConsoleRoutes(app, {
+      pool,
+      logger: createLogger(),
+      webAppBootstrapSecret: 'secret-1',
+      sessions: new Map(),
+      contactService: {} as unknown as ContactService,
+      bus: createMockBus(),
+      eventRouter: createMockEventRouter(),
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/chat/history?conversationId=c1&limit=2',
+      headers: { 'x-web-bootstrap-secret': 'secret-1' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { messages: Array<{ content: string }>; hasMore: boolean };
+    expect(body.messages.map((m) => m.content)).toEqual(['hello', 'hi']);
+    expect(body.hasMore).toBe(false);
+    expect(body.messages).toHaveLength(2);
+
+    await app.close();
+    vi.mocked(pool.query).mockReset();
+  });
+
   // ── Tier / kind validation (issue #1055) ────────────────────────────────────
 
-  describe('PATCH /api/kg/contacts/:id — tier/kind validation', () => {
+  describe('PATCH /api/contacts/:id — tier/kind validation', () => {
     it('rejects an invalid tier value with 400', async () => {
       const contactService = createContactService();
       vi.mocked(contactService.getContact).mockResolvedValue(makeContact() as never);
@@ -326,18 +731,18 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        include: ['contacts'],
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'superuser' },
       });
@@ -358,18 +763,19 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'principal' },
       });
@@ -390,18 +796,19 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { kind: 'principal' },
       });
@@ -422,18 +829,19 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { kind: 'agent' },
       });
@@ -456,18 +864,19 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'known' },
       });
@@ -489,18 +898,19 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { displayName: 'New Name', tier: 'trusted' },
       });
@@ -527,18 +937,19 @@ describe('knowledgeGraphRoutes', () => {
       const txPool = createTransactionalPool(client);
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: txPool as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { tier: 'trusted', kind: 'organization' },
       });
@@ -561,18 +972,19 @@ describe('knowledgeGraphRoutes', () => {
       );
 
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool: { query: vi.fn() } as unknown as Pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'PATCH',
-        url: '/api/kg/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        url: '/api/contacts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { kind: 'person' },
       });
@@ -583,22 +995,22 @@ describe('knowledgeGraphRoutes', () => {
     });
   });
 
-  describe('POST /api/kg/contacts — tier/kind validation', () => {
+  describe('POST /api/contacts — tier/kind validation', () => {
     it('rejects an invalid tier value with 400', async () => {
       const contactService = createContactService();
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        include: ['contacts'],
       });
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/contacts',
+        url: '/api/contacts',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { displayName: 'Test', tier: 'superuser' },
       });
@@ -612,24 +1024,185 @@ describe('knowledgeGraphRoutes', () => {
     it('rejects tier="principal" in POST (structural guard)', async () => {
       const contactService = createContactService();
       const app = Fastify();
-      await app.register(knowledgeGraphRoutes, {
+      await registerConsoleRoutes(app, {
         pool,
         logger: createLogger(),
         webAppBootstrapSecret: 'secret-1',
-        secureCookies: false,
         sessions: new Map(),
         contactService,
+        bus: createMockBus(),
+        eventRouter: createMockEventRouter(),
       });
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/contacts',
+        url: '/api/contacts',
         headers: { 'x-web-bootstrap-secret': 'secret-1' },
         payload: { displayName: 'Test', tier: 'principal' },
       });
 
       expect(res.statusCode).toBe(400);
       expect(contactService.createContact).not.toHaveBeenCalled();
+      await app.close();
+    });
+  });
+
+  describe('POST /api/tasks — principal lineage (#1127)', () => {
+    // Helper: register the routes with a contactService stub and return both so tests can
+    // inspect findContactBySystemRole and the INSERT params.
+    async function setupTasksApp(contactService: ContactService) {
+      const app = Fastify();
+      const logger = createLogger();
+      await registerConsoleRoutes(app, {
+        pool,
+        logger,
+        webAppBootstrapSecret: 'secret-1',
+        sessions: new Map(),
+        contactService,
+        include: ['tasks'],
+      });
+      return { app, logger };
+    }
+
+    const validPayload = { agentId: 'coordinator', intentAnchor: 'follow up with vendor' };
+
+    it('stamps a principal TaskOriginator on the inserted task row', async () => {
+      const contactService = createContactService();
+      // INSERT returns the created row.
+      (pool.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: 'task-1', agent_id: 'coordinator', title: 'follow up with vendor' }],
+      });
+      const { app } = await setupTasksApp(contactService);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        headers: { 'x-web-bootstrap-secret': 'secret-1' },
+        payload: validPayload,
+      });
+
+      expect(res.statusCode).toBe(201);
+      expect(contactService.findContactBySystemRole).toHaveBeenCalledWith('principal');
+
+      // The INSERT is the single pool.query call; its last param is the originator JSON.
+      const insertCall = (pool.query as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const sql = insertCall[0] as string;
+      const params = insertCall[1] as unknown[];
+      expect(sql).toContain('originator');
+      const originatorJson = params[params.length - 1] as string;
+      expect(JSON.parse(originatorJson)).toMatchObject({
+        contactId: PRINCIPAL_CONTACT_ID,
+        systemRole: 'principal',
+        channel: 'console',
+        tier: 'principal',
+      });
+      // Omitted source defaults to 'ceo' (non-derived), not 'agent' (#1127) — otherwise the
+      // heartbeat would mark the task derived and the ladder would downgrade the lineage we
+      // just stamped. source is the 9th INSERT param ($9).
+      expect(params[8]).toBe('ceo');
+      await app.close();
+    });
+
+    it('falls back to null originator when no principal contact exists', async () => {
+      const contactService = createContactService();
+      vi.mocked(contactService.findContactBySystemRole).mockResolvedValueOnce(null);
+      (pool.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: 'task-2', agent_id: 'coordinator', title: 'follow up with vendor' }],
+      });
+      const { app, logger } = await setupTasksApp(contactService);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        headers: { 'x-web-bootstrap-secret': 'secret-1' },
+        payload: validPayload,
+      });
+
+      expect(res.statusCode).toBe(201);
+      const insertCall = (pool.query as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const params = insertCall[1] as unknown[];
+      // Conservative default: no lineage stamped, but the task is still created.
+      expect(params[params.length - 1]).toBeNull();
+      // The drop must be observable with the created task id for later correlation (#1127).
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: 'task-2', channel: 'console' }),
+        expect.stringContaining('WITHOUT principal lineage'),
+      );
+      await app.close();
+    });
+
+    it('accepts a legitimate agent name as sourceAgentId (#1882)', async () => {
+      const contactService = createContactService();
+      (pool.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: 'task-3', agent_id: 'coordinator', title: 'follow up with vendor' }],
+      });
+      const { app } = await setupTasksApp(contactService);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        headers: { 'x-web-bootstrap-secret': 'secret-1' },
+        payload: { ...validPayload, sourceAgentId: 'health-service' },
+      });
+
+      expect(res.statusCode).toBe(201);
+      const insertCall = (pool.query as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const params = insertCall[1] as unknown[];
+      // source_agent_id is the 10th INSERT param ($10).
+      expect(params[9]).toBe('health-service');
+      await app.close();
+    });
+
+    it.each([
+      ['coordinator', 'known agent'],
+      ['a'.repeat(64), 'max length'],
+    ])('accepts sourceAgentId %j (%s) (#1882)', async (name) => {
+      const contactService = createContactService();
+      (pool.query as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ id: 'task-ok', agent_id: 'coordinator', title: 'follow up with vendor' }],
+      });
+      const { app } = await setupTasksApp(contactService);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        headers: { 'x-web-bootstrap-secret': 'secret-1' },
+        payload: { ...validPayload, sourceAgentId: name },
+      });
+
+      expect(res.statusCode).toBe(201);
+      const insertCall = (pool.query as ReturnType<typeof vi.fn>).mock.calls[0]!;
+      const params = insertCall[1] as unknown[];
+      expect(params[9]).toBe(name);
+      await app.close();
+    });
+
+    it.each([
+      ['a'.repeat(65), 'over length'],
+      ['coord\u0000inator', 'control char'],
+      ['Coordinator', 'uppercase'],
+      ['1agent', 'leading digit'],
+      ['-agent', 'leading hyphen'],
+      ['my_agent', 'underscore'],
+      ['Bad Agent!', 'space and punctuation'],
+    ])('rejects sourceAgentId %j (%s) with 400 (#1882)', async (name) => {
+      const contactService = createContactService();
+      const { app } = await setupTasksApp(contactService);
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        headers: { 'x-web-bootstrap-secret': 'secret-1' },
+        payload: { ...validPayload, sourceAgentId: name },
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(/Invalid sourceAgentId/);
+      expect(pool.query).not.toHaveBeenCalled();
       await app.close();
     });
   });

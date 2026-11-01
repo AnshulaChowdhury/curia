@@ -5,7 +5,17 @@ import type { CreateJobParams } from '../../../src/scheduler/scheduler-service.j
 // -- Mock helpers --
 
 function mockPool() {
-  return { query: vi.fn() };
+  const clientQuery = vi.fn();
+  const client = {
+    query: clientQuery,
+    release: vi.fn(),
+  };
+  return {
+    query: vi.fn(),
+    connect: vi.fn().mockResolvedValue(client),
+    _clientQuery: clientQuery,
+    _client: client,
+  };
 }
 
 function mockBus() {
@@ -102,10 +112,11 @@ describe('SchedulerService', () => {
     it('creates a persistent task when intentAnchor is provided', async () => {
       const jobId = 'job-333';
       const taskId = 'task-aaa';
-      // First call: INSERT into scheduled_jobs
-      pool.query.mockResolvedValueOnce({ rows: [{ id: jobId }] });
-      // Second call: CTE returns { task_id, job_id } confirming both INSERT and UPDATE succeeded
-      pool.query.mockResolvedValueOnce({ rows: [{ task_id: taskId, job_id: jobId }] });
+      pool._clientQuery
+        .mockResolvedValueOnce({ rows: [] }) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: jobId }] }) // INSERT into scheduled_jobs
+        .mockResolvedValueOnce({ rows: [{ task_id: taskId, job_id: jobId }] }) // task CTE
+        .mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       const params: CreateJobParams = {
         agentId: 'agent-3',
@@ -113,17 +124,76 @@ describe('SchedulerService', () => {
         taskPayload: { skill: 'report' },
         createdBy: 'system',
         intentAnchor: 'weekly-report',
-        errorBudget: { maxRetries: 5 },
+        errorBudget: { resumable: true, max_iterations: 50 },
       };
       const result = await svc.createJob(params);
 
       expect(result.jobId).toBe(jobId);
       expect(result.agentTaskId).toBe(taskId);
 
-      // Two queries: job insert + task CTE (INSERT tasks + UPDATE scheduled_jobs.task_id)
-      expect(pool.query).toHaveBeenCalledTimes(2);
-      const taskSql = pool.query.mock.calls[1]?.[0] as string;
-      expect(taskSql).toContain('INSERT INTO tasks');
+      expect(pool.connect).toHaveBeenCalledOnce();
+      const clientCalls = pool._clientQuery.mock.calls.map(([sql]) => sql as string);
+      expect(clientCalls[0]).toBe('BEGIN');
+      expect(clientCalls[1]).toContain('INSERT INTO scheduled_jobs');
+      expect(clientCalls[2]).toContain('INSERT INTO tasks');
+      expect(clientCalls[3]).toBe('COMMIT');
+      expect(pool._client.release).toHaveBeenCalledOnce();
+    });
+
+    it('rejects per-invocation error_budget keys on persistent tasks (#883)', async () => {
+      const params: CreateJobParams = {
+        agentId: 'agent-3',
+        cronExpr: '0 */6 * * *',
+        taskPayload: { skill: 'report' },
+        createdBy: 'system',
+        intentAnchor: 'weekly-report',
+        errorBudget: { maxTurns: 30 },
+      };
+
+      await expect(svc.createJob(params)).rejects.toThrow(/not supported on tasks/);
+      expect(pool.connect).not.toHaveBeenCalled();
+    });
+
+    it('rejects null and array errorBudget values (#883)', async () => {
+      const base: CreateJobParams = {
+        agentId: 'agent-3',
+        cronExpr: '0 */6 * * *',
+        taskPayload: { skill: 'report' },
+        createdBy: 'system',
+        intentAnchor: 'weekly-report',
+      };
+
+      await expect(svc.createJob({ ...base, errorBudget: null as unknown as Record<string, unknown> }))
+        .rejects.toThrow(/must be an object/);
+      await expect(svc.createJob({ ...base, errorBudget: [] as unknown as Record<string, unknown> }))
+        .rejects.toThrow(/must be an object/);
+      expect(pool.connect).not.toHaveBeenCalled();
+    });
+
+    it('rolls back when the task CTE throws — no orphaned scheduled_jobs row', async () => {
+      const jobId = 'job-rollback';
+      pool._clientQuery
+        .mockResolvedValueOnce({ rows: [] }) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: jobId }] }) // INSERT into scheduled_jobs
+        .mockRejectedValueOnce(new Error('task link failed')) // task CTE throws
+        .mockResolvedValueOnce({ rows: [] }); // ROLLBACK
+
+      const params: CreateJobParams = {
+        agentId: 'agent-3',
+        cronExpr: '0 */6 * * *',
+        taskPayload: { skill: 'report' },
+        createdBy: 'system',
+        intentAnchor: 'weekly-report',
+      };
+
+      await expect(svc.createJob(params)).rejects.toThrow('task link failed');
+
+      const clientCalls = pool._clientQuery.mock.calls.map(([sql]) => sql as string);
+      expect(clientCalls).toContain('BEGIN');
+      expect(clientCalls).toContain('ROLLBACK');
+      expect(clientCalls).not.toContain('COMMIT');
+      expect(bus.publish).not.toHaveBeenCalled();
+      expect(pool._client.release).toHaveBeenCalledOnce();
     });
 
     it('rejects when neither cronExpr nor runAt is provided', async () => {
@@ -273,6 +343,43 @@ describe('SchedulerService', () => {
     });
   });
 
+  // -- pauseJob (operator-initiated pause; distinct from drift pause) --
+
+  describe('pauseJob', () => {
+    it('sets both the job and its linked task to paused in one query', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      await svc.pauseJob('job-pause');
+
+      expect(pool.query).toHaveBeenCalledTimes(1);
+      const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
+      // Single CTE updates scheduled_jobs and the linked tasks row together.
+      expect(sql).toContain('scheduled_jobs');
+      expect(sql).toContain('tasks');
+      expect(sql).toContain('paused');
+      // Terminal jobs must not be re-armable via pause → resume.
+      expect(sql).toContain("NOT IN ('cancelled', 'completed')");
+      expect(params[0]).toBe('job-pause');
+    });
+
+    it('throws when the job is missing or already terminal (0 rows)', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+      await expect(svc.pauseJob('gone')).rejects.toThrow('not found or already cancelled/completed');
+    });
+  });
+
+  // -- pauseJobForDrift (drift path stays non-throwing) --
+
+  describe('pauseJobForDrift', () => {
+    it('logs a warning but does not throw when the job matched nothing', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+      await expect(svc.pauseJobForDrift('gone')).resolves.toBeUndefined();
+      expect(logger.warn).toHaveBeenCalled();
+    });
+  });
+
   // -- listJobs --
 
   describe('listJobs', () => {
@@ -325,6 +432,55 @@ describe('SchedulerService', () => {
       const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain('agent_id');
       expect(params).toContain('agent-x');
+    });
+
+    it('applies a SQL LIMIT when a limit is provided (#1487)', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+
+      await svc.listJobs({ limit: 50 });
+
+      const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('LIMIT');
+      expect(params).toContain(50);
+    });
+
+    it('does NOT add a LIMIT clause when no limit is provided', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+
+      await svc.listJobs();
+
+      const [sql] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).not.toContain('LIMIT');
+    });
+
+    it('floors a fractional limit and combines it with filters at the right param index', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+
+      await svc.listJobs({ status: 'pending', limit: 10.9 });
+
+      const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('LIMIT $2');
+      expect(params).toEqual(['pending', 10]);
+    });
+
+    it('ignores a non-positive limit (no LIMIT clause)', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+
+      await svc.listJobs({ limit: 0 });
+
+      const [sql] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).not.toContain('LIMIT');
+    });
+
+    it('floors a fractional limit in (0, 1) up to 1, not down to a zero-row LIMIT', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [] });
+
+      await svc.listJobs({ limit: 0.5 });
+
+      const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
+      expect(sql).toContain('LIMIT');
+      expect(params).toContain(1);
+      expect(params).not.toContain(0);
     });
   });
 
@@ -383,8 +539,38 @@ describe('SchedulerService', () => {
       const result = await svc.completeJobRun('job-os', true);
 
       expect(result.suspended).toBe(false);
-      const [, params] = pool.query.mock.calls[1] as [string, unknown[]];
+      const [sql, params] = pool.query.mock.calls[1] as [string, unknown[]];
       expect(params).toContain('completed');
+      // #1938: a running self-reschedule is armed from deferred_wake_at instead of
+      // completing the row. The CASE must stay on this write.
+      expect(sql).toContain('deferred_wake_at');
+      expect(sql).toContain("THEN 'pending'");
+    });
+
+    it('arms a deferred wake on failure only while under the suspend threshold', async () => {
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: 'job-defer', cron_expr: null, status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'pending' }], rowCount: 1 });
+
+      const result = await svc.completeJobRun('job-defer', false, 'boom');
+
+      expect(result.suspended).toBe(false);
+      const [sql] = pool.query.mock.calls[1] as [string];
+      expect(sql).toContain('consecutive_failures = $1');
+      expect(sql).toContain('deferred_wake_at IS NOT NULL AND $1 < 3');
+      expect(sql).not.toContain('THEN 0');
+    });
+
+    it('reports suspended when a deferred failure returns status suspended', async () => {
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: 'job-defer-suspend', cron_expr: null, status: 'running', consecutive_failures: 2, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'suspended' }], rowCount: 1 });
+
+      const result = await svc.completeJobRun('job-defer-suspend', false, 'boom');
+
+      expect(result.suspended).toBe(true);
     });
 
     it('updates next_run_at for recurring job on success', async () => {
@@ -404,7 +590,7 @@ describe('SchedulerService', () => {
       pool.query.mockResolvedValueOnce({
         rows: [{ id: 'job-fail', cron_expr: '0 9 * * *', status: 'pending', consecutive_failures: 2 }],
       });
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'suspended' }], rowCount: 1 });
 
       const result = await svc.completeJobRun('job-fail', false, 'boom');
 
@@ -417,11 +603,28 @@ describe('SchedulerService', () => {
       pool.query.mockResolvedValueOnce({
         rows: [{ id: 'job-f1', cron_expr: '0 9 * * *', status: 'pending', consecutive_failures: 0 }],
       });
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'failed' }], rowCount: 1 });
 
       const result = await svc.completeJobRun('job-f1', false, 'oops');
 
       expect(result.suspended).toBe(false);
+    });
+
+    it('skips the completion write when the job is no longer running (0 rows updated)', async () => {
+      // Fetch says running, but the fenced UPDATE matches 0 rows because a concurrent
+      // pause/cancel changed the status — completion must not resurrect the job.
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: 'job-race', cron_expr: '0 9 * * *', status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // fenced UPDATE: no running row
+
+      const result = await svc.completeJobRun('job-race', true);
+
+      expect(result.suspended).toBe(false);
+      // The UPDATE is fenced against operator-intervention states so a paused/cancelled
+      // job stays put, while a plain 'pending' wake job can still be completed.
+      const [sql] = pool.query.mock.calls[1] as [string];
+      expect(sql).toContain("status NOT IN ('paused', 'cancelled')");
     });
 
     it('clears run_started_at on success for a recurring job', async () => {
@@ -442,7 +645,7 @@ describe('SchedulerService', () => {
         .mockResolvedValueOnce({
           rows: [{ id: 'job-1', cron_expr: '0 9 * * *', status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
         })
-        .mockResolvedValueOnce({ rows: [] }); // UPDATE
+        .mockResolvedValueOnce({ rows: [{ status: 'failed' }], rowCount: 1 });
 
       await svc.completeJobRun('job-1', false, 'some error');
 
@@ -502,7 +705,7 @@ describe('SchedulerService', () => {
       pool.query.mockResolvedValueOnce({
         rows: [{ id: jobId, cron_expr: '0 9 * * *', status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
       });
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'failed' }], rowCount: 1 });
 
       await svc.completeJobRun(jobId, false, 'something went wrong');
 
@@ -510,6 +713,80 @@ describe('SchedulerService', () => {
       const sql: string = updateCall[0];
       const params: unknown[] = updateCall[1];
       expect(sql).toContain('last_run_outcome');
+      expect(params).toContain('failed');
+    });
+
+    it('merges failedSkills into last_run_context without flipping health (#1830)', async () => {
+      const jobId = 'job-failed-skills';
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: jobId, cron_expr: '0 9 * * *', status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      const failedSkills = [{ name: 'bullpen-post', error: 'Thread not found' }];
+      const result = await svc.completeJobRun(jobId, true, undefined, 'sweep done', failedSkills);
+
+      expect(result).toEqual({ suspended: false });
+      const updateCall = pool.query.mock.calls[1];
+      const sql: string = updateCall[0];
+      const params: unknown[] = updateCall[1];
+      expect(sql).toContain('last_run_outcome = $4');
+      expect(params).toContain('completed');
+      expect(sql).toContain('consecutive_failures = 0');
+      expect(sql).toContain('last_error = NULL');
+      expect(sql).toContain("jsonb_typeof(last_run_context) = 'object'");
+      expect(sql).toContain("(last_run_context - 'failedSkills' - 'failedSkillsOmitted')");
+      expect(params).toContain(JSON.stringify({ failedSkills }));
+    });
+
+    it('clears stale failedSkills key when this run had no tool failures (#1830)', async () => {
+      const jobId = 'job-clear-failed-skills';
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: jobId, cron_expr: null, status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      await svc.completeJobRun(jobId, true, undefined, 'all good');
+
+      const updateCall = pool.query.mock.calls[1];
+      const sql: string = updateCall[0];
+      expect(sql).toContain("jsonb_typeof(last_run_context) = 'object'");
+      expect(sql).toContain("last_run_context - 'failedSkills' - 'failedSkillsOmitted'");
+      expect(sql).not.toContain('|| $');
+    });
+
+    it('clears failedSkills on the failure path when none were reported (#1830)', async () => {
+      const jobId = 'job-fail-clear-skills';
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: jobId, cron_expr: '0 9 * * *', status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'failed' }], rowCount: 1 });
+
+      await svc.completeJobRun(jobId, false, 'budget blown');
+
+      const updateCall = pool.query.mock.calls[1];
+      const sql: string = updateCall[0];
+      expect(sql).toContain("last_run_outcome = $5");
+      expect(sql).toContain("jsonb_typeof(last_run_context) = 'object'");
+      expect(sql).toContain("last_run_context - 'failedSkills' - 'failedSkillsOmitted'");
+      expect(sql).not.toContain('|| $6');
+    });
+
+    it('merges failedSkills on the failure path when the isError response carried them (#1830)', async () => {
+      const jobId = 'job-fail-merge-skills';
+      pool.query.mockResolvedValueOnce({
+        rows: [{ id: jobId, cron_expr: '0 9 * * *', status: 'running', consecutive_failures: 0, timezone: 'UTC' }],
+      });
+      pool.query.mockResolvedValueOnce({ rows: [{ status: 'failed' }], rowCount: 1 });
+
+      const failedSkills = [{ name: 'bullpen-post', error: 'Thread not found' }];
+      await svc.completeJobRun(jobId, false, 'budget blown', undefined, failedSkills);
+
+      const updateCall = pool.query.mock.calls[1];
+      const sql: string = updateCall[0];
+      const params: unknown[] = updateCall[1];
+      expect(sql).toContain('|| $6::jsonb');
+      expect(params).toContain(JSON.stringify({ failedSkills }));
       expect(params).toContain('failed');
     });
 
@@ -528,8 +805,9 @@ describe('SchedulerService', () => {
       // Must use COALESCE so an agent-provided scheduler-report call wins
       expect(sql).toContain('COALESCE(last_run_summary,');
       expect(params).toContain('auto summary');
-      // Must NOT touch last_run_context — that column is only written by scheduler-report
-      expect(sql).not.toContain('last_run_context');
+      // No failedSkills → clear the keys only; do not merge a payload (#1830)
+      expect(sql).toContain("last_run_context - 'failedSkills' - 'failedSkillsOmitted'");
+      expect(sql).toContain("jsonb_typeof(last_run_context) = 'object'");
     });
 
     it('uses COALESCE for last_run_summary so agent-provided summary wins (recurring)', async () => {
@@ -580,7 +858,10 @@ describe('SchedulerService', () => {
             timezone: 'America/Toronto',
           }],
         })
-        .mockResolvedValueOnce({ rows: [] }); // UPDATE
+        .mockResolvedValueOnce({
+          rows: [{ status: 'pending', consecutive_failures: 1, rearmed: false }],
+          rowCount: 1,
+        });
 
       const result = await svc.recoverStuckJob('job-1', 900);
 
@@ -595,6 +876,14 @@ describe('SchedulerService', () => {
       // Error message should mention timeout
       const lastError = updateParams.find(p => typeof p === 'string' && (p as string).includes('timed out'));
       expect(lastError).toBeTruthy();
+      // #1829: claim already NULLed last_run_summary; recovery must not restore a stale
+      // success summary — leaving the column alone keeps the mid-run NULL honest.
+      // last_run_context is also untouched (continuity cursors survive timeouts).
+      expect(updateSql).not.toContain('last_run_summary');
+      expect(updateSql).not.toContain('last_run_context');
+      expect(updateSql).toContain('FOR UPDATE');
+      expect(updateSql).toContain('AS rearmed');
+      expect(result.rearmed).toBe(false);
     });
 
     it('resets a one-shot stuck job to pending with next_run_at = now', async () => {
@@ -608,7 +897,10 @@ describe('SchedulerService', () => {
             timezone: 'UTC',
           }],
         })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({
+          rows: [{ status: 'pending', consecutive_failures: 1, rearmed: false }],
+          rowCount: 1,
+        });
 
       const result = await svc.recoverStuckJob('job-2', 600);
 
@@ -632,7 +924,10 @@ describe('SchedulerService', () => {
             timezone: 'UTC',
           }],
         })
-        .mockResolvedValueOnce({ rows: [] });
+        .mockResolvedValueOnce({
+          rows: [{ status: 'suspended', consecutive_failures: 3, rearmed: false }],
+          rowCount: 1,
+        });
 
       const result = await svc.recoverStuckJob('job-3', 600);
 
@@ -675,7 +970,10 @@ describe('SchedulerService', () => {
             timezone: 'UTC',
           }],
         })
-        .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+        .mockResolvedValueOnce({
+          rowCount: 1,
+          rows: [{ status: 'pending', consecutive_failures: 1, rearmed: false }],
+        });
 
       const result = await svc.recoverStuckJob('job-ok', 600);
 
@@ -695,7 +993,10 @@ describe('SchedulerService', () => {
         .mockResolvedValueOnce({
           rows: [{ id: jobId, cron_expr: null, run_at: null, consecutive_failures: 0, timezone: 'UTC' }],
         })
-        .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+        .mockResolvedValueOnce({
+          rowCount: 1,
+          rows: [{ status: 'pending', consecutive_failures: 1, rearmed: false }],
+        });
 
       await svc.recoverStuckJob(jobId, 600);
 
@@ -881,10 +1182,11 @@ describe('SchedulerService', () => {
     });
 
     it('creates a tasks row when intent_anchor is provided', async () => {
-      // First query: the scheduled_jobs upsert; second query: CTE returns { task_id, job_id }
-      // confirming both the tasks INSERT and scheduled_jobs UPDATE succeeded.
-      pool.query.mockResolvedValueOnce({ rows: [{ id: 'job-anchor' }] });
-      pool.query.mockResolvedValueOnce({ rows: [{ task_id: 'task-new', job_id: 'job-anchor' }] });
+      pool._clientQuery
+        .mockResolvedValueOnce({ rows: [] }) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 'job-anchor' }] }) // upsert
+        .mockResolvedValueOnce({ rows: [{ task_id: 'task-new', job_id: 'job-anchor' }] }) // task CTE
+        .mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       await svc.upsertDeclarativeJob('coordinator', 'coordinator', {
         cron: '0 9 * * 1',
@@ -892,24 +1194,22 @@ describe('SchedulerService', () => {
         intent_anchor: 'Produce a weekly summary of key business metrics',
       });
 
-      expect(pool.query).toHaveBeenCalledTimes(2);
+      expect(pool.connect).toHaveBeenCalledOnce();
+      const clientCalls = pool._clientQuery.mock.calls.map(([sql]) => sql as string);
+      expect(clientCalls[0]).toBe('BEGIN');
+      expect(clientCalls[1]).toContain('ON CONFLICT');
+      expect(clientCalls[2]).toContain('INSERT INTO tasks');
+      expect(clientCalls[2]).toContain('WHERE NOT EXISTS');
+      expect(clientCalls[2]).toContain('cleanup_orphan');
+      expect(clientCalls[3]).toBe('COMMIT');
+      expect(pool._client.release).toHaveBeenCalledOnce();
 
-      // Second call must be the CTE: INSERT INTO tasks WHERE NOT EXISTS + UPDATE scheduled_jobs
-      // (guarded by AND task_id IS NULL) + cleanup_orphan DELETE + SELECT.
-      const [taskSql, taskParams] = pool.query.mock.calls[1] as [string, unknown[]];
-      expect(taskSql).toContain('INSERT INTO tasks');
-      expect(taskSql).toContain('WHERE NOT EXISTS');
-      expect(taskSql).toContain('UPDATE scheduled_jobs');
-      expect(taskSql).toContain('AND task_id IS NULL');
-      expect(taskSql).toContain('cleanup_orphan');
-      expect(taskSql).toContain('task_id');
-      expect(taskSql).toContain('job_id');
+      const taskParams = pool._clientQuery.mock.calls[2]?.[1] as unknown[];
       expect(taskParams).toContain('coordinator');
       expect(taskParams).toContain('Produce a weekly summary of key business metrics');
       expect(taskParams).toContain('active');
       expect(taskParams).toContain('job-anchor');
 
-      // Logs at info level confirming the anchor was created.
       expect(logger.info).toHaveBeenCalledWith(
         expect.objectContaining({ agentId: 'coordinator', jobId: 'job-anchor', anchorCreated: true }),
         expect.stringContaining('drift detection enabled'),
@@ -917,9 +1217,11 @@ describe('SchedulerService', () => {
     });
 
     it('is idempotent on restart — skips tasks INSERT when row already exists', async () => {
-      // rowCount: 0 means the WHERE NOT EXISTS guard fired — the existing row was preserved.
-      pool.query.mockResolvedValueOnce({ rows: [{ id: 'job-anchor-2' }] });
-      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+      pool._clientQuery
+        .mockResolvedValueOnce({ rows: [] }) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 'job-anchor-2' }] }) // upsert
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 }) // task CTE — WHERE NOT EXISTS guard
+        .mockResolvedValueOnce({ rows: [] }); // COMMIT
 
       await svc.upsertDeclarativeJob('coordinator', 'coordinator', {
         cron: '0 9 * * 1',
@@ -927,9 +1229,7 @@ describe('SchedulerService', () => {
         intent_anchor: 'Produce a weekly summary of key business metrics',
       });
 
-      expect(pool.query).toHaveBeenCalledTimes(2);
-
-      // Logs at info level confirming the existing row was preserved.
+      expect(pool.connect).toHaveBeenCalledOnce();
       expect(logger.info).toHaveBeenCalledWith(
         expect.objectContaining({ agentId: 'coordinator', jobId: 'job-anchor-2', anchorCreated: false }),
         expect.stringContaining('restart idempotency'),
@@ -949,12 +1249,11 @@ describe('SchedulerService', () => {
     });
 
     it('throws when tasks INSERT succeeds but scheduled_jobs UPDATE fails (orphan race)', async () => {
-      // Simulate the race where the scheduled_jobs row disappears (or was already linked
-      // by a concurrent startup) between the upsert and the task-link CTE.
-      // The cleanup_orphan CTE deletes the orphan task (DB-side); INSERT returns task_id
-      // but job_id is null, indicating the link failed.
-      pool.query.mockResolvedValueOnce({ rows: [{ id: 'job-race' }] });
-      pool.query.mockResolvedValueOnce({ rows: [{ task_id: 'task-orphan', job_id: null }] });
+      pool._clientQuery
+        .mockResolvedValueOnce({ rows: [] }) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 'job-race' }] }) // upsert
+        .mockResolvedValueOnce({ rows: [{ task_id: 'task-orphan', job_id: null }] }) // link failed
+        .mockResolvedValueOnce({ rows: [] }); // ROLLBACK
 
       await expect(
         svc.upsertDeclarativeJob('coordinator', 'coordinator', {
@@ -964,10 +1263,35 @@ describe('SchedulerService', () => {
         }),
       ).rejects.toThrow(/scheduled_jobs row.*not found when linking task/);
 
+      const clientCalls = pool._clientQuery.mock.calls.map(([sql]) => sql as string);
+      expect(clientCalls).toContain('ROLLBACK');
+      expect(clientCalls).not.toContain('COMMIT');
       expect(logger.error).toHaveBeenCalledWith(
         expect.objectContaining({ jobId: 'job-race', taskId: 'task-orphan' }),
         expect.stringContaining('orphaned task'),
       );
+    });
+
+    it('rolls back when the task CTE throws — no orphaned scheduled_jobs row', async () => {
+      pool._clientQuery
+        .mockResolvedValueOnce({ rows: [] }) // BEGIN
+        .mockResolvedValueOnce({ rows: [{ id: 'job-rollback' }] }) // upsert
+        .mockRejectedValueOnce(new Error('task link failed')) // task CTE throws
+        .mockResolvedValueOnce({ rows: [] }); // ROLLBACK
+
+      await expect(
+        svc.upsertDeclarativeJob('coordinator', 'coordinator', {
+          cron: '0 9 * * 1',
+          task: 'weekly digest',
+          intent_anchor: 'Produce a weekly summary',
+        }),
+      ).rejects.toThrow('task link failed');
+
+      const clientCalls = pool._clientQuery.mock.calls.map(([sql]) => sql as string);
+      expect(clientCalls).toContain('BEGIN');
+      expect(clientCalls).toContain('ROLLBACK');
+      expect(clientCalls).not.toContain('COMMIT');
+      expect(pool._client.release).toHaveBeenCalledOnce();
     });
 
     it('stamps a system originator with systemRole system and channel declarative', async () => {
@@ -1068,7 +1392,7 @@ describe('SchedulerService', () => {
 
   describe('updateJob', () => {
     it('updates cronExpr and recalculates next_run_at', async () => {
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
 
       await svc.updateJob('job-up', { cronExpr: '*/10 * * * *' });
 
@@ -1079,13 +1403,19 @@ describe('SchedulerService', () => {
     });
 
     it('updates taskPayload only', async () => {
-      pool.query.mockResolvedValueOnce({ rows: [] });
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
 
       await svc.updateJob('job-up2', { taskPayload: { a: 1 } });
 
       const [sql, params] = pool.query.mock.calls[0] as [string, unknown[]];
       expect(sql).toContain('task_payload');
       expect(params).toContain('job-up2');
+    });
+
+    it('throws when the job_id matches no row (0 rows updated)', async () => {
+      pool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+      await expect(svc.updateJob('gone', { cronExpr: '*/10 * * * *' })).rejects.toThrow('not found');
     });
   });
 });

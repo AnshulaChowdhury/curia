@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { convertNylasMessage, parseSenderVerified } from '../../../../src/channels/email/message-converter.js';
+import { convertNylasMessage, parseSenderVerified, senderAuthenticationStatus } from '../../../../src/channels/email/message-converter.js';
 import type { NylasMessage } from '../../../../src/channels/email/nylas-client.js';
 
 // ---------------------------------------------------------------------------
@@ -166,6 +166,58 @@ describe('convertNylasMessage', () => {
 });
 
 // ---------------------------------------------------------------------------
+// otherRecipientCount — who else an email reached (#2261)
+// ---------------------------------------------------------------------------
+
+describe('convertNylasMessage — otherRecipientCount', () => {
+  const SELF = 'curia@example.com';
+  const from = [{ email: 'xiaopu@example.com', name: 'Xiaopu' }];
+
+  it('is 0 when the email reached only Curia, case-insensitively', () => {
+    const result = convertNylasMessage(mockMessage({ from, to: [{ email: 'Curia@Example.com', name: 'Curia' }], cc: [] }), SELF);
+    expect(result.metadata.otherRecipientCount).toBe(0);
+  });
+
+  // The adapter's reply-all drops a plus-address of its own mailbox, so it is not a second person.
+  it('is 0 when the email reached only a plus-address of Curia\'s mailbox', () => {
+    const result = convertNylasMessage(mockMessage({ from, to: [{ email: 'Curia+Lunch@example.com', name: 'Curia' }], cc: [] }), SELF);
+    expect(result.metadata.otherRecipientCount).toBe(0);
+    expect(result.metadata.curiaRole).toBe('to');
+  });
+
+  it('still counts another person beside a plus-address of Curia', () => {
+    const result = convertNylasMessage(mockMessage({
+      from, to: [{ email: 'curia+lunch@example.com', name: 'Curia' }], cc: [{ email: 'jeff@example.com', name: 'Jeff' }],
+    }), SELF);
+    expect(result.metadata.otherRecipientCount).toBe(1);
+  });
+
+  it('does not count the sender copying themselves', () => {
+    const result = convertNylasMessage(mockMessage({ from, to: [{ email: SELF, name: 'Curia' }], cc: [{ email: 'xiaopu@example.com', name: 'Xiaopu' }] }), SELF);
+    expect(result.metadata.otherRecipientCount).toBe(0);
+  });
+
+  it('counts each distinct other To and CC address', () => {
+    const result = convertNylasMessage(mockMessage({
+      from,
+      to: [{ email: SELF, name: 'Curia' }, { email: 'jeff@example.com', name: 'Jeff' }],
+      cc: [{ email: 'JEFF@example.com', name: 'Jeff' }, { email: 'ann@example.com', name: 'Ann' }],
+    }), SELF);
+    expect(result.metadata.otherRecipientCount).toBe(2);
+  });
+
+  it('counts the To recipients of a mail Curia was not visibly sent (BCC)', () => {
+    const result = convertNylasMessage(mockMessage({ from, to: [{ email: 'jeff@example.com', name: 'Jeff' }], cc: [] }), SELF);
+    expect(result.metadata.otherRecipientCount).toBe(1);
+  });
+
+  it('is omitted when the adapter does not know its own address', () => {
+    const result = convertNylasMessage(mockMessage({ from, to: [{ email: SELF, name: 'Curia' }], cc: [] }));
+    expect(result.metadata).not.toHaveProperty('otherRecipientCount');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // curiaRole and primaryRecipientEmails — CC role detection
 // ---------------------------------------------------------------------------
 
@@ -242,6 +294,22 @@ describe('convertNylasMessage — curiaRole and primaryRecipientEmails', () => {
     expect(result.metadata.curiaRole).toBe('cc');
   });
 
+  it('treats a plus-address of selfEmail as Curia (#2261)', () => {
+    const cc = convertNylasMessage(
+      mockMessage({ to: [{ email: 'nik@example.com' }], cc: [{ email: 'curia+lunch@example.com' }] }),
+      SELF_EMAIL,
+    );
+    expect(cc.metadata.curiaRole).toBe('cc');
+    expect(cc.metadata.primaryRecipientEmails).toEqual(['nik@example.com']);
+
+    const to = convertNylasMessage(
+      mockMessage({ to: [{ email: 'curia+lunch@example.com' }, { email: 'nik@example.com' }], cc: [] }),
+      SELF_EMAIL,
+    );
+    expect(to.metadata.curiaRole).toBe('to');
+    expect(to.metadata.primaryRecipientEmails).toEqual(['nik@example.com']);
+  });
+
   it('defaults curiaRole to "to" when selfEmail is not found in To or CC (BCC fallback)', () => {
     const result = convertNylasMessage(
       mockMessage({
@@ -265,8 +333,55 @@ describe('convertNylasMessage — curiaRole and primaryRecipientEmails', () => {
 });
 
 // ---------------------------------------------------------------------------
+// curiaMailbox — the Curia address in To, for the outreach matcher (#2312)
+// ---------------------------------------------------------------------------
+
+describe('convertNylasMessage — curiaMailbox', () => {
+  const SELF_EMAIL = 'curia@example.com';
+
+  it('is Curia\'s own To address, lowercased, plus-tag kept', () => {
+    const plain = convertNylasMessage(mockMessage({ to: [{ email: 'nik@example.com' }, { email: 'Curia@Example.com' }] }), SELF_EMAIL);
+    expect(plain.metadata.curiaMailbox).toBe('curia@example.com');
+    const tagged = convertNylasMessage(mockMessage({ to: [{ email: 'Curia+Ops@Example.com' }] }), SELF_EMAIL);
+    expect(tagged.metadata.curiaMailbox).toBe('curia+ops@example.com');
+  });
+
+  it('is absent when Curia is CC\'d', () => {
+    const r = convertNylasMessage(mockMessage({ to: [{ email: 'nik@example.com' }], cc: [{ email: SELF_EMAIL }] }), SELF_EMAIL);
+    expect(r.metadata).not.toHaveProperty('curiaMailbox');
+  });
+
+  it('is absent when Curia is in neither To nor CC (BCC, or an alias that forwards to it)', () => {
+    const bcc = convertNylasMessage(mockMessage({ to: [{ email: 'nik@example.com' }], cc: [{ email: 'alice@example.com' }] }), SELF_EMAIL);
+    expect(bcc.metadata.curiaRole).toBe('to');
+    expect(bcc.metadata).not.toHaveProperty('curiaMailbox');
+    const alias = convertNylasMessage(mockMessage({ to: [{ email: 'assistant@example.com' }] }), SELF_EMAIL);
+    expect(alias.metadata).not.toHaveProperty('curiaMailbox');
+  });
+
+  it('is absent when Curia\'s own address is unknown', () => {
+    expect(convertNylasMessage(mockMessage()).metadata).not.toHaveProperty('curiaMailbox');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseSenderVerified — Authentication-Results header parsing
 // ---------------------------------------------------------------------------
+
+describe('senderAuthenticationStatus (#2312)', () => {
+  const ar = (value: string) => [{ name: 'Authentication-Results', value }];
+  it('is passed exactly when parseSenderVerified is true', () => {
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=pass; dkim=pass; dmarc=pass'))).toBe('passed');
+  });
+  it('is failed when a mechanism explicitly failed', () => {
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=pass; dkim=pass; dmarc=fail'))).toBe('failed');
+  });
+  it('is not confirmed with no Authentication-Results, or nothing that passed or failed', () => {
+    expect(senderAuthenticationStatus(undefined)).toBe('not confirmed');
+    expect(senderAuthenticationStatus([{ name: 'Subject', value: 'hi' }])).toBe('not confirmed');
+    expect(senderAuthenticationStatus(ar('mx.google.com; spf=none; dkim=none; dmarc=none'))).toBe('not confirmed');
+  });
+});
 
 describe('parseSenderVerified', () => {
   it('returns true when SPF, DKIM, and DMARC all pass', () => {
@@ -346,17 +461,32 @@ describe('parseSenderVerified', () => {
     expect(parseSenderVerified(headers)).toBe(false);
   });
 
-  it('returns true when a second Authentication-Results header (e.g. from final MTA) has all passing', () => {
-    // Multiple headers are common in relay scenarios. Each hop prepends its own.
-    // The final receiving MTA's header (last added, first in array) should be
-    // authoritative. Checking with some() means true if any header has all three passing.
+  it('returns true when the provider header passes and a later relay header is partial', () => {
+    // The receiving MTA prepends its header, so the first one is authoritative.
+    // A later relay header that only carried SPF does not undo that pass.
     const headers = [
-      // Final MTA header — all pass (this is the authoritative one)
       { name: 'Authentication-Results', value: 'mx.google.com; spf=pass; dkim=pass; dmarc=pass' },
-      // Intermediate relay header — only SPF (no DKIM/DMARC in scope)
       { name: 'Authentication-Results', value: 'relay.isp.com; spf=pass' },
     ];
     expect(parseSenderVerified(headers)).toBe(true);
+  });
+
+  it('returns false when the provider header fails and a later sender header passes (#2071)', () => {
+    // A sender can add their own all-pass Authentication-Results. The provider
+    // prepends a failing one and does not have to strip a foreign authserv-id.
+    const headers = [
+      { name: 'Authentication-Results', value: 'mx.google.com; spf=fail; dkim=fail; dmarc=fail' },
+      { name: 'Authentication-Results', value: 'mx.example; spf=pass; dkim=pass; dmarc=pass' },
+    ];
+    expect(parseSenderVerified(headers)).toBe(false);
+  });
+
+  it('returns false when a sender pass is listed first and the provider header fails (#2071)', () => {
+    const headers = [
+      { name: 'Authentication-Results', value: 'mx.example; spf=pass; dkim=pass; dmarc=pass' },
+      { name: 'Authentication-Results', value: 'mx.google.com; spf=fail; dkim=pass; dmarc=pass' },
+    ];
+    expect(parseSenderVerified(headers)).toBe(false);
   });
 
   it('returns false when all Authentication-Results headers are present but none has all three passing', () => {
@@ -488,5 +618,65 @@ describe('convertNylasMessage — attachments', () => {
     }));
     expect(result.content).toContain('[Attachments: empty.txt (0 B)]');
     expect(result.metadata.attachments[0]?.size).toBe(0);
+  });
+});
+
+describe('convertNylasMessage — auto-generated metadata (#1734)', () => {
+  it('sets isAutoGenerated for empty-body calendar REPLY attachments', () => {
+    const result = convertNylasMessage(mockMessage({
+      subject: 'Declined: Sync',
+      body: '',
+      snippet: '',
+      attachments: [
+        {
+          id: 'att-ics',
+          filename: 'invite.ics',
+          contentType: 'text/calendar; method=REPLY; charset=UTF-8',
+          size: 120,
+          isCalendarInvite: true,
+        },
+      ],
+    }));
+    expect(result.metadata.isAutoGenerated).toBe(true);
+    expect(result.metadata.autoGeneratedSignals).toContain('calendar_reply');
+  });
+
+  it('leaves normal human mail as not auto-generated', () => {
+    const result = convertNylasMessage(mockMessage({
+      subject: 'Lunch tomorrow?',
+      body: '<p>Want to grab lunch?</p>',
+      snippet: 'Want to grab lunch?',
+    }));
+    expect(result.metadata.isAutoGenerated).toBe(false);
+    expect(result.metadata.autoGeneratedSignals).toEqual([]);
+  });
+
+  it('marks Auto-Submitted bounce notices as auto-generated (actionability is the agent\'s)', () => {
+    const result = convertNylasMessage(mockMessage({
+      subject: 'Undeliverable: Report',
+      body: '<p>Delivery has failed for recipient@example.com</p>',
+      snippet: 'Delivery has failed',
+      headers: [{ name: 'Auto-Submitted', value: 'auto-generated' }],
+    }));
+    expect(result.metadata.isAutoGenerated).toBe(true);
+    expect(result.metadata.autoGeneratedSignals).toContain('auto_submitted');
+  });
+
+  it('does not treat empty-body calendar attach without method as auto-generated', () => {
+    const result = convertNylasMessage(mockMessage({
+      subject: 'Invitation: Sync',
+      body: '',
+      snippet: '',
+      attachments: [
+        {
+          id: 'att-ics',
+          filename: 'invite.ics',
+          contentType: 'text/calendar',
+          size: 200,
+          isCalendarInvite: true,
+        },
+      ],
+    }));
+    expect(result.metadata.isAutoGenerated).toBe(false);
   });
 });

@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { EmailMarkReadHandler } from '../../../skills/email-mark-read/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { EmailMarkReadHandler } from '../../../skills/email/tools/email-mark-read/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
-function makeCtx(input: Record<string, unknown>, overrides?: Partial<SkillContext>): SkillContext {
-  return { input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
+function makeCtx(input: Record<string, unknown>, overrides?: Partial<ToolContext>): ToolContext {
+  return { toolName: 'email-mark-read', toolVersion: '1.0.0', input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
 }
 
 describe('EmailMarkReadHandler', () => {
@@ -37,7 +37,7 @@ describe('EmailMarkReadHandler', () => {
     );
     expect(result.success).toBe(true);
     if (result.success) expect((result.data as { marked_read: boolean }).marked_read).toBe(true);
-    expect(gateway.markEmailAsRead).toHaveBeenCalledWith('msg-1', 'curia');
+    expect(gateway.markEmailAsRead).toHaveBeenCalledWith('msg-1', 'curia', expect.anything());
   });
 
   it('passes undefined accountId when account is absent', async () => {
@@ -46,7 +46,7 @@ describe('EmailMarkReadHandler', () => {
       makeCtx({ message_id: 'msg-1' }, { outboundGateway: gateway as never }),
     );
     expect(result.success).toBe(true);
-    expect(gateway.markEmailAsRead).toHaveBeenCalledWith('msg-1', undefined);
+    expect(gateway.markEmailAsRead).toHaveBeenCalledWith('msg-1', undefined, expect.anything());
   });
 
   it('passes undefined accountId when account is empty string', async () => {
@@ -55,7 +55,7 @@ describe('EmailMarkReadHandler', () => {
       makeCtx({ message_id: 'msg-1', account: '' }, { outboundGateway: gateway as never }),
     );
     expect(result.success).toBe(true);
-    expect(gateway.markEmailAsRead).toHaveBeenCalledWith('msg-1', undefined);
+    expect(gateway.markEmailAsRead).toHaveBeenCalledWith('msg-1', undefined, expect.anything());
   });
 
   it('returns failure when gateway returns an error', async () => {

@@ -10,9 +10,9 @@
 // LLM calls go through the constrained InfraLlm service (classify + extract only),
 // which routes through ModelRouter and publishes llm.call bus events for telemetry.
 
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
 import { EDGE_TYPES, NODE_TYPES } from '../../src/memory/types.js';
-import type { EdgeType, NodeType } from '../../src/memory/types.js';
+import type { EdgeType, NodeType, KgNode } from '../../src/memory/types.js';
 
 // Shape of each triple returned by the LLM extraction prompt.
 interface ExtractedTriple {
@@ -27,9 +27,9 @@ interface ExtractedTriple {
 const EDGE_TYPES_LIST = EDGE_TYPES.join(', ');
 const NODE_TYPES_LIST = NODE_TYPES.join(', ');
 
-export class ExtractRelationshipsHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
-    const { text, source } = ctx.input as { text?: string; source?: string };
+export class ExtractRelationshipsHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    const { text, source, max_stored } = ctx.input as { text?: string; source?: string; max_stored?: number };
 
     if (!text || typeof text !== 'string') {
       // Log only safe metadata — never log ctx.input directly (contains full transcript)
@@ -45,14 +45,23 @@ export class ExtractRelationshipsHandler implements SkillHandler {
       return { success: false, error: 'Entity memory not available — database not configured' };
     }
 
-    // Guard: infraLlm is a required capability declared in skill.json.
+    // Guard: infraLlm is a required capability declared in tool.json.
     if (!ctx.infraLlm) {
       ctx.log.error('extract-relationships: infraLlm capability missing — execution layer misconfigured');
       return { success: false, error: 'extract-relationships requires infraLlm capability' };
     }
 
     try {
-    // -- Step 1: Classifier gate --
+      const maxStored = typeof max_stored === 'number' && Number.isFinite(max_stored) && max_stored >= 0
+        ? Math.floor(max_stored)
+        : undefined;
+
+      if (maxStored === 0) {
+        ctx.log.info({ extracted: 0, confirmed: 0, failed: 0 }, 'extract-relationships: complete');
+        return { success: true, data: { extracted: 0, confirmed: 0, failed: 0, ambiguous: 0, skipped: false } };
+      }
+
+      // -- Step 1: Classifier gate --
     // Cheap fast-tier call — exits early on the majority of messages (scheduling,
     // email drafts, lookups) that contain no entity-to-entity relationships.
     const classifyResult = await ctx.infraLlm.classify(
@@ -68,11 +77,12 @@ export class ExtractRelationshipsHandler implements SkillHandler {
 
     if (!classifierAnswer.startsWith('yes')) {
       ctx.log.debug({ textPreview: text.slice(0, 80) }, 'extract-relationships: classifier gate — no relationships, skipping');
-      return { success: true, data: { extracted: 0, confirmed: 0, skipped: true } };
+      return { success: true, data: { extracted: 0, confirmed: 0, failed: 0, ambiguous: 0, skipped: true } };
     }
 
     // -- Step 2: Extraction prompt --
-    // Standard-tier call with the full EDGE_TYPES vocabulary. Returns JSON triples.
+    // Fast-tier call with the full EDGE_TYPES vocabulary. Returns JSON triples. 1000 tokens
+    // leaves no room for thinking, so it runs where boot guarantees thinking can be off (#2224).
     const extractionResult = await ctx.infraLlm.extract(
       `Extract entity-to-entity relationships from the text below. Return a JSON array of relationship triples.
 
@@ -91,7 +101,7 @@ Format:
 
 Text:
 ${text}`,
-      { maxTokens: 1000 },
+      { maxTokens: 1000, tier: 'fast' },
     );
 
     if (!extractionResult.ok) {
@@ -110,18 +120,19 @@ ${text}`,
       if (!Array.isArray(parsed)) {
         // Log length only — rawText may contain extracted entity names (PII).
         ctx.log.warn({ responseLength: rawText.length }, 'extract-relationships: extraction returned non-array, treating as empty');
-        return { success: true, data: { extracted: 0, confirmed: 0, skipped: false } };
+        return { success: true, data: { extracted: 0, confirmed: 0, failed: 0, ambiguous: 0, skipped: false } };
       }
       triples = parsed as ExtractedTriple[];
     } catch (err) {
       ctx.log.warn({ err, responseLength: rawText.length }, 'extract-relationships: failed to parse extraction JSON, treating as empty');
-      return { success: true, data: { extracted: 0, confirmed: 0, skipped: false } };
+      return { success: true, data: { extracted: 0, confirmed: 0, failed: 0, ambiguous: 0, skipped: false } };
     }
 
     // -- Steps 3 & 4: Node resolution + edge upsert --
     let extracted = 0;
     let confirmed = 0;
     let failed = 0;
+    let ambiguous = 0;
 
     // Entity types that are valid relationship endpoints. 'fact' is excluded —
     // facts describe a single entity and should not appear as nodes in a
@@ -129,6 +140,67 @@ ${text}`,
     const ENTITY_NODE_TYPES: ReadonlySet<string> = new Set(
       NODE_TYPES.filter(t => t !== 'fact'),
     );
+
+    // Bind the narrowed values once: the guards above have already established both, but
+    // a closure defined here does not carry that narrowing on its own.
+    const entityMemory = ctx.entityMemory;
+    const edgeSource = source;
+
+    /**
+     * Look one endpoint up. Pure read — it never writes, which is the point.
+     *
+     * Mirrors `EntityMemory.resolveOrCreate`'s exact-match contract (#1705):
+     *   0 matches                                   → absent (caller decides whether to mint)
+     *   1 match                                     → that node, even if its type differs
+     *                                                 (a lone label match is almost always
+     *                                                 the same real-world entity)
+     *   2+ matches, exactly one of the wanted type  → that node
+     *   2+ matches, several or none of that type    → ambiguous
+     *
+     * It deliberately does NOT use resolveOrCreate itself: that adds an embedding-based
+     * fuzzy phase, and this handler runs over whole transcripts in a background pipeline
+     * where an extra embed + vector search per endpoint is real cost. The exact-match half
+     * is what this fix needs; the two must be kept in step if either changes.
+     *
+     * Before ADR-040 resolution took `matches[0]` when several nodes shared a label. That
+     * was always a coin flip, but two contacts with the same display name could not both
+     * hold a node, so it was rare. Now they can, so it would be routine — and attaching a
+     * relationship to the wrong one of two real people is worse than dropping it (#1714).
+     */
+    async function lookupEndpoint(
+      label: string,
+      wantedType: NodeType,
+    ): Promise<
+      | { kind: 'found'; node: KgNode }
+      | { kind: 'ambiguous'; candidateIds: string[] }
+      | { kind: 'absent' }
+    > {
+      const matches = await entityMemory.findEntities(label);
+
+      if (matches.length === 0) return { kind: 'absent' };
+      if (matches.length === 1) return { kind: 'found', node: matches[0]! };
+
+      const typeMatches = matches.filter(n => n.type === wantedType);
+      if (typeMatches.length === 1) return { kind: 'found', node: typeMatches[0]! };
+
+      return {
+        kind: 'ambiguous',
+        candidateIds: (typeMatches.length > 1 ? typeMatches : matches).map(n => n.id),
+      };
+    }
+
+    /** Mint an endpoint node. Separate from the lookup so nothing is written until BOTH
+     *  endpoints are known to be resolvable — see the call site. */
+    async function createEndpoint(label: string, wantedType: NodeType): Promise<KgNode> {
+      const { entity } = await entityMemory.createEntity({
+        type: wantedType,
+        label,
+        properties: {},
+        source: edgeSource,
+        confidence: 0.6,
+      });
+      return entity;
+    }
 
     for (const triple of triples) {
       try {
@@ -159,29 +231,38 @@ ${text}`,
           ? triple.objectType as NodeType
           : 'person';
 
-        // Resolve subject — prefer a node whose type matches the extraction.
-        // Falling back to the first match handles cases where a node was previously
-        // created under a different type; creating a new node is the last resort.
-        const subjectMatches = await ctx.entityMemory.findEntities(triple.subject);
-        const subjectMatch = subjectMatches.find(n => n.type === subjectType) ?? subjectMatches[0];
-        const subjectNode = subjectMatch ?? (await ctx.entityMemory.createEntity({
-          type: subjectType,
-          label: triple.subject,
-          properties: {},
-          source,
-          confidence: 0.6,
-        })).entity;
+        // Look BOTH endpoints up before minting either. An edge needs both ends, so a
+        // triple with one ambiguous endpoint is dropped — and if the lookup and the mint
+        // were interleaved, dropping it would still leave behind whichever endpoint had
+        // already been created: an edgeless node persisted for a relationship this handler
+        // decided not to record.
+        const subjectLookup = await lookupEndpoint(triple.subject, subjectType);
+        const objectLookup = await lookupEndpoint(triple.object, objectType);
 
-        // Resolve object — same pattern
-        const objectMatches = await ctx.entityMemory.findEntities(triple.object);
-        const objectMatch = objectMatches.find(n => n.type === objectType) ?? objectMatches[0];
-        const objectNode = objectMatch ?? (await ctx.entityMemory.createEntity({
-          type: objectType,
-          label: triple.object,
-          properties: {},
-          source,
-          confidence: 0.6,
-        })).entity;
+        if (subjectLookup.kind === 'ambiguous' || objectLookup.kind === 'ambiguous') {
+          // Candidate ids, never the raw label — those are extracted entity names and
+          // therefore PII (#1706). The ids are enough to inspect the collision by hand.
+          ctx.log.warn(
+            {
+              predicate,
+              subjectCandidateIds: subjectLookup.kind === 'ambiguous' ? subjectLookup.candidateIds : undefined,
+              objectCandidateIds: objectLookup.kind === 'ambiguous' ? objectLookup.candidateIds : undefined,
+            },
+            'extract-relationships: ambiguous endpoint — skipping triple rather than guessing',
+          );
+          ambiguous++;
+          continue;
+        }
+
+        // Both resolvable, so minting is safe. A triple naming the same new label at both
+        // ends mints once, not twice: createEntity upserts on (lower(label), type), so the
+        // second call returns the first node and the self-loop guard below catches it.
+        const subjectNode = subjectLookup.kind === 'found'
+          ? subjectLookup.node
+          : await createEndpoint(triple.subject, subjectType);
+        const objectNode = objectLookup.kind === 'found'
+          ? objectLookup.node
+          : await createEndpoint(triple.object, objectType);
 
         // Skip self-loops — subject and object resolved to the same node.
         // The extraction prompt asks for two distinct entities but the LLM can still
@@ -195,6 +276,8 @@ ${text}`,
         const confidence = typeof triple.confidence === 'number'
           ? Math.min(1, Math.max(0, triple.confidence))
           : 0.7;
+
+        if (maxStored !== undefined && extracted + confirmed >= maxStored) break;
 
         const { created } = await ctx.entityMemory.upsertEdge(
           subjectNode.id,
@@ -210,6 +293,7 @@ ${text}`,
         } else {
           confirmed++;
         }
+        if (maxStored !== undefined && extracted + confirmed >= maxStored) break;
       } catch (err) {
         // Log at error (not warn) — persistence failures are infrastructure errors
         // (DB outage, connection loss) that must surface in Sentry, not soft warnings.
@@ -220,8 +304,8 @@ ${text}`,
       }
     }
 
-    ctx.log.info({ extracted, confirmed, failed }, 'extract-relationships: complete');
-    return { success: true, data: { extracted, confirmed, failed, skipped: false } };
+    ctx.log.info({ extracted, confirmed, failed, ambiguous }, 'extract-relationships: complete');
+    return { success: true, data: { extracted, confirmed, failed, ambiguous, skipped: false } };
     } catch (err) {
       // Top-level catch for unexpected errors (e.g. provider implementation bugs that
       // throw instead of returning { type: 'error' }).

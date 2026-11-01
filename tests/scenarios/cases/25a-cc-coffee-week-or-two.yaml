@@ -1,0 +1,133 @@
+# Case 25a (docs/wip/2026-10-21-principal-scheduling-scenarios-design.md): the principal
+# CCs Curia on an email suggesting coffee "in a week or two". The CC turn guidance
+# (src/agents/prompts/turn-guidance.ts, EMAIL_CC_PRINCIPAL) says to infer intent and reply
+# on the thread. Nothing yet says the principal's timing words bound the slots Curia
+# offers. The free-time result also shows open time in the next three days, so offering
+# those is easy.
+name: cc coffee in a week or two
+description: >
+  The principal emails Dana Okafor, an external contact they met at a conference, and CCs
+  Curia without mentioning it. The principal suggests coffee "in a week or two". Curia
+  should take the scheduling over: check the calendar, then reply on the thread (reply all)
+  offering Dana two or three coffee slots. Each slot is 30 to 60 minutes, in person, during
+  the workday, at least a week out and no more than about two and a half weeks out. The
+  calendar has open time in the next few days too; offering those ignores what the
+  principal said.
+tags: [principal-scheduling, ps-core, calendar, email-cc]
+delegation: real
+release_gate: false
+autonomy: { score: 84, gating: band }
+stub_sets: [human-channels, calendar-office, calendar-specialist]
+seed:
+  contacts:
+    - key: dana
+      display_name: Dana Okafor
+      tier: known
+      kind: person
+      channel: email
+      identifier: dana.okafor@lumen.example.test
+inbound:
+  from: principal
+  channel: email
+  content: |
+    Subject: Great meeting you at FinTech North
+
+    Hi Dana,
+
+    Really enjoyed our chat about embedded payments yesterday. Let's grab a coffee in a
+    week or two and keep the conversation going.
+
+    Avery
+  email:
+    nylas_message_id: scenario-msg-25a-dana-coffee
+    to: [dana]
+    cc: [curia]
+tool_stubs:
+  # Other fair writes a specialist may make on the way.
+  contact-set-role:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:dana}}", display_name: Dana Okafor, role: contact }
+  calendar-holds-sweep:
+    - agent: calendar
+      match: {}
+      return: { scanned: 0, expired: 0, failed: 0, calendarErrors: 0 }
+  # The contacts specialist filling in a contact's organization: a fair write.
+  contact-update:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:dana}}", updated_fields: [organization] }
+  # Remembering how the principal knows someone is fair; a write the case allows.
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 0e5d6c7b-1a2b-4c3d-8e9f-0000000000d5, sensitivity: internal }
+  calendar-find-free-time:
+    - agent: calendar
+      match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        freeWindows:
+          - { start: "{{time:today+1 09:30}}", end: "{{time:today+1 12:00}}" }
+          - { start: "{{time:today+2 14:00}}", end: "{{time:today+2 17:00}}" }
+          - { start: "{{time:today+3 10:00}}", end: "{{time:today+3 12:00}}" }
+          - { start: "{{time:next-monday+7 10:00}}", end: "{{time:next-monday+7 12:00}}" }
+          - { start: "{{time:next-monday+8 14:00}}", end: "{{time:next-monday+8 16:30}}" }
+          - { start: "{{time:next-monday+9 09:00}}", end: "{{time:next-monday+9 11:30}}" }
+expected_behaviors:
+  - id: reads_calendar
+    weight: critical
+    description: The principal's calendar is read before times are offered.
+    check:
+      called: [calendar-find-free-time, calendar-list-events]
+      agent: any
+      success: true
+  - id: replies_on_thread
+    weight: critical
+    description: Answers Dana on the principal's thread (email-reply to its Message ID), not a new email.
+    check:
+      called: email-reply
+      with: { reply_to_message_id: scenario-msg-25a-dana-coffee }
+  - id: no_hold_tomorrow
+    weight: critical
+    description: No hold is placed for tomorrow.
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:today+1}}" }
+  - id: no_hold_in_two_days
+    weight: critical
+    description: No hold is placed for the day after tomorrow.
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:today+2}}" }
+  - id: no_hold_in_three_days
+    weight: critical
+    description: No hold is placed three days out.
+    check:
+      not_called: [calendar-create-hold, calendar-create-event]
+      agent: any
+      contains: { start: "{{date:today+3}}" }
+  - id: slots_in_window
+    weight: critical
+    description: >
+      Every time offered to Dana is at least six days after the run's date and no more than
+      about eighteen days after it. None is in the next few days.
+  - id: coffee_shaped
+    weight: critical
+    description: >
+      The meeting offered is a coffee: 30 to 60 minutes, in person (a café, or near the
+      principal's office), during the workday. Not a video call and not an evening slot.
+  - id: no_question_on_thread
+    weight: critical
+    description: >
+      Does not ask the principal anything on the thread Dana can see, and does not ask Dana
+      what the principal wants. It takes the scheduling over.
+  - id: tells_principal
+    weight: nice-to-have
+    description: The principal can tell Curia is handling it (they are on the reply, or get a short note).
+failure_modes:
+  - Offers Dana a slot tomorrow or later this week
+  - Sets up a video call instead of a coffee
+  - Replies only to the principal asking what to do
+  - Ends with NO_REPLY, treating the CC as informational

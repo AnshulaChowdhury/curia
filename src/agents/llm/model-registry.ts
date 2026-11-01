@@ -4,10 +4,26 @@
 // context windows, capabilities). Deployment-specific config (which tier maps to
 // which model) stays in config/default.yaml.
 //
-// Lookup uses prefix matching: 'claude-haiku-4-5-20251001' matches 'claude-haiku-4-5'.
-// Entries are pre-sorted by key length descending so longer prefixes win.
+// Lookup tries an exact key match first, then falls back to prefix matching:
+// 'claude-haiku-4-5-20251001' matches 'claude-haiku-4-5'. Entries are pre-sorted
+// by key length descending so longer prefixes win.
+//
+// A prefix hit means the requested model is borrowing another entry's pricing and
+// limits, which is a guess — it is logged at warn, once per distinct model id, so
+// an operator pointing a tier at a dated snapshot is told rather than silently
+// billed against the wrong numbers (#1804).
 
 import type { Logger } from '../../logger.js';
+import type { ReasoningEffort } from './sampling-options.js';
+
+// Anthropic effort docs, read 2026-10-20: Haiku 5.5, Sonnet 4.6 and Opus 4.6
+// take low through max (xhigh is left out, ADR-048), and `none` maps to a
+// clean `thinking: disabled`. Sonnet 5.5 takes the same efforts, with `none`
+// sent as `between_tools` (see thinkingOffType).
+const ANTHROPIC_ADAPTIVE: ModelReasoningSupport = {
+  control: 'anthropic-adaptive',
+  efforts: ['none', 'low', 'medium', 'high', 'max'],
+};
 
 export interface ModelPricing {
   /** USD per million input tokens */
@@ -31,6 +47,118 @@ export interface ModelMetadata {
   capabilities: string[];
   /** Maximum output tokens per call. Default 4096 if unset. */
   maxOutputTokens?: number;
+  /**
+   * Why `pricing.cacheReadPerMToken` is absent, when the provider publishes no
+   * cache-read price for this model. Required on any `openrouter` entry without
+   * one — see `model-registry.test.ts`. The reason makes an omission read as
+   * "checked, none published" instead of "nobody looked" (#1804).
+   */
+  cacheReadPricingUnavailable?: string;
+  /**
+   * The provider returns a 400 for any non-default `temperature`, `top_p` or
+   * `top_k`. Providers omit all three for such a model, and `llm.call`
+   * publishers record `temperature: null` via `sentTemperature()` so the audit
+   * row matches the request (#2077, #2038).
+   */
+  rejectsSamplingParams?: boolean;
+  /**
+   * The model thinks when a request sends no reasoning setting. A fact about
+   * the model, not a request rule: unset reasoning gets the provider default
+   * (ADR-048 §3). AnthropicProvider reads it only to size `max_tokens` for a
+   * request that will think. Without `none` in `reasoning`, it also decides
+   * canTurnThinkingOff, where unset counts as unknown on a reasoning model.
+   * `false` records that the model was checked and does not think; on an
+   * OpenRouter entry either value comes from a measurement at the small-cap
+   * call sites (#2224).
+   */
+  thinksByDefault?: boolean;
+  /**
+   * A thinking block from this model is valid only while everything sent before
+   * it is unchanged; sending one back after `system`, `tools` or an earlier
+   * message changed returns a 400. AnthropicProvider drops passed-back thinking
+   * from the first changed prefix onward (ADR-048 §1, prefix guard).
+   */
+  thinkingBoundToPrefix?: boolean;
+  /**
+   * The `thinking.type` that reasoning effort `none` sends, when it is not
+   * `disabled`. Sonnet 5.5 returns a 400 for `disabled`. Its `between_tools`
+   * turns off thinking before the first response. Anthropic documents short
+   * thinking between tool calls, though none appeared in 16 live requests on
+   * 2026-10-21 (#2077, #2220).
+   */
+  thinkingOffType?: 'between_tools';
+  /**
+   * How the model takes a reasoning effort, and which efforts it honors
+   * (ADR-048 §2). Absent when Curia sends it no reasoning setting at all: a
+   * tier effort on such a model fails at boot, and a call site's effort is not
+   * sent. `none` is listed only where it turns reasoning off cleanly.
+   */
+  reasoning?: ModelReasoningSupport;
+}
+
+/** How a provider expresses reasoning effort for a model. */
+export type ReasoningControl =
+  /** OpenRouter's unified `reasoning: { effort }`; `none` is `{ enabled: false }`. */
+  | 'openrouter-effort'
+  /** Anthropic adaptive thinking plus `output_config.effort`. `none` sends the entry's `thinkingOffType`, or `thinking: disabled` when the entry has no `thinkingOffType`. */
+  | 'anthropic-adaptive';
+
+export interface ModelReasoningSupport {
+  control: ReasoningControl;
+  efforts: readonly ReasoningEffort[];
+}
+
+// AWS Bedrock — Claude models reached through the Converse API (bedrock.ts, ADR-041).
+//
+// The bedrock-runtime endpoint takes an inference-profile id, not a bare model id:
+// `global.` routes anywhere AWS has capacity, `us.` / `eu.` stay inside that
+// geography (data residency). Each prefix is its own registry key so the id an
+// operator puts in `model_routing` resolves exactly, and the provider is 'bedrock'
+// rather than 'anthropic' — it needs AWS credentials, not an Anthropic key.
+//
+// Ids and context/output limits checked against the AWS model cards on 2026-10-16:
+//   claude-sonnet-4-6  → {prefix}.anthropic.claude-sonnet-4-6
+//   claude-sonnet-4-5  → {prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0
+//   claude-haiku-4-5   → {prefix}.anthropic.claude-haiku-4-5-20251001-v1:0
+// Opus and the Claude 5 family are not registered: add them with their own card's id
+// once there is a tier that needs one.
+//
+// Pricing mirrors the direct-API entries above. Bedrock bills these through AWS
+// Marketplace and may price geo profiles differently from `global.` — reconfirm
+// against the Bedrock pricing page if a cost estimate stops matching an invoice.
+// Cache rates are mirrored too: bedrock.ts emits no cache checkpoints, but Bedrock
+// reports cache tokens when a model caches implicitly, and an unrecorded rate would
+// price those tokens at zero.
+const BEDROCK_PROFILE_PREFIXES = ['global', 'us', 'eu'] as const;
+
+function bedrockClaudeEntries(): Record<string, ModelMetadata> {
+  const entries: Record<string, ModelMetadata> = {};
+  for (const prefix of BEDROCK_PROFILE_PREFIXES) {
+    entries[`${prefix}.anthropic.claude-sonnet-4-6`] = {
+      provider: 'bedrock',
+      contextWindow: 200_000,
+      pricing: { inputPerMToken: 3.00, outputPerMToken: 15.00, cacheCreationPerMToken: 3.75, cacheReadPerMToken: 0.30 },
+      capabilities: ['vision', 'reasoning', 'coding', 'large_context', 'tools'],
+      // Sonnet 4.6 thinks only when a request turns thinking on, and bedrock.ts never does.
+      thinksByDefault: false,
+    };
+    // Sonnet 4.5: same price and behaviour class as 4.6 (thinks only when asked, which bedrock.ts never does).
+    // Added for deployments whose AWS account has the Sonnet 4.5 Marketplace subscription but not 4.6's.
+    entries[`${prefix}.anthropic.claude-sonnet-4-5-20250929-v1:0`] = {
+      provider: 'bedrock',
+      contextWindow: 200_000,
+      pricing: { inputPerMToken: 3.00, outputPerMToken: 15.00, cacheCreationPerMToken: 3.75, cacheReadPerMToken: 0.30 },
+      capabilities: ['vision', 'reasoning', 'coding', 'large_context', 'tools'],
+      thinksByDefault: false,
+    };
+    entries[`${prefix}.anthropic.claude-haiku-4-5-20251001-v1:0`] = {
+      provider: 'bedrock',
+      contextWindow: 200_000,
+      pricing: { inputPerMToken: 0.80, outputPerMToken: 4.00, cacheCreationPerMToken: 1.00, cacheReadPerMToken: 0.08 },
+      capabilities: ['vision', 'coding', 'large_context', 'tools'],
+    };
+  }
+  return entries;
 }
 
 // Keyed by model name prefix. OpenRouter models added by #379.
@@ -38,6 +166,43 @@ export interface ModelMetadata {
 // Each entry and its nested pricing/capabilities objects are frozen at module
 // load time so getModel()/getAllModels() callers cannot mutate registry state.
 const MODEL_REGISTRY: Record<string, ModelMetadata> = {
+  // Claude 5.5 Opus and Sonnet (#2077). Cache writes are the 5-minute rate.
+  //
+  // Opus 5.5 cannot turn thinking off. The API returns a 400 for `disabled` at
+  // every effort, so its `reasoning` entry leaves out `none`. A call site that
+  // sends `none` gets the model's default thinking, so boot refuses it on a
+  // small-cap call site (canTurnThinkingOff, small-cap-models.ts, #2224).
+  'claude-opus-5-5': {
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    pricing: {
+      inputPerMToken: 4.00,
+      outputPerMToken: 20.00,
+      cacheCreationPerMToken: 5.00,
+      cacheReadPerMToken: 0.20,
+    },
+    capabilities: ['vision', 'coding', 'large_context', 'streaming', 'tools'],
+    rejectsSamplingParams: true,
+    thinksByDefault: true,
+    thinkingBoundToPrefix: true,
+    reasoning: { control: 'anthropic-adaptive', efforts: ['low', 'medium', 'high', 'max'] },
+  },
+  'claude-sonnet-5-5': {
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    pricing: {
+      inputPerMToken: 2.00,
+      outputPerMToken: 10.00,
+      cacheCreationPerMToken: 2.50,
+      cacheReadPerMToken: 0.20,
+    },
+    capabilities: ['vision', 'coding', 'large_context', 'streaming', 'tools'],
+    rejectsSamplingParams: true,
+    thinksByDefault: true,
+    thinkingBoundToPrefix: true,
+    thinkingOffType: 'between_tools',
+    reasoning: ANTHROPIC_ADAPTIVE,
+  },
   'claude-opus-4-6': {
     provider: 'anthropic',
     contextWindow: 200_000,
@@ -47,7 +212,8 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
       cacheCreationPerMToken: 18.75,
       cacheReadPerMToken: 1.50,
     },
-    capabilities: ['vision', 'reasoning', 'coding', 'large_context'],
+    capabilities: ['vision', 'reasoning', 'coding', 'large_context', 'streaming', 'tools'],
+    reasoning: ANTHROPIC_ADAPTIVE,
   },
   'claude-sonnet-4-6': {
     provider: 'anthropic',
@@ -58,8 +224,11 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
       cacheCreationPerMToken: 3.75,
       cacheReadPerMToken: 0.30,
     },
-    capabilities: ['vision', 'reasoning', 'coding'],
+    capabilities: ['vision', 'reasoning', 'coding', 'streaming', 'tools'],
+    reasoning: ANTHROPIC_ADAPTIVE,
   },
+  // No `reasoning` entry: Haiku 4.5 takes only a thinking budget, which Curia
+  // does not send (ADR-048 §2), so a tier effort on it fails at boot.
   'claude-haiku-4-5': {
     provider: 'anthropic',
     contextWindow: 200_000,
@@ -69,20 +238,56 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
       cacheCreationPerMToken: 1.00,
       cacheReadPerMToken: 0.08,
     },
-    capabilities: ['vision', 'coding'],
+    capabilities: ['vision', 'coding', 'streaming', 'tools'],
+  },
+  // Released 2026-10-07; replaces claude-haiku-4-5 as the default fast tier and
+  // judge model (#2077). The 4.5 entry above stays for audit log provenance.
+  //
+  // Prices are the rates for prompts of 100K tokens or fewer; longer prompts
+  // bill at $0.50 / $2.50, which `ModelPricing` cannot represent (#1814).
+  // maxOutputTokens is left at the 4096 default Haiku 4.5 runs at: the model
+  // allows 128K, but a larger cap raises max_tokens on every call that sets none.
+  'claude-haiku-5-5': {
+    provider: 'anthropic',
+    contextWindow: 1_000_000,
+    pricing: {
+      inputPerMToken: 0.10,
+      outputPerMToken: 0.50,
+      cacheCreationPerMToken: 0.125,
+      cacheReadPerMToken: 0.01,
+    },
+    // The loose 'reasoning' capability tag is left off; `reasoning` below is
+    // what the code reads (needs are documentary only, #379).
+    capabilities: ['vision', 'coding', 'streaming', 'tools'],
+    rejectsSamplingParams: true,
+    thinksByDefault: true,
+    thinkingBoundToPrefix: true,
+    reasoning: ANTHROPIC_ADAPTIVE,
   },
 
   // OpenRouter models — non-Claude models routed via OpenRouter's OpenAI-compatible API.
   // Registry keys are the model IDs that OpenRouter's API expects.
-  // Pricing should be verified against OpenRouter's pricing page periodically.
+  //
+  // Prices are the published top-level rates from `GET /api/v1/models`, last
+  // verified 2026-09-18. Per-provider endpoint rates differ from these — for
+  // cache reads the spread reaches 10x on a single model — so an entry is only
+  // as accurate as the endpoint OpenRouter actually routes to. An entry with no
+  // `cacheReadPerMToken` must say why in `cacheReadPricingUnavailable`.
   'google/gemini-3.1-flash-lite': {
     provider: 'openrouter',
     contextWindow: 1_000_000,
     pricing: {
       inputPerMToken: 0.25,
       outputPerMToken: 1.50,
+      cacheReadPerMToken: 0.025,
     },
-    capabilities: ['vision', 'coding'],
+    capabilities: ['vision', 'coding', 'streaming', 'tools'],
+    // OpenRouter supported_efforts. No `none`: the judges run Gemini's default
+    // `minimal` thinking today, and `none` at a call site must not change that.
+    reasoning: { control: 'openrouter-effort', efforts: ['low', 'medium', 'high'] },
+    // At that default it answered every small-cap call with no reasoning
+    // tokens (2026-10-25, #2224; scripts/spikes/thinking-off-small-caps).
+    thinksByDefault: false,
     maxOutputTokens: 8_192,
   },
   // Removed from OpenRouter ~2026-05-31. Entry retained for audit log provenance.
@@ -93,8 +298,9 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
       inputPerMToken: 0.10,
       outputPerMToken: 0.40,
     },
-    capabilities: ['vision', 'coding'],
+    capabilities: ['vision', 'coding', 'streaming', 'tools'],
     maxOutputTokens: 8_192,
+    cacheReadPricingUnavailable: 'delisted from OpenRouter ~2026-05-31 — no current published price to record',
   },
   'deepseek/deepseek-chat-v3-0324': {
     provider: 'openrouter',
@@ -103,20 +309,92 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
       inputPerMToken: 0.27,
       outputPerMToken: 1.10,
     },
-    capabilities: ['coding'],
+    capabilities: ['coding', 'streaming', 'tools'],
     maxOutputTokens: 8_192,
+    cacheReadPricingUnavailable: 'OpenRouter publishes no cache-read rate for this model (verified 2026-09-18)',
   },
   'deepseek/deepseek-v4-pro': {
     provider: 'openrouter',
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
+    // $0.435/$0.87 was a promotional rate that ended mid-August 2026; the entry
+    // kept it for about a month, understating every `estimatedCostUsd` written
+    // to `audit_log` by ~3.7x (#1804).
     pricing: {
-      inputPerMToken: 0.435,
-      outputPerMToken: 0.87,
+      inputPerMToken: 1.60,
+      outputPerMToken: 3.20,
+      cacheReadPerMToken: 0.135,
     },
-    capabilities: ['coding', 'reasoning'],
+    capabilities: ['coding', 'reasoning', 'streaming', 'tools'],
     // 8_192 was too low — long-form writing tasks (e.g. import_to_google_doc with
     // a full essay body) exceeded it, producing truncated JSON tool call arguments.
     // DeepSeek V4 Pro on OpenRouter supports up to 64k output tokens (#934).
+    maxOutputTokens: 32_768,
+  },
+  // Dated snapshot of V4 Pro. Registered in its own right so it resolves to its
+  // own price rather than prefix-matching 'deepseek/deepseek-v4-pro' (#1804).
+  //
+  // Caveat: OpenRouter publishes weekday peak-hour overrides for this model
+  // (UTC 01:00-04:00 and 06:00-10:00 bill at 2x these rates). `ModelPricing`
+  // holds one flat rate, so peak-window calls are costed at the off-peak price.
+  'deepseek/deepseek-v4-pro-0813': {
+    provider: 'openrouter',
+    contextWindow: 1_048_576,
+    pricing: {
+      inputPerMToken: 0.66,
+      outputPerMToken: 1.98,
+      cacheReadPerMToken: 0.022,
+    },
+    capabilities: ['coding', 'reasoning', 'streaming', 'tools'],
+    maxOutputTokens: 32_768,
+  },
+  // Candidate replacements for the `standard` tier (curia-deploy#226), added so
+  // pointing a tier at one passes ModelRouter's registry check at boot.
+  //
+  // Same peak-hour caveat as the 0813 snapshot above: weekday UTC 01:00-04:00
+  // and 06:00-10:00 bill at 2x the rates recorded here.
+  'deepseek/deepseek-v4.1-flash': {
+    provider: 'openrouter',
+    contextWindow: 1_048_576,
+    pricing: {
+      inputPerMToken: 0.15,
+      outputPerMToken: 0.60,
+      cacheReadPerMToken: 0.003,
+    },
+    capabilities: ['vision', 'coding', 'reasoning', 'streaming', 'tools'],
+    // OpenRouter supported_efforts, confirmed by the 2026-10-08 probe with
+    // require_parameters (ADR-048). No `none`: on a hard task the model then
+    // writes its working into the visible reply.
+    reasoning: { control: 'openrouter-effort', efforts: ['low', 'high', 'max'] },
+    // Measured 2026-10-25 (#2224): the 10-token classifier returned no text on
+    // 6 of 6 calls, and drift checks used up to 582 output tokens, 536 of them
+    // reasoning. Boot keeps it off the small-cap call sites.
+    thinksByDefault: true,
+    maxOutputTokens: 32_768,
+  },
+  'z-ai/glm-5.3-flash': {
+    provider: 'openrouter',
+    // The model publishes 1_310_720, but OpenRouter's top provider for it serves
+    // 1_048_576. Budget against the smaller number so requests sized from this
+    // value are not rejected by the endpoint that actually handles them.
+    contextWindow: 1_048_576,
+    pricing: {
+      inputPerMToken: 0.09,
+      outputPerMToken: 0.30,
+      cacheReadPerMToken: 0.018,
+    },
+    capabilities: ['vision', 'coding', 'reasoning', 'streaming', 'tools'],
+    maxOutputTokens: 32_768,
+  },
+  'qwen/qwen3.8-flash': {
+    provider: 'openrouter',
+    contextWindow: 1_000_000,
+    pricing: {
+      inputPerMToken: 0.15,
+      outputPerMToken: 0.47,
+      cacheCreationPerMToken: 0.20,
+      cacheReadPerMToken: 0.016,
+    },
+    capabilities: ['vision', 'coding', 'reasoning', 'streaming', 'tools'],
     maxOutputTokens: 32_768,
   },
   'openai/gpt-4o': {
@@ -125,14 +403,20 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
     pricing: {
       inputPerMToken: 2.50,
       outputPerMToken: 10.00,
+      cacheReadPerMToken: 1.25,
     },
-    capabilities: ['vision', 'coding', 'reasoning'],
+    capabilities: ['vision', 'coding', 'reasoning', 'streaming', 'tools'],
     maxOutputTokens: 16_384,
+    // Not a reasoning model: the capability tag is the loose ADR-014 one.
+    thinksByDefault: false,
   },
+
+  ...bedrockClaudeEntries(),
 
   // OpenAI embedding model — used by EmbeddingService for semantic search and entity resolution.
   // inputPerMToken matches current OpenAI pricing for text-embedding-3-small.
   // outputPerMToken is 0: embeddings produce no billed output tokens.
+  // No streaming/tools — embeddings are not chat models (#1553).
   'text-embedding-3-small': {
     provider: 'openai',
     contextWindow: 8191,
@@ -147,9 +431,18 @@ const MODEL_REGISTRY: Record<string, ModelMetadata> = {
 for (const entry of Object.values(MODEL_REGISTRY)) {
   Object.freeze(entry.pricing);
   Object.freeze(entry.capabilities);
+  if (entry.reasoning) {
+    Object.freeze(entry.reasoning.efforts);
+    Object.freeze(entry.reasoning);
+  }
   Object.freeze(entry);
 }
 Object.freeze(MODEL_REGISTRY);
+
+// Exact-match index. A Map, not the record itself: an index read on a plain
+// object hits Object.prototype, so getModel('constructor') would "find" a
+// function and hand it back as ModelMetadata.
+const EXACT_ENTRIES = new Map(Object.entries(MODEL_REGISTRY));
 
 // Pre-sorted entries for prefix matching — longest prefix wins.
 const SORTED_ENTRIES = Object.entries(MODEL_REGISTRY)
@@ -158,25 +451,52 @@ const SORTED_ENTRIES = Object.entries(MODEL_REGISTRY)
 /**
  * Provides typed lookups against the static model registry.
  *
- * All lookups use prefix matching: 'claude-haiku-4-5-20251001' resolves to
- * the 'claude-haiku-4-5' entry. Entries are sorted by key length descending
- * so longer prefixes take priority.
+ * Lookups try an exact key match first, then fall back to prefix matching:
+ * 'claude-haiku-4-5-20251001' resolves to the 'claude-haiku-4-5' entry. Entries
+ * are sorted by key length descending so longer prefixes take priority.
  */
 export class ModelRegistry {
   // Logger is used for debug/warn calls (e.g. unknown model warnings).
   private readonly logger: Logger;
 
+  // Model ids already warned about for resolving by prefix. getModel() runs on
+  // every LLM call via getPricing/getProvider, so warning each time would emit
+  // several lines per call for a model id that is only ever wrong once.
+  private readonly warnedPrefixMatches = new Set<string>();
+
   constructor(logger: Logger) {
     this.logger = logger;
   }
 
-  /** Look up full metadata for a model. Returns undefined if no prefix matches. */
+  /**
+   * Look up full metadata for a model. Returns undefined if nothing matches.
+   *
+   * An exact key wins. Failing that, the longest registered prefix of `modelId`
+   * matches and the hit is logged at warn — the returned pricing, context window
+   * and output cap belong to a different model, which is a guess the operator
+   * should get to overrule (#1804). The warning fires once per distinct model id
+   * per instance.
+   */
   getModel(modelId: string): ModelMetadata | undefined {
+    const exact = EXACT_ENTRIES.get(modelId);
+    if (exact) {
+      return exact;
+    }
+
     const entry = SORTED_ENTRIES.find(([prefix]) => modelId.startsWith(prefix));
     if (!entry) {
       this.logger.debug({ modelId }, 'ModelRegistry: model not found in registry');
+      return undefined;
     }
-    return entry ? entry[1] : undefined;
+
+    if (!this.warnedPrefixMatches.has(modelId)) {
+      this.warnedPrefixMatches.add(modelId);
+      this.logger.warn(
+        { modelId, matchedEntry: entry[0] },
+        `ModelRegistry: "${modelId}" is not a registry key — resolved by prefix to "${entry[0]}" and will be priced and sized as that model. Add its own entry if the metadata differs.`,
+      );
+    }
+    return entry[1];
   }
 
   /** Returns context window size in tokens. Returns undefined for unknown models. */
@@ -192,6 +512,52 @@ export class ModelRegistry {
   /** Returns the provider identifier for a model. Returns undefined for unknown models. */
   getProvider(modelId: string): string | undefined {
     return this.getModel(modelId)?.provider;
+  }
+
+  /** True when the model 400s on non-default sampling parameters. False for unknown models. */
+  rejectsSamplingParams(modelId: string): boolean {
+    return this.getModel(modelId)?.rejectsSamplingParams === true;
+  }
+
+  /** True when the model thinks unless the request disables it. False for unknown models. */
+  thinksByDefault(modelId: string): boolean {
+    return this.getModel(modelId)?.thinksByDefault === true;
+  }
+
+  /**
+   * True when a `NO_REASONING` request gets an answer without thinking: the
+   * entry lists `none`, or it records `thinksByDefault: false`. With the flag
+   * unset, only a model with no sign of reasoning passes: no `reasoning` entry
+   * and no `reasoning` capability. A missing flag on a reasoning model is not a
+   * measurement, so it fails. False for unknown models. Boot requires it of
+   * every model on a small-cap call site (#2224).
+   */
+  canTurnThinkingOff(modelId: string): boolean {
+    const entry = this.getModel(modelId);
+    if (!entry) return false;
+    if (entry.reasoning?.efforts.includes('none') === true) return true;
+    if (entry.thinksByDefault !== undefined) return !entry.thinksByDefault;
+    return entry.reasoning === undefined && !entry.capabilities.includes('reasoning');
+  }
+
+  /** How the model takes a reasoning effort, or undefined when Curia sends it none. */
+  reasoningSupport(modelId: string): ModelReasoningSupport | undefined {
+    return this.getModel(modelId)?.reasoning;
+  }
+
+  /** True when the model's registry entry lists this effort. False for unknown models. */
+  honorsReasoningEffort(modelId: string, effort: ReasoningEffort): boolean {
+    return this.reasoningSupport(modelId)?.efforts.includes(effort) === true;
+  }
+
+  /** The `thinking.type` that reasoning effort `none` sends. `disabled` unless the entry names another. */
+  thinkingOffType(modelId: string): 'disabled' | 'between_tools' {
+    return this.getModel(modelId)?.thinkingOffType ?? 'disabled';
+  }
+
+  /** True when the model rejects thinking sent back after a prefix change. False for unknown models. */
+  thinkingBoundToPrefix(modelId: string): boolean {
+    return this.getModel(modelId)?.thinkingBoundToPrefix === true;
   }
 
   /** Returns true if the model is in the registry (prefix match). */

@@ -14,6 +14,15 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 export type SessionStore = Map<string, number>;
 
 /**
+ * Shared per-route rate limit for console session-authed APIs (KG, tasks, contacts,
+ * chat, dashboard, …): 60/min per IP. Kept in one place so the cap cannot drift
+ * across route files (#872 review).
+ */
+export const CONSOLE_RATE = {
+  config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+} as const;
+
+/**
  * SHA-256 hash of a session token. Used as the Map key and the DB column value so the
  * raw 256-bit token stays only in the HttpOnly cookie and is never persisted anywhere.
  */

@@ -1,6 +1,6 @@
 // service.ts — ExecutiveProfileService
 //
-// System-layer service that owns the executive (CEO) profile — writing voice,
+// System-layer service that owns the executive (principal) profile — writing voice,
 // style preferences, and (in future versions) communication preferences.
 //
 // This is separate from OfficeIdentityService, which owns the assistant's persona.
@@ -19,7 +19,7 @@
 // Every profile change emits a config.change bus event via the audit trail.
 
 import * as fs from 'node:fs';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import chokidar, { type FSWatcher } from 'chokidar';
 import type { Pool } from 'pg';
 import type { Logger } from '../logger.js';
@@ -300,7 +300,13 @@ export class ExecutiveProfileService {
          JOIN executive_profile_versions v ON v.id = c.version_id`,
       );
       if (result.rows.length === 0) return null;
-      return result.rows[0]!.config as ExecutiveProfile;
+      const config = result.rows[0]!.config as ExecutiveProfile;
+      // Rows persisted before the `guide` field was introduced won't have it in
+      // their stored JSON — default so pre-existing rows load without a runtime error.
+      if (typeof config.writingVoice.guide !== 'string') {
+        config.writingVoice.guide = '';
+      }
+      return config;
     } catch (err) {
       // Table doesn't exist yet (pre-migration) — treat as no record.
       const pgCode = (err as { code?: string }).code;
@@ -358,6 +364,11 @@ export class ExecutiveProfileService {
           avoid: wv.vocabulary?.avoid ?? [],
         },
         signOff: wv.sign_off ?? '',
+        // The learned guide is never seeded from YAML — it's populated later by the
+        // weekly voice-learn LLM pass. Preserve the currently-cached guide here so an
+        // unrelated YAML edit (which triggers the watcher to re-seed from
+        // config/executive-profile.yaml and persist) does not wipe the learned value.
+        guide: this.cached?.writingVoice.guide ?? '',
       },
     };
   }
@@ -447,6 +458,10 @@ export function validateProfile(config: ExecutiveProfile): void {
   if (typeof voice.signOff !== 'string') {
     throw new Error('writingVoice.signOff must be a string');
   }
+
+  if (voice.guide !== undefined && typeof voice.guide !== 'string') {
+    throw new Error('writingVoice.guide must be a string');
+  }
 }
 
 /**
@@ -461,6 +476,7 @@ export function validateProfile(config: ExecutiveProfile): void {
  *   3. Writing patterns (ordered list)
  *   4. Vocabulary (prefer / avoid)
  *   5. Sign-off
+ *   6. Learned voice guide (free-form markdown from the weekly voice-learn pass)
  */
 export function compileWritingVoiceBlock(profile: ExecutiveProfile, executiveName: string): string {
   const voice = profile.writingVoice;
@@ -506,6 +522,13 @@ export function compileWritingVoiceBlock(profile: ExecutiveProfile, executiveNam
   if (voice.signOff) {
     lines.push('**Sign-off:**');
     lines.push(`End emails with: ${voice.signOff}`);
+  }
+
+  // 5. Learned voice guide (maintained by the weekly voice-learn LLM pass).
+  if (voice.guide && voice.guide.trim()) {
+    lines.push('**How the executive actually writes (learned from their edits):**');
+    lines.push(voice.guide.trim());
+    lines.push('');
   }
 
   return lines.join('\n');

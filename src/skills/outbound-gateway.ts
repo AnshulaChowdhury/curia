@@ -12,85 +12,114 @@
 // blocked-contact check.
 //
 // Adding a new channel:
-//   1. Add a new variant to OutboundSendRequest (discriminated union by `channel`)
-//   2. Add the channel client to OutboundGatewayConfig
-//   3. Add a private dispatch<Channel>() method
-//   4. Add a branch in send() to call it
+//   1. Add `src/channels/<name>/outbound-request.ts` and contribute
+//      `extractRecipients` on that channel's `principal-rules.ts` (ADR-035) —
+//      recipient projection for principal tagging needs no gateway edit.
+//   2. Re-export the new request variant into OutboundSendRequest below
+//      (public API union) and add the channel client to OutboundGatewayConfig.
+//   3. Add a private dispatch<Channel>() method and a branch in send() to call it.
 //   The blocked-contact check and content filter in send() are channel-agnostic and
-//   run for all channels before dispatch.
+//   run for all channels before dispatch. Principal identity compare + Gate C
+//   carve-out live on PrincipalChannelRules (ADR-034).
 
 import { randomUUID } from 'node:crypto';
 import type { NylasClient, NylasMessage, NylasFolder, ListMessagesOptions, SendEmailOptions, AttachmentContent } from '../channels/email/nylas-client.js';
+import { deleteHeldDraft, findHeldDraft } from '../channels/email/held-draft.js';
+import { quoteParticipants } from './_shared/reply-quote.js';
 import { readAttachmentFiles, MAX_ATTACHMENT_BYTES, type OutboundAttachmentInput } from './_shared/read-attachments.js';
+import type { EmailRecipientSource, EmailSendRequest } from '../channels/email/outbound-request.js';
+import type { SignalOutboundRequest } from '../channels/signal/outbound-request.js';
+import type { SlackOutboundRequest } from '../channels/slack/outbound-request.js';
+import type { SmsOutboundRequest } from '../channels/sms/outbound-request.js';
 import type { SignalRpcClient } from '../channels/signal/signal-rpc-client.js';
+import type { SlackClient } from '../channels/slack/slack-client.js';
+import type { SmsClient } from '../channels/sms/sms-client.js';
+import { TelnyxSendError } from '../channels/sms/sms-client.js';
+import { TELNYX_ERROR_OPTED_OUT } from '../channels/sms/types.js';
 import type { ContactService } from '../contacts/contact-service.js';
-import type { ContactTier, ChannelIdentity } from '../contacts/types.js';
-import type { OutboundContentFilter, FilterRecipient } from '../dispatch/outbound-filter.js';
-import type { PiiRedactor } from '../dispatch/pii-redactor.js';
+import { classifyEmailSender } from '../contacts/contact-service.js';
+import type { ContactTier, ChannelIdentity, TaskOriginator } from '../contacts/types.js';
+import {
+  isPrincipalIdentity,
+  computePrincipalIsSoleRecipient,
+} from '../contacts/principal-recipient.js';
+import { findPrincipalChannelRules } from '../contacts/principal-channel-registry.js';
+import type { ProjectedRecipient } from '../contacts/principal-channel-rules.js';
+import type { OutboundContentFilter, FilterFinding, FilterRecipient } from '../dispatch/outbound-filter.js';
+import type { DetectedPii, PiiRedactor } from '../dispatch/pii-redactor.js';
+import type { BriefDetectedItem } from '../autonomy/judge-brief.js';
 import type { EventBus } from '../bus/bus.js';
 import type { Logger } from '../logger.js';
-import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked } from '../bus/events.js';
-import { AutonomyService } from '../autonomy/autonomy-service.js';
+import { createOutboundBlocked, createOutboundDelivered, createOutboundNotification, createAutonomySendBlocked, createAutonomyRelayDeferred, createPrincipalReport } from '../bus/events.js';
+import type { ChannelReconnectEvent } from '../bus/events.js';
+import { AutonomyService, type AutonomyConfig } from '../autonomy/autonomy-service.js';
+import { markdownToMrkdwn } from '../format/markdown-to-mrkdwn.js';
 import type { ActionLogRepo } from '../autonomy/action-log-repo.js';
-import { generateShortRef } from '../autonomy/approval-trigger.js';
+import { approvalAdvisory, buildApprovalDeliveryWake, generateShortRef, readApprovalNumber, type ApprovalWakeAsk } from '../autonomy/approval-trigger.js';
+import { enrichGatewayApprovalPayload } from '../autonomy/approval-notification.js';
+import type { ApprovalDelivery } from '../autonomy/approval-delivery.js';
+import type { AutonomyGating } from '../autonomy/band-policy.js';
+import { budgetedOriginator, type RelayBudget } from '../autonomy/relay-budget.js';
+import { isUuid } from '../util/uuid.js';
+import {
+  BAND_RULES, describePiiLabels, type BandReviewAsk, type BandReviewReport, type BandReviewSignals, type BandSendReview,
+} from '../dispatch/band-send-review.js';
 import type { OutboundNotificationPayload } from '../bus/events.js';
-import { markdownToHtml } from '../channels/email/markdown-to-html.js';
+import { askPreamble, displayName, normalizeCounterparty, type DisclosureAsk } from '../autonomy/disclosure-decisions.js';
+import { markdownToHtml } from '../format/markdown-to-html.js';
+import { bodyEndsWithSignature, emailSignatureHtml, emailSignatureText, stripModelSignOff } from '../channels/email/signature.js';
+import type { AgentPersona } from './types.js';
 import { scrubPii } from '../pii/scrubber.js';
+import type { ExportControlService } from '../security/export-controls.js';
+import {
+  ExportControlService as ExportControlServiceClass,
+  extractDestinationFromEmailRequest,
+  formatDestination,
+} from '../security/export-controls.js';
+import { OutboundQueueFullError, type OutboundQueueRepo } from './outbound-queue-repo.js';
+import type { ExportItem } from '../security/export-controls.js';
+import type { ConversationEntityState } from '../entity-context/conversation-entities.js';
+import { describeUnresolvedIdentity, emailLocalNameTokens } from '../agents/resolved-entities.js';
+import type { IdentityGateMode } from '../config.js';
+import type { ErrorType } from '../errors/types.js';
+import type { CallBudget } from '../util/call-budget.js';
+import { nylasMessageFailure } from '../channels/email/nylas-message-id.js';
+import {
+  PRINCIPAL_RECIPIENT_ALIAS,
+  parseRecipientReference,
+  resolveRecipientReference,
+  type RecipientReferenceFields,
+  type RecipientResolution,
+} from './_shared/recipient-reference.js';
 
 // ---------------------------------------------------------------------------
-// Public types
+// Public types — request variants owned by channel packages; re-exported here
+// so existing callers keep a stable import path (public API surface).
 // ---------------------------------------------------------------------------
 
-export interface EmailSendRequest {
-  channel: 'email';
-  /** Which named account should send this message (e.g. "curia", "joseph").
-   *  Used by the gateway to select the right NylasClient from its map.
-   *  Defaults to the first configured account when absent. */
-  accountId?: string;
-  /** Recipient email address */
-  to: string;
-  subject?: string;
-  body: string;
-  cc?: string[];
-  /** When set, Nylas threads the outbound message as a reply */
-  replyToMessageId?: string;
-  /** Pre-formed HTML fragment appended verbatim after markdownToHtml(body).
-   *  Used for the quoted original message block: the HTML quote must not pass
-   *  through markdownToHtml because that converter escapes < and > characters. */
-  htmlQuote?: string;
-  /** File attachments to include. Each entry must have a file:// URL pointing
-   *  to a temp file (from email-download-attachment or similar). The gateway
-   *  reads the files from disk before passing them to Nylas. */
-  attachments?: OutboundAttachmentInput[];
-}
+export type { EmailSendRequest } from '../channels/email/outbound-request.js';
+export type { SignalOutboundRequest } from '../channels/signal/outbound-request.js';
+export type { SlackOutboundRequest } from '../channels/slack/outbound-request.js';
+export type { SmsOutboundRequest } from '../channels/sms/outbound-request.js';
 
 // Re-export so callers can construct attachment lists without importing from read-attachments directly.
 export type { OutboundAttachmentInput };
 
-export interface SignalOutboundRequest {
-  channel: 'signal';
-  /**
-   * E.164 phone number for 1:1 sends (e.g. "+14155552671").
-   * Mutually exclusive with groupId — set exactly one.
-   */
-  recipient?: string;
-  /**
-   * Base64-encoded group V2 ID for group sends.
-   * Mutually exclusive with recipient — set exactly one.
-   */
-  groupId?: string;
-  message: string;
-}
-
 /**
  * Discriminated union of all supported outbound send requests.
- * Add a new variant here when adding a new channel.
+ * Variants live in `src/channels/<name>/outbound-request.ts`; re-export the new
+ * variant into this union when adding a channel (delivery dispatch still needs
+ * a gateway branch — recipient projection for principal tagging does not).
  *
  * Note: OutboundSendRequest is a public API surface — adding a new variant is
  * backwards-compatible, but changing existing field names or types is a breaking
  * change that must be called out in CHANGELOG.md.
  */
-export type OutboundSendRequest = EmailSendRequest | SignalOutboundRequest;
+export type OutboundSendRequest =
+  | EmailSendRequest
+  | SignalOutboundRequest
+  | SlackOutboundRequest
+  | SmsOutboundRequest;
 
 // Re-export the old name as an alias so existing callers don't break.
 // Previously OutboundSendRequest was a single interface (email-only). Now it's a
@@ -100,21 +129,91 @@ export type OutboundSendRequest = EmailSendRequest | SignalOutboundRequest;
 // terms of what email callers already do.
 export type { OutboundSendRequest as OutboundEmailSendRequest };
 
+/**
+ * Queue JSON is untyped. Only the exact `email_participant` opt-in counts;
+ * any other value, including rows queued before #2071, fails closed.
+ * The display name is used only for that opt-in's duplicate check.
+ */
+function emailProvenanceFromPayload(payload: EmailSendRequest): {
+  source?: EmailRecipientSource;
+  displayName?: string;
+} {
+  if (payload.recipientSource !== 'email_participant') return {};
+  const rawName = payload.recipientDisplayName;
+  const displayName = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+  return {
+    source: 'email_participant',
+    ...(displayName ? { displayName } : {}),
+  };
+}
+
 export interface OutboundSendResult {
   success: boolean;
   messageId?: string;
+  /** The provider's thread for a sent email (#2333): a reply to it arrives on this thread. */
+  threadId?: string;
   /** Human-readable reason when success is false */
   blockedReason?: string;
+  /**
+   * Content-filter rule name(s) that triggered a block (e.g. `llm-judge-audience-leak`).
+   * Populated by both `send()` (#1051) and `sendEmailDraft()` (#1158) when the content
+   * filter rejects the send, giving the agent's tool loop the specific rule category so
+   * it can address the root cause and retry. Rule names only — never the (potentially
+   * sensitive) finding detail.
+   *
+   * Optional because non-filter block paths (blocked recipient, autonomy gate, client
+   * misconfiguration) set `blockedReason` without a rule set — callers must treat absence
+   * as "no rule info available".
+   */
+  blockedRules?: string[];
+  /**
+   * Recipients of a blocked send that match no contact, or only an unverified
+   * identity (#2033). Set only on filter blocks, and only when the contact lookup
+   * succeeded; `blockedReason` already carries the agent-facing note.
+   */
+  unmatchedRecipients?: string[];
+  /**
+   * PII redactions that changed what was sent (#2312): the pattern label and which field it hit.
+   * Labels only, never the matched values. Set only on a successful send (dispatched, queued or
+   * held for the digest) where redaction changed something; absent otherwise.
+   */
+  redactions?: Array<{ label: string; field: 'body' | 'subject' }>;
+  /** The body as delivered. Set with `redactions`; send skills use it for outbound context. */
+  sentContent?: string;
+  /** The email subject as delivered. Set with `redactions` on email sends; skills return it in place of the input subject. */
+  sentSubject?: string;
   /** True when the autonomy gate blocked this send */
   gated?: boolean;
   /** Short reference for the action_log row (e.g. 'a3f7c12b'). Present when gated is true. */
   actionRef?: string;
+  /**
+   * True when the send was durably queued because the channel transport was down (#1380).
+   * `success` is still true — the message was accepted for later delivery, not dropped.
+   */
+  queued?: boolean;
+  /**
+   * When success is false, hints that the failure is transport/availability related
+   * and the gateway may enqueue for later retry on queueable channels (#1380).
+   * Permanent failures (opt-out, validation) must leave this unset/false.
+   */
+  queueable?: boolean;
+  /**
+   * True when the relay budget held this send for the principal's digest instead of sending
+   * it (#1320). `success` is true: the message is kept, and the caller must not re-send it
+   * another way.
+   */
+  deferredToDigest?: boolean;
 }
 
 /** Result from createEmailDraft() — extends send result with the Nylas draft ID. */
 export interface OutboundDraftResult extends OutboundSendResult {
   /** Nylas draft ID when success is true. */
   draftId?: string;
+  /**
+   * The draft's subject and body as Nylas stored them, when success is true (#2312). An
+   * approval of the draft stores them so send-draft can match the replay to what was shown.
+   */
+  draft?: { subject: string; body: string };
 }
 
 export interface OutboundGatewayConfig {
@@ -134,6 +233,22 @@ export interface OutboundGatewayConfig {
   nylasClients?: Map<string, NylasClient>;
 
   /**
+   * Each email account's own address (`email_accounts.self_email`), by account name.
+   * isPrincipalMailbox() reads it to tell the principal's mailbox from Curia's own
+   * (prompt trim PR 6). Absent in tests and boots without email, where no mailbox
+   * counts as the principal's.
+   */
+  emailAccountAddresses?: ReadonlyMap<string, string>;
+
+  /**
+   * The assistant's persona, held by reference so a hot-reloaded identity edit applies
+   * to the next email. Its signature is added to every email the gateway sends or
+   * drafts, except system notifications and mail from the principal's own mailbox
+   * (prompt trim PR 6). Absent: no signature.
+   */
+  agentPersona?: AgentPersona;
+
+  /**
    * signal-cli RPC client for Signal sends. Optional — gateway can be initialized
    * with only email (nylasClient) if Signal is not configured.
    */
@@ -144,6 +259,16 @@ export interface OutboundGatewayConfig {
    * signal-cli RPC calls. Required when signalClient is provided.
    */
   signalPhoneNumber?: string;
+
+  /**
+   * Slack Socket Mode / Web API client. Optional — only when Slack channel is enabled.
+   */
+  slackClient?: SlackClient;
+
+  /**
+   * Telnyx SMS client. Optional — only when SMS channel is enabled.
+   */
+  smsClient?: SmsClient;
 
   contactService: ContactService;
   contentFilter: OutboundContentFilter;
@@ -158,6 +283,22 @@ export interface OutboundGatewayConfig {
    * When empty (no principal contact exists), the principal bypass does not fire.
    */
   principalIdentities?: ChannelIdentity[];
+
+  /**
+   * Conversation-scoped resolved contacts (#1818). When set, a send to a
+   * non-principal recipient is blocked if the body has an unconfirmed-name
+   * hedge, or an unresolved name next to an invitation or attendance cue.
+   * Other names are not blocked. Absent in tests and in boots that have no
+   * database — the gate is skipped.
+   */
+  conversationEntities?: ConversationEntityState;
+
+  /**
+   * Kill switch for the identity gate (#1818). `enforce` blocks, `shadow`
+   * logs the block and sends, `off` does not inspect the text. Default
+   * `enforce` when omitted, including in tests.
+   */
+  identityGate?: IdentityGateMode;
 
   logger: Logger;
 
@@ -199,6 +340,58 @@ export interface OutboundGatewayConfig {
    * every successful outbound send. Replaces the setTrustLevel('high') band-aid.
    */
   confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
+
+  /**
+   * Bulk export gate service (#201) — enforces item-count threshold, destination
+   * allowlisting, and restricted sensitivity ceiling on email attachments.
+   */
+  exportControlService?: ExportControlService;
+
+  /**
+   * Durable outbound queue for disconnected / unavailable channels (#1380).
+   * Channels that opt in via `Channel.supportsOutboundQueue` are registered in
+   * `outboundQueueReadiness`; post-policy sends are persisted while not ready
+   * (or when dispatch returns `queueable: true`) and flushed on `channel.reconnect`.
+   */
+  outboundQueue?: OutboundQueueRepo;
+  /**
+   * Readiness probes for queueable channels, keyed by channel name (`signal`,
+   * `slack`, `sms`, `email`, …). Built at bootstrap from each adapter's `isOutboundReady`
+   * (or the underlying client). Absent channels are never auto-queued.
+   */
+  outboundQueueReadiness?: ReadonlyMap<string, () => boolean>;
+
+  /**
+   * Which policy reviews sends (#2159). Under 'band', a send that passes the content
+   * filter is reviewed by `bandReview` (the escalation judge's brief) before dispatch.
+   * Default 'tier': no band review, today's behavior. A gating on the autonomy config
+   * overrides it per send (#2312): production stamps this same value there; the scenario
+   * suite pins it per case.
+   */
+  gating?: AutonomyGating;
+  /** The band review (#2159). Used only when gating is 'band'. */
+  bandReview?: Pick<BandSendReview, 'review'>;
+  /**
+   * Caps the immediate messages to the principal that one outside contact can cause (#1320).
+   * Absent: no cap.
+   */
+  relayBudget?: RelayBudget;
+}
+
+/** One send's autonomy config read (#2312). `failed`: the read threw (`error`); config is then null. */
+interface AutonomyRead {
+  config: AutonomyConfig | null;
+  failed: boolean;
+  error?: unknown;
+}
+
+/** What a band hold replays on approval: the same shape as reExecRecipe (#2159). */
+interface SendRecipe {
+  toolName: string;
+  partialPayload?: Record<string, unknown>;
+  description: string;
+  /** Used instead of `description` when the hold is a personal-data ask (#2312). */
+  askDescription?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,8 +419,39 @@ function redactId(value: string): string {
 }
 
 /**
+ * A relay originator's contact id, safe for logs (#1320). An unresolved sender's id is its raw
+ * address or number (stampOriginator), so it is redacted like any other recipient id.
+ */
+function loggableContactId(contactId: string): string {
+  return isUuid(contactId) ? contactId : redactId(contactId);
+}
+
+/** Every To address of an email request, primary first (#2273). */
+function emailToAddresses(request: EmailSendRequest): string[] {
+  return [request.to, ...(request.additionalTo ?? [])];
+}
+
+/**
+ * The once-per-window relay-budget notice (#1320), addressed exactly as the held relay was:
+ * same channel, account and principal address, with the body replaced and any threading or
+ * attachments dropped, so nothing of the held message rides along.
+ */
+function relayNoticeRequest(request: OutboundSendRequest, text: string, subject: string): OutboundSendRequest {
+  switch (request.channel) {
+    case 'email':
+      return { channel: 'email', to: request.to, subject, body: text, ...(request.accountId ? { accountId: request.accountId } : {}) };
+    case 'slack':
+      return { channel: 'slack', slackChannelId: request.slackChannelId, ...(request.slackUserId ? { slackUserId: request.slackUserId } : {}), message: text };
+    case 'sms':
+      return { channel: 'sms', recipient: request.recipient, message: text };
+    case 'signal':
+      return { channel: 'signal', ...(request.recipient ? { recipient: request.recipient } : {}), message: text };
+  }
+}
+
+/**
  * Build a principal-safe summary of WHY an outbound message was blocked, for the
- * CEO notification body. The summary gives the CEO something actionable without
+ * principal notification body. The summary gives the principal something actionable without
  * re-leaking the offending content into their mailbox (and through the email
  * provider that carries the notification).
  *
@@ -245,14 +469,185 @@ function redactId(value: string): string {
  *     detail. This preserves the existing "no sensitive content in the notification"
  *     invariant for the deterministic stage.
  */
+/**
+ * The reasons of a hold a bounce or block outranked (#2333), as sentences to append when nobody
+ * can rewrite the send (a saved draft, a relayed reply), so they still apply. Rule details only.
+ */
+function heldBesideNote(heldBeside: readonly FilterFinding[] | undefined): string {
+  return (heldBeside ?? []).map((f) => ` ${f.detail.replace(/^Held for the principal: /, 'Also, ')}`).join('');
+}
+
 function buildBlockReasonSummary(findings: Array<{ rule: string; detail: string }>): string {
   if (findings.length === 0) return 'Content filter (no rule detail available)';
   return findings
     .map((f) => {
-      const showDetail = (f.rule.startsWith('llm-judge-') || f.rule === 'disclosure-tier-gate') && f.detail;
+      // principal-note-markup's detail is fixed text that tells the agent where the note goes.
+      // A band bounce's detail quotes the agent's own sentences, which it needs to fix the
+      // message (#2159); it never carries a matched secret or a third party's data.
+      const showDetail = (
+        f.rule.startsWith('llm-judge-')
+        || f.rule === 'disclosure-tier-gate'
+        || f.rule === 'principal-note-markup'
+        || f.rule === BAND_RULES.ungrounded
+        || f.rule === BAND_RULES.unneeded
+        // Labels and fixed text only, never values (#2312): the drafter needs them to rewrite.
+        || f.rule === BAND_RULES.pii
+        || f.rule === BAND_RULES.token
+      ) && f.detail;
       return showDetail ? `${f.rule}: ${f.detail}` : f.rule;
     })
     .join('\n');
+}
+
+/**
+ * A blocked send's recipient that the contact lookup could not tie to a confirmed
+ * address (#2033): no contact at all, or a match on an unverified identity only.
+ * The second covers a mistyped address that was delivered once before: the gateway
+ * recorded it as an unverified `outbound_recipient` contact, and it must not stop
+ * counting as suspect from then on.
+ */
+export interface UnmatchedRecipient {
+  identifier: string;
+  reason: 'no-contact' | 'unverified';
+}
+
+/**
+ * Agent-facing note for a blocked send whose recipient matches no contact (#2033).
+ *
+ * Block reasons describe the content, so an agent with a mistyped address edits
+ * the message until it passes. On 2026-10-07 that loop delivered principal-facing
+ * content to an invented domain on the fifth try. Naming the recipient points the
+ * agent at the address first.
+ */
+export function formatUnmatchedRecipientNote(unmatched: readonly UnmatchedRecipient[]): string {
+  const sentence = (ids: string[], verbOne: string, verbMany: string, rest: string) =>
+    ids.length === 0 ? '' : `${ids.join(', ')} ${ids.length === 1 ? verbOne : verbMany} ${rest} `;
+  const none = unmatched.filter((u) => u.reason === 'no-contact').map((u) => u.identifier);
+  const unverified = unmatched.filter((u) => u.reason === 'unverified').map((u) => u.identifier);
+  return (
+    'Recipient check: ' +
+    sentence(none, 'matches', 'match', 'no known contact.') +
+    sentence(unverified, 'matches', 'match', 'only an unverified contact address, one nobody has confirmed.') +
+    `The block may be about who this is going to, not what it says. Check the recipient before you rewrite ` +
+    `the message. To reach a known person, send by their contact ID, or "${PRINCIPAL_RECIPIENT_ALIAS}" for ` +
+    'the principal, instead of typing an address.'
+  );
+}
+
+/**
+ * The recipient lines of the principal's "outbound message blocked" FYI, marking
+ * any recipient that matches no contact (#2033). The 2026-10-07 FYIs read as
+ * content problems while the address was the problem.
+ */
+function unmatchedRecipientNotificationLines(intended: string, unmatched: readonly UnmatchedRecipient[]): string[] {
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  const label = (u: UnmatchedRecipient) => (u.reason === 'no-contact' ? 'matches no known contact' : 'unverified contact address');
+  const forIntended = unmatched.find((u) => same(u.identifier, intended));
+  const others = unmatched.filter((u) => !same(u.identifier, intended));
+  return [
+    `Intended recipient: ${intended}${forIntended ? ` (${label(forIntended)})` : ''}`,
+    ...(others.length > 0
+      ? [`Other recipients to check: ${others.map((u) => `${u.identifier} (${label(u)})`).join(', ')}`]
+      : []),
+  ];
+}
+
+/**
+ * A pending-approval payload for display, minus recipient fields that hold a
+ * contact reference (#2033). The caller fills those from the resolved request,
+ * so the principal approves a send to an address, not to a bare contact UUID.
+ * The stored payload keeps the reference; approval re-resolves it.
+ */
+function withoutRecipientReferences(payload: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(payload).filter(([key, value]) => {
+      if (typeof value !== 'string') return true;
+      // to / recipient hold one reference; cc holds a list that may mix them in.
+      if (key === 'to' || key === 'recipient') return parseRecipientReference(value) === null;
+      if (key === 'cc') return !value.split(',').some((entry) => parseRecipientReference(entry) !== null);
+      return true;
+    }),
+  );
+}
+
+/** Node.js network-error `code` values that indicate a transient, retryable failure. */
+const TRANSIENT_ERROR_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EPIPE', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH',
+]);
+
+/**
+ * True when an error carries a **structured** signal that it is transient/retryable —
+ * an HTTP status of 408/429/5xx (`statusCode`/`status`) or a Node network-error `code` —
+ * independent of its message text. Callers OR this with a message-regex fallback so a
+ * retryable failure is not misclassified as permanent just because the provider only
+ * stringified it (#1380 review). Auth/validation (4xx other than 408/429) is not matched.
+ */
+export function hasTransientErrorSignal(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { statusCode?: unknown; status?: unknown; code?: unknown };
+  const status = typeof e.statusCode === 'number' ? e.statusCode
+    : typeof e.status === 'number' ? e.status
+      : undefined;
+  if (status !== undefined && (status === 408 || status === 429 || status >= 500)) return true;
+  return typeof e.code === 'string' && TRANSIENT_ERROR_CODES.has(e.code);
+}
+
+/**
+ * A named mailbox is not in the configured Nylas client map.
+ * Gate C returns this message to the agent instead of escalating (#1832).
+ */
+export class UnknownEmailAccountError extends Error {
+  readonly accountId: string;
+
+  constructor(accountId: string, available: readonly string[]) {
+    super(`unknown account '${accountId}'; available: [${available.join(', ')}]`);
+    this.name = 'UnknownEmailAccountError';
+    this.accountId = accountId;
+  }
+}
+
+// How a spot-check summary names each kind of send (#2159 Phase 3), e.g. 'Emailed dana@example.com'.
+const SENT_VERB: Record<OutboundSendRequest['channel'], string> = {
+  email: 'Emailed', signal: 'Sent a Signal message to', sms: 'Texted', slack: 'Sent a Slack message to',
+};
+// A recipient whose contact is younger than this counts as a first contact (#2159 Phase 3).
+const FIRST_CONTACT_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** What the spot-check pool needs to know about a send's primary recipient. */
+interface FirstContactProbe {
+  /** A person (an address or a DM), not a group or channel id. */
+  person: boolean;
+  /** The contact Step 1 resolved, or undefined when none matched. */
+  contactId: string | undefined;
+  /** Step 1's contact lookup threw, so contactId says nothing. */
+  lookupFailed: boolean;
+}
+/** First line, at most 80 characters: enough to recognise the message on a phone. */
+function truncatePreview(text: string): string {
+  const line = text.split('\n').find((l) => l.trim() !== '')?.trim() ?? '';
+  return line.length > 80 ? `${line.slice(0, 77)}...` : line;
+}
+
+// The question an ask's approval opens with (#2312); approval delivery rebuilds it from the row.
+export { askPreamble };
+
+/**
+ * An ask's approval shows any other reason it was held beside the question (#2312): a hold for
+ * speaking as the principal below 80 keeps the ask (band-send-review.ts, combine).
+ */
+function alsoHeld(findings: readonly FilterFinding[]): string[] {
+  const other = findings.filter((f) => f.rule !== BAND_RULES.pii);
+  return other.length > 0 ? [`Also held by the send review: ${other.map((f) => f.detail).join(' ')}`] : [];
+}
+
+/**
+ * A personal-data ask as a relayed reply's coordinator wake states it (#2312): human labels and
+ * the requester, plus the email it answers so the holding reply can thread under it.
+ */
+function wakeAskFor(request: OutboundSendRequest, ask: BandReviewAsk): ApprovalWakeAsk {
+  const replyTo = request.channel === 'email' && request.replyToMessageId
+    ? { messageId: request.replyToMessageId, ...(request.accountId ? { account: request.accountId } : {}) }
+    : undefined;
+  return { details: describePiiLabels(ask.labels), requester: normalizeCounterparty(ask.requester), ...(replyTo ? { replyTo } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -264,35 +659,98 @@ export class OutboundGateway {
   private readonly nylasClients: Map<string, NylasClient>;
   /**
    * The primary NylasClient — first entry in nylasClients, used for system
-   * notifications (blocked-content CEO alerts) when no accountId is specified.
+   * notifications (blocked-content principal alerts) when no accountId is specified.
    */
   private readonly primaryNylasClient: NylasClient | undefined;
   private readonly signalClient?: SignalRpcClient;
   private readonly signalPhoneNumber?: string;
+  private readonly slackClient?: SlackClient;
+  private readonly smsClient?: SmsClient;
   private readonly contactService: ContactService;
   private readonly contentFilter: OutboundContentFilter;
   private readonly bus: EventBus;
   private readonly principalIdentities: ChannelIdentity[];
+  private readonly emailAccountAddresses: ReadonlyMap<string, string>;
+  private readonly agentPersona?: AgentPersona;
+  private readonly conversationEntities?: ConversationEntityState;
+  private readonly identityGate: IdentityGateMode;
   private readonly log: Logger;
   private readonly autonomyService?: AutonomyService;
   private readonly piiRedactor?: PiiRedactor;
   private readonly actionLogRepo?: ActionLogRepo;
+  /** Set after construction (setApprovalDelivery) — ApprovalDelivery sends through this gateway. */
+  private approvalDelivery?: Pick<ApprovalDelivery, 'registerDisplay'>;
   private readonly confidencePipeline?: import('../contacts/confidence-pipeline.js').ConfidencePipeline;
+  private readonly exportControlService?: ExportControlService;
+  private readonly outboundQueue?: OutboundQueueRepo;
+  private readonly outboundQueueReadiness: Map<string, () => boolean>;
+  private readonly gating: AutonomyGating;
+  private readonly bandReview?: Pick<BandSendReview, 'review'>;
+  private readonly relayBudget?: RelayBudget;
+  private flushInFlight = new Set<string>();
+  /** Backoff timers for HTTP channels that queued on a transient failure (#1380). */
+  private flushRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(config: OutboundGatewayConfig) {
     this.nylasClients = config.nylasClients ?? new Map();
     this.primaryNylasClient = this.nylasClients.values().next().value;
     this.signalClient = config.signalClient;
     this.signalPhoneNumber = config.signalPhoneNumber;
+    this.slackClient = config.slackClient;
+    this.smsClient = config.smsClient;
     this.contactService = config.contactService;
     this.contentFilter = config.contentFilter;
     this.bus = config.bus;
     this.principalIdentities = config.principalIdentities ?? [];
+    this.emailAccountAddresses = config.emailAccountAddresses ?? new Map();
+    this.agentPersona = config.agentPersona;
+    this.conversationEntities = config.conversationEntities;
+    this.identityGate = config.identityGate ?? 'enforce';
     this.log = config.logger.child({ component: 'outbound-gateway' });
     this.autonomyService = config.autonomyService;
     this.piiRedactor = config.piiRedactor;
     this.actionLogRepo = config.actionLogRepo;
     this.confidencePipeline = config.confidencePipeline;
+    this.exportControlService = config.exportControlService;
+    this.outboundQueue = config.outboundQueue;
+    this.outboundQueueReadiness = new Map(config.outboundQueueReadiness ?? []);
+    this.gating = config.gating ?? 'tier';
+    this.bandReview = config.bandReview;
+    this.relayBudget = config.relayBudget;
+    if (this.gating === 'band' && !this.bandReview) {
+      // The filter turns contact-data-leak and Stage 2.5 off under band; without the review
+      // that replaces them, sends would go out with no disclosure review at all.
+      this.log.error({ gating: this.gating }, 'outbound-gateway: band gating without a band review — sends get no disclosure review');
+    }
+    if (!this.actionLogRepo) {
+      // Once here rather than per send: without the repo no autonomous send reaches the
+      // spot-check pool (#2159 Phase 3), and that should not be invisible.
+      this.log.warn({ actionLogRepo: false }, 'outbound-gateway: spot-check pool disabled: no actionLogRepo');
+    }
+  }
+
+  /**
+   * Register or replace a channel's outbound-queue readiness probe (#1380).
+   * Called when an adapter that sets `supportsOutboundQueue` is constructed —
+   * SMS readiness depends on adapter start/stop, which happens after gateway boot.
+   */
+  setOutboundQueueReadiness(channel: string, isReady: () => boolean): void {
+    this.outboundQueueReadiness.set(channel, isReady);
+  }
+
+  /**
+   * Subscribe to `channel.reconnect` so queued messages flush when a transport
+   * comes back (#1380). Call once after construction.
+   */
+  start(): void {
+    if (!this.outboundQueue) return;
+    this.bus.subscribe('channel.reconnect', 'system', (event) => {
+      const e = event as ChannelReconnectEvent;
+      void this.flushChannel(e.payload.channel).catch((err) => {
+        this.log.error({ err, channel: e.payload.channel }, 'outbound-gateway: queue flush failed');
+      });
+    });
+    this.log.info('Outbound gateway queue flush subscriber registered');
   }
 
   /**
@@ -305,19 +763,28 @@ export class OutboundGateway {
    *   2. Content filter (fail-closed)
    *   3. Channel dispatch (email → Nylas, signal → signal-cli RPC)
    *
-   * @param options.skipNotificationOnBlock  When true, suppress the CEO notification
+   * @param options.skipNotificationOnBlock  When true, suppress the principal notification
    *   if the content filter blocks this message. Used by the EmailAdapter's
    *   outbound.notification subscriber to break the recursion cycle: without this
    *   guard, a broken content filter (crash → fail-closed) would trigger
    *   send → block → sendNotification → EmailAdapter → send → block → ... infinitely.
    * @param options.humanApproved  When true, skip Step 0 (autonomy gate) only.
-   *   The CEO is explicitly in the loop. All other safety checks (blocked-contact,
+   *   The principal is explicitly in the loop. All other safety checks (blocked-contact,
    *   content filter) run normally. See ADR-017.
    * @param options.isSystemNotification  When true, skip Step 0 (autonomy gate) only.
-   *   Used for infrastructure alerts sent TO the CEO (e.g. approval_requested,
+   *   Used for infrastructure alerts sent TO the principal (e.g. approval_requested,
    *   blocked_content). These must never be silenced by the same gate they report on —
-   *   if the score is too low to send autonomously, the CEO still needs to know about it.
+   *   if the score is too low to send autonomously, the principal still needs to know about it.
    *   All other safety checks (blocked-contact, content filter) run normally.
+   * @param options.recipientSource  Provenance for a contact this send creates (#2071).
+   *   Applies to the email To only. Default `outbound_recipient` (unverified), so a
+   *   caller that does not set it fails closed. `email-reply` passes
+   *   `email_participant` only when To was copied from a From header that is not
+   *   an owned mailbox and that passed SPF, DKIM, and DMARC. The gateway cannot
+   *   infer that from `replyToMessageId`: `email-send` sets it too. A likely
+   *   duplicate still records `outbound_recipient`.
+   * @param options.recipientDisplayName  From display name for that duplicate check.
+   *   Omitted when the header has no real name. Not sent to the provider.
    */
   async send(
     request: OutboundSendRequest,
@@ -338,15 +805,23 @@ export class OutboundGateway {
        * Channel adapters opt in to the two-step draft-fallback pattern by providing
        * this object. When present and the send is gated, the gateway writes a
        * pending_approval row using these values so approve-action can invoke the
-       * correct skill with the correct payload on CEO approval.
+       * correct skill with the correct payload on principal approval.
        *
        * When absent, no pending_approval row is written and the send returns
        * { gated: true } without an actionRef. Adapters without a re-execution
        * path (e.g. Signal today) simply omit this field.
        */
+      /**
+       * True when no agent turn is waiting on this send — a dispatcher-relayed reply (#2159).
+       * A held approval then wakes the coordinator to deliver it, since nobody reads the
+       * blocked result's advisory.
+       */
+      postTurn?: boolean;
+      /** The principal note cut from this relayed reply and queued for the principal: judge evidence (#2312). */
+      reportedToPrincipal?: string;
       reExecRecipe?: {
         /** Registered skill name to invoke on approval (e.g. 'send-draft'). */
-        skillName: string;
+        toolName: string;
         /**
          * Partial payload to store in the action_log row. May be incomplete at gate
          * time (e.g. draft_id not yet known). Callers fill in missing fields via
@@ -355,10 +830,46 @@ export class OutboundGateway {
         partialPayload?: Record<string, unknown>;
         /**
          * Human-readable description of the blocked action. Used in the action_log
-         * row (visible via list-pending-actions) and the CEO notification body.
+         * row (visible via list-pending-actions) and the principal notification body.
          */
         description: string;
+        /** Used instead of `description` when band review holds the send as a personal-data ask (#2312). */
+        askDescription?: string;
       };
+      /** Export gate context for attachment bulk-export audit and approval (#201). */
+      exportContext?: {
+        toolName: string;
+        agentId?: string;
+        exportItems?: unknown;
+      };
+      /**
+       * Provenance for a contact this send creates when the recipient has none.
+       * Email To only. Omitted means `outbound_recipient` (#2071).
+       */
+      recipientSource?: EmailRecipientSource;
+      /**
+       * From display name, used only when `recipientSource` is `email_participant`.
+       * An address is not a name; omit it and the duplicate check is identifier-only.
+       */
+      recipientDisplayName?: string;
+      /**
+       * The principal directed this send. Send skills compute it with
+       * isPrincipalDirectedSend(). It lifts only the Stage 2.5 disclosure gate;
+       * every other check still runs. Omitted means the gate applies (#1870).
+       * Under band gating it narrows the band review to grounding (#2159).
+       */
+      principalDirected?: boolean;
+      /**
+       * What to replay on approval if band review holds this send (#2159). Same shape as
+       * reExecRecipe; used only by the band hold, so tier gating never writes approval rows
+       * for it. Falls back to reExecRecipe when absent.
+       */
+      holdRecipe?: SendRecipe;
+      /**
+       * Who started the work this send belongs to: the task's originator, which send skills
+       * pass through. Used only by the relay budget (#1320). Omitted: never budgeted.
+       */
+      originator?: TaskOriginator;
     },
   ): Promise<OutboundSendResult> {
     // ------------------------------------------------------------------
@@ -368,20 +879,22 @@ export class OutboundGateway {
     // allowed the skill, the gateway independently blocks the actual send
     // when the score is too low. Fail-open if the service is not wired
     // or the config table is missing.
+    // One read per send (#2312): this gate, the gating and the band review's score share it.
+    const autonomy = await this.readAutonomy();
     if (this.autonomyService && options?.humanApproved) {
-      // CEO is explicitly in the loop — autonomy gate does not apply. Log the bypass
+      // principal is explicitly in the loop — autonomy gate does not apply. Log the bypass
       // so operators can trace every humanApproved send in the log stream. See ADR-017.
       this.log.info(
         { channel: request.channel },
-        'outbound-gateway: autonomy gate skipped — humanApproved flag set (CEO-authorized action, see ADR-017)',
+        'outbound-gateway: autonomy gate skipped — humanApproved flag set (principal-authorized action, see ADR-017)',
       );
     } else if (this.autonomyService && options?.isSystemNotification) {
-      // Infrastructure alert to the CEO — gate must not silence its own alarm bell.
-      // A notification about a blocked action still needs to reach the CEO regardless
+      // Infrastructure alert to the principal — gate must not silence its own alarm bell.
+      // A notification about a blocked action still needs to reach the principal regardless
       // of the score that caused the block. All other safety checks still run below.
       this.log.info(
         { channel: request.channel },
-        'outbound-gateway: autonomy gate skipped — isSystemNotification flag set (infrastructure alert to CEO)',
+        'outbound-gateway: autonomy gate skipped — isSystemNotification flag set (infrastructure alert to principal)',
       );
     } else if (this.autonomyService && this.isPrincipalRecipient(request)) {
       // Agent-to-principal communication — the autonomy gate must not silence
@@ -397,13 +910,11 @@ export class OutboundGateway {
       // Fail-open on config read only — getConfig() failure must not block sends.
       // The action_log DB write is kept outside this try/catch so a DB error there
       // does NOT cause fail-open; the send stays blocked even if we can't write the row.
-      let autonomyConfig: Awaited<ReturnType<typeof this.autonomyService.getConfig>> | null = null;
-      try {
-        autonomyConfig = await this.autonomyService.getConfig();
-      } catch (err) {
+      const autonomyConfig = autonomy.config;
+      if (autonomy.failed) {
         // DB error — fail-open. Log at warn so anomalies are visible in alerting.
         this.log.warn(
-          { err, channel: request.channel },
+          { err: autonomy.error, channel: request.channel },
           'outbound-gateway: autonomy gate failed to read config — proceeding without gate (fail-open)',
         );
       }
@@ -418,7 +929,7 @@ export class OutboundGateway {
           channel: request.channel,
           currentScore: autonomyConfig.score,
           requiredScore: sendThreshold,
-        })).catch((err) => {
+        }, options?.parentEventId)).catch((err) => {
           this.log.warn(
             { err, channel: request.channel },
             'outbound-gateway: failed to publish autonomy.send_blocked event',
@@ -427,93 +938,24 @@ export class OutboundGateway {
 
         // Two-step draft-fallback: channel adapters opt in by passing reExecRecipe.
         // When present, write a pending_approval row so approve-action can invoke the
-        // correct skill on CEO approval. DB failure must NOT cause fail-open — the send
+        // correct skill on principal approval. DB failure must NOT cause fail-open — the send
         // stays blocked even if the row can't be written (actionRef will be absent).
-        let actionRef: string | undefined;
-        if (this.actionLogRepo && options?.taskEventId && options?.reExecRecipe) {
-          const recipe = options.reExecRecipe;
-
-          // Hoist expiresAt so both the insert row and the notification body use the
-          // same value — if the 48h window ever changes, only one line needs updating.
-          const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
-          // Hoist candidateRef before the try block so the notification body can
-          // reference it directly — avoiding a fragile dependency on the outer-scope
-          // actionRef variable which is only set after insert() confirms success.
-          const candidateRef = generateShortRef();
-          let rowId: number | undefined;
-          try {
-            // Only assign actionRef after insert confirms the DB row exists to
-            // prevent phantom refs if insert throws.
-            rowId = await this.actionLogRepo.insert({
-              taskId: options.taskEventId,
-              conversationId: options.conversationId ?? undefined,
-              skillName: recipe.skillName,
-              actionRisk: 'medium',
-              outcome: 'pending_approval',
-              shortRef: candidateRef,
-              description: recipe.description,
-              payload: recipe.partialPayload ?? {},
-              expiresAt,
-            });
-            // Only commit actionRef now that the row actually exists in the DB
-            actionRef = candidateRef;
-          } catch (err) {
-            this.log.error(
-              { err, channel: request.channel, taskEventId: options.taskEventId },
-              'outbound-gateway: failed to write action_log row during gate — send is still blocked, actionRef will be absent',
-            );
-            // actionRef remains undefined — send is still blocked below
-          }
-
-          // Notify CEO (best-effort) — mirrors ApprovalTriggerService.request() pattern.
-          // sendNotification() has its own try-catch and returns false on failure, so it
-          // never throws. Only stamp notification_sent_at if the publish succeeded.
-          // setNotificationSentAt is wrapped separately so a DB failure there does not
-          // discard the fact that the insert (and the notification delivery) succeeded.
-          const principalEmail = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-          if (rowId !== undefined && principalEmail) {
-            const sent = await this.sendNotification({
-              notificationType: 'approval_requested',
-              ceoEmail: principalEmail,
-              subject: `Approval needed — ${recipe.description}`,
-              body: [
-                recipe.description,
-                '',
-                `Autonomy score: ${autonomyConfig.score} (threshold: ${sendThreshold})`,
-                `Reference: ${candidateRef}`,
-                `Expires: ${expiresAt.toISOString()}`,
-                '',
-                `Reply with the reference to approve, deny, or dismiss this request.`,
-              ].join('\n'),
-            });
-            if (sent) {
-              try {
-                await this.actionLogRepo.setNotificationSentAt(rowId);
-              } catch (err) {
-                // Non-fatal: the pending_approval row exists and gating is correct.
-                // Only notification_sent_at is missing — the CEO still received the alert.
-                this.log.warn(
-                  { err, rowId, taskEventId: options.taskEventId },
-                  'outbound-gateway: setNotificationSentAt failed after successful notification — notification_sent_at will be null',
-                );
-              }
-            }
-          } else if (rowId !== undefined && !principalEmail) {
-            // Row was written but no principal email identity configured — notification silently skipped.
-            // Surface this as an error so misconfigured deployments are detectable in alerting.
-            this.log.error(
-              { rowId, taskEventId: options.taskEventId },
-              'outbound-gateway: pending_approval row written but principal notification skipped — no principal email identity configured',
-            );
-          }
+        let raised: { shortRef: string; approvalNumber: number | null } | undefined;
+        if (options?.taskEventId && options?.reExecRecipe) {
+          raised = await this.raiseSendApproval(
+            request,
+            options.reExecRecipe,
+            { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
+            [`Autonomy score: ${autonomyConfig.score} (threshold: ${sendThreshold})`],
+          );
         }
 
-        if (actionRef) {
+        if (raised) {
           return {
             success: false,
             gated: true,
-            actionRef,
-            blockedReason: `Autonomy score ${autonomyConfig.score} is below send threshold ${sendThreshold}`,
+            actionRef: raised.shortRef,
+            blockedReason: `Autonomy score ${autonomyConfig.score} is below send threshold ${sendThreshold}. ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}`,
           };
         }
 
@@ -522,32 +964,101 @@ export class OutboundGateway {
           gated: true,
           blockedReason:
             `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
-            `Use createEmailDraft() for drafts, or ask the CEO to raise the score with set-autonomy.`,
+            `Use createEmailDraft() for drafts, or ask the principal to raise the score with set-autonomy.`,
         };
       }
     }
 
     // Derive a stable recipient identifier for the blocked-contact check and logging.
     // Email: the To address. Signal: phone number (1:1) or base64 group ID.
+    // Slack: prefer the peer user id (U…); fall back to conversation id only for logging.
+    // SMS: peer E.164.
     const recipientId = request.channel === 'email'
       ? request.to
-      : (request.recipient ?? request.groupId ?? '');
+      : request.channel === 'slack'
+        ? (request.slackUserId ?? request.slackChannelId)
+        : request.channel === 'sms'
+          ? request.recipient
+          : (request.recipient ?? request.groupId ?? '');
 
     // The message body field differs between channel types.
     const messageBody = request.channel === 'email' ? request.body : request.message;
 
     // ------------------------------------------------------------------
+    // Step 0.5: No-reply / automated recipient guard (email only, #1302)
+    // ------------------------------------------------------------------
+    // A no-reply address is a dead end: replying there is undeliverable, and it was a
+    // recurring source of mis-addressed sends — the coordinator narrating principal-
+    // directed status ("pending approval on your end") back down an automated-
+    // notification thread, auto-routed to the noreply@ sender (#1302).
+    //
+    // This is a *recipient* problem, not a *content* problem: the address cannot be
+    // fixed by rewriting, so we hard-block (like the Step-1 blocked-contact check
+    // below) rather than returning a rewrite-and-retry reason to the agent — which
+    // would only invite futile retries against an immutable recipient. We still record
+    // an outbound.blocked audit event so the suppression is visible, but we deliberately
+    // do NOT send the principal an FYI (these automated notifications are routine; a per-drop
+    // alert would be noise — the audit log is the record).
+    //
+    // Predicate: block only when EVERY recipient classifies as automated (no deliverable
+    // human anywhere on the envelope). A normal send that merely CCs a noreply address
+    // still reaches its human recipients and is not blocked. Signal is exempt —
+    // recipients are phone numbers / group IDs, where "no-reply" has no meaning.
+    if (request.channel === 'email') {
+      const emailRecipients = this.buildFilterRecipients(request).recipients;
+      if (
+        emailRecipients.length > 0 &&
+        emailRecipients.every((r) => classifyEmailSender(r.email) === 'automated')
+      ) {
+        this.log.warn(
+          { channel: request.channel, recipientId: redactId(recipientId), rule: 'no-reply-recipient' },
+          'outbound-gateway: send blocked — all recipients are no-reply/automated addresses',
+        );
+        const blockId = `block_${randomUUID()}`;
+        try {
+          // scrubPii() because we run before Step 1.5 PII redaction — the audit event
+          // must never carry raw PII, matching the fail-closed redactor-error path below.
+          await this.bus.publish('dispatch', createOutboundBlocked({
+            blockId,
+            conversationId: options?.conversationId ?? '',
+            channelId: request.channel,
+            content: scrubPii(messageBody),
+            recipientId,
+            reason: 'no_reply_recipient',
+            findings: [{ rule: 'no-reply-recipient', detail: 'All recipients classify as automated/no-reply; message not deliverable' }],
+            parentEventId: options?.parentEventId ?? '',
+          }));
+        } catch (publishErr) {
+          this.log.warn(
+            { publishErr, blockId },
+            'outbound-gateway: failed to publish outbound.blocked event for no-reply recipient — message is still blocked',
+          );
+        }
+        // Terse, terminal result — no blockedRules (that field is the content filter's
+        // "here is what to rewrite" affordance; omitting it signals a non-fixable
+        // recipient problem, discouraging retry loops).
+        return { success: false, blockedReason: 'Recipient is a no-reply/automated address; message not deliverable' };
+      }
+    }
+
+    // ------------------------------------------------------------------
     // Step 1: Contact blocked check + trust level capture
     // ------------------------------------------------------------------
     // Resolve the recipient to a known contact. If they are explicitly blocked
-    // by the CEO, reject immediately without touching the transport layer or filter.
+    // by the principal, reject immediately without touching the transport layer or filter.
     // We also capture the contact's trust level here for the content filter's
     // contact-data-leak rule — no extra DB call needed.
     //
     // Fail-open on DB errors: an infra failure should not silently prevent
     // sending. We warn so the anomaly is visible in logs/alerting.
     let recipientTier: ContactTier = 'unknown';
+    // Set when the lookup threw, so the disclosure gate can label an outage-caused
+    // 'unknown' tier rather than treat it as a genuinely unknown recipient (#1870).
+    let recipientTierUnresolved = false;
     let recipientContactId: string | undefined;
+    let recipientIdentityVerified = false;
+    // The contact record's name, for an ask's wording only (#2312).
+    let recipientName: string | undefined;
     try {
       const contact = await this.contactService.resolveByChannelIdentity(request.channel, recipientId);
       if (contact !== null) {
@@ -559,19 +1070,168 @@ export class OutboundGateway {
           );
           return { success: false, blockedReason: 'Recipient is blocked' };
         }
-        // Capture tier for the content filter, and contact UUID for the PII redactor's
-        // CEO bypass check. Both are used downstream: tier by the content filter's disclosure
-        // gate, and contact UUID by PiiRedactor.redact() for the principal bypass.
+        // Capture tier for the content filter's disclosure gate, and the contact UUID for the
+        // audit and delivery events (the PII redactor no longer uses it for a principal bypass).
         recipientTier = contact.tier;
         recipientContactId = contact.contactId;
+        recipientIdentityVerified = contact.verified === true;
+        recipientName = contact.displayName;
       }
     } catch (err) {
       // DB or service error — log at warn and proceed.
       // recipientTier stays 'unknown', which is the safe/conservative fallback.
+      // The Stage 2.5 disclosure gate still evaluates at 'unknown' (fail-closed); see
+      // FilterCheckInput.recipientTierUnresolved for why.
+      recipientTierUnresolved = true;
       this.log.warn(
         { err, channel: request.channel, recipientId: redactId(recipientId) },
         'outbound-gateway: contact resolution failed, proceeding without blocked check',
       );
+    }
+
+    // The rest of the envelope (further To, CC): a blocked contact anywhere on
+    // it is refused, not only the primary (#2273). Fail-open, as above.
+    // Every resolved person recipient's tier, for the band review's ask (#2312).
+    const recipientTiers: Record<string, ContactTier> = {};
+    // Contact ids for link coverage, from verified identities only (#2312): an unverified
+    // address on a linked contact must not count as that contact.
+    const recipientContactIds: Record<string, string> = {};
+    if (recipientContactId !== undefined && recipientIdentityVerified) recipientContactIds[normalizeCounterparty(recipientId)] = recipientContactId;
+    if (!recipientTierUnresolved && recipientContactId !== undefined) recipientTiers[normalizeCounterparty(recipientId)] = recipientTier;
+    const blockedOther = await this.findBlockedRecipient(
+      request.channel,
+      this.personRecipients(request).filter((id) => id.toLowerCase() !== recipientId.toLowerCase()),
+      { failClosed: false, tiers: recipientTiers, contactIds: recipientContactIds },
+    );
+    if (blockedOther?.kind === 'blocked') {
+      this.log.warn(
+        { channel: request.channel, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
+        'outbound-gateway: send blocked — a recipient is blocked',
+      );
+      return { success: false, blockedReason: 'Recipient is blocked' };
+    }
+
+    // After Step 1 so a blocked recipient is reported as blocked, not as an
+    // unresolved identity (#1818).
+    const identityBlock = await this.blockForUnresolvedIdentity({
+      request,
+      messageBody,
+      recipientId,
+      options,
+    });
+    if (identityBlock) {
+      // Its reason names "an external recipient", never which one (#2033).
+      return this.withUnmatchedRecipientNote(
+        identityBlock,
+        await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 1.25: Bulk export controls — attachments only (#201)
+    // ------------------------------------------------------------------
+    let exportAuditItems: ExportItem[] | undefined;
+    if (
+      this.exportControlService
+      && request.channel === 'email'
+      && request.attachments
+      && request.attachments.length > 0
+    ) {
+      const rawExportItems = Array.isArray(options?.exportContext?.exportItems)
+        ? options.exportContext.exportItems as Array<Record<string, unknown>>
+        : undefined;
+      const exportEval = await this.exportControlService.evaluateGatewayAttachments({
+        attachments: request.attachments.map((a) => ({
+          filename: a.filename,
+          nodeId: a.nodeId,
+          sensitivity: a.sensitivity,
+        })),
+        destination: extractDestinationFromEmailRequest(request.to),
+        exportItems: rawExportItems?.map((e) => ({
+          node_id: typeof e['node_id'] === 'string' ? e['node_id'] : undefined,
+          label: typeof e['label'] === 'string' ? e['label'] : undefined,
+          sensitivity: typeof e['sensitivity'] === 'string' ? e['sensitivity'] : undefined,
+        })),
+        humanApproved: options?.humanApproved,
+      });
+
+      if (exportEval) {
+        const { outcome, items } = exportEval;
+
+        if (outcome.action === 'block') {
+          this.log.warn(
+            { channel: request.channel, recipientId: redactId(recipientId), code: outcome.code },
+            'outbound-gateway: export blocked — restricted bulk export',
+          );
+          return this.withUnmatchedRecipientNote(
+            { success: false, blockedReason: outcome.message },
+            await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
+          );
+        }
+
+        if (outcome.action === 'approval_required') {
+          this.log.info(
+            { channel: request.channel, code: outcome.code, itemCount: items.length },
+            'outbound-gateway: export requires principal approval',
+          );
+          const itemSummary = ExportControlServiceClass.formatItemSummary(items);
+          let actionRef: string | undefined;
+          let rowId: number | undefined;
+          if (this.actionLogRepo && options?.taskEventId && options?.reExecRecipe) {
+            const recipe = options.reExecRecipe;
+            const candidateRef = generateShortRef();
+            try {
+              rowId = await this.actionLogRepo.insert({
+                taskId: options.taskEventId,
+                conversationId: options.conversationId ?? undefined,
+                toolName: recipe.toolName,
+                actionRisk: 'medium',
+                outcome: 'pending_approval',
+                shortRef: candidateRef,
+                description: recipe.description,
+                payload: recipe.partialPayload ?? {},
+                expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+              });
+              actionRef = candidateRef;
+            } catch (err) {
+              this.log.error({ err }, 'outbound-gateway: failed to write export-gate action_log row');
+            }
+          }
+          // As at the score gate (raiseSendApproval): the number insert() allocated, read back
+          // by row id (#2159 Phase 3). actionRef and rowId are set together.
+          const approvalNumber = actionRef && this.actionLogRepo && rowId !== undefined
+            ? await readApprovalNumber(this.actionLogRepo, rowId, this.log)
+            : null;
+          // As at the score gate: no notification (#2159); the agent delivers it.
+          if (actionRef && options?.reExecRecipe) {
+            this.approvalDelivery?.registerDisplay(actionRef, {
+              preamble: outcome.message,
+              payload: {
+                ...withoutRecipientReferences(options.reExecRecipe.partialPayload ?? {}),
+                // The display shows the resolved addresses; the stored payload keeps the references.
+                ...(request.channel === 'email'
+                  ? { to: emailToAddresses(request).join(', '), ...(request.cc && request.cc.length > 0 ? { cc: request.cc.join(', ') } : {}) }
+                  : {}),
+                export_items: items.map((i) => ({ node_id: i.nodeId, label: i.label, sensitivity: i.sensitivity })),
+              },
+              extraLines: [`Items:\n${itemSummary}`],
+              approvalNumber,
+            });
+            // actionRef is set only after an insert that required taskEventId, so it is present.
+            await this.queueApprovalMention(actionRef, options.reExecRecipe.description, options.taskEventId ?? options.parentEventId ?? '', options.conversationId ?? undefined);
+          }
+          return {
+            success: false,
+            gated: true,
+            actionRef,
+            blockedReason: `${outcome.message}\n\n${itemSummary}${actionRef ? `\n\n${approvalAdvisory(actionRef, undefined, approvalNumber)}` : ''}`,
+          };
+        }
+
+        if (outcome.action === 'allow') {
+          exportAuditItems = items;
+        }
+      }
     }
 
     // ------------------------------------------------------------------
@@ -584,55 +1244,116 @@ export class OutboundGateway {
     //
     // Optional: when piiRedactor is not configured, redactedBody == messageBody
     // and the pipeline behaves identically to the pre-redaction behaviour.
+    // Built once and reused by Step 2: the redactor's principal bypass keys on the same
+    // sole-recipient computation as the content filter (#2312).
+    //
+    // Under band gating (#2312) the review, not the redactor, decides each disclosure. When
+    // the review will run, the PII is detected, the filter gets a redacted copy, and the
+    // message goes out as written only if the review authorizes every item. An approved
+    // replay (humanApproved) goes out intact: the principal approved this exact message.
+    // Otherwise (a system notice, the principal alone, no review wired) band redacts as tier.
+    const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
+    const gating = this.currentGating(autonomy);
+    const bandReviewRuns = gating === 'band' && this.bandReview !== undefined
+      && !options?.isSystemNotification && !options?.humanApproved && !principalIsSoleRecipient;
+    const sendIntact = gating === 'band' && options?.humanApproved === true;
+    // The redacted copy: what the content filter and the audit events see. Under tier it is
+    // also what is sent; under band review it never goes on the wire.
     let redactedBody = messageBody;
     // Email subjects can contain PII just as the body can — track a separate
     // variable so we can pass the cleaned subject to dispatchEmail() below.
     let redactedSubject: string | undefined = request.channel === 'email' ? request.subject : undefined;
-    if (this.piiRedactor) {
+    // What goes on the wire. The redacted copy, except under band review, where it stays raw.
+    let sendBody = messageBody;
+    let sendSubject = redactedSubject;
+    // The personal data the band review rules on (#2312), `P1…` in order body, subject, quote.
+    const detectedItems: BriefDetectedItem[] = [];
+    // Labels of what the redactor changed, reported on the send result (#2312).
+    const appliedRedactions: NonNullable<OutboundSendResult['redactions']> = [];
+    // An approved replay's quoted thread holds details the principal was not shown (#2312).
+    let dropIntactQuote = false;
+    if (this.piiRedactor && sendIntact) {
+      this.log.info(
+        { channel: request.channel },
+        'outbound-gateway: PII detection skipped — an approved send goes out as the principal approved it',
+      );
+      // Sent as written, but the content filter and the audit events still get redacted copies.
+      redactedBody = this.redactedCopy(messageBody, request.channel, recipientId);
+      if (request.channel === 'email' && request.subject) redactedSubject = this.redactedCopy(request.subject, 'email', recipientId);
+      // The approval showed the body and subject. A reply's quote is rebuilt at send time and was
+      // never shown, so personal details in it go out only after a review: here, without it.
+      // Unless everyone it reaches was on the quoted message, as for a reviewed send.
+      if (request.channel === 'email' && request.htmlQuote && !(await this.quoteIsExempt(request, recipients))) {
+        try {
+          dropIntactQuote = this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId, principalIsSoleRecipient }).length > 0;
+        } catch (err) {
+          this.log.warn({ err }, 'outbound-gateway: PII redactor threw scanning an approved reply\'s quote — sending without it');
+          dropIntactQuote = true;
+        }
+        if (dropIntactQuote) this.log.info('outbound-gateway: approved reply sent without its quoted message — the quote has details the approval did not show');
+      }
+    } else if (this.piiRedactor && bandReviewRuns) {
+      const redactor = this.piiRedactor;
+      const quoteExempt = request.channel === 'email' && request.htmlQuote ? await this.quoteIsExempt(request, recipients) : false;
+      try {
+        const ctx = { recipientId, principalIsSoleRecipient };
+        const detectIn = (text: string | undefined, field: BriefDetectedItem['field']): DetectedPii[] => {
+          if (!text) return [];
+          const found = redactor.detect(text, request.channel, ctx);
+          for (const item of found) {
+            detectedItems.push({ id: `P${detectedItems.length + 1}`, label: item.label, text: item.matched, field });
+          }
+          return found;
+        };
+        const bodyItems = detectIn(messageBody, 'body');
+        const subjectItems = request.channel === 'email' ? detectIn(request.subject, 'subject') : [];
+        // Quoted history shown back to people who were on it is not a disclosure (#2312): the
+        // quote's items are ruled only when someone on this send was not on the quoted message.
+        if (request.channel === 'email' && request.htmlQuote) {
+          if (quoteExempt) {
+            this.log.debug({ channel: request.channel }, 'outbound-gateway: quote not reviewed — every recipient was on the quoted message');
+          } else {
+            detectIn(request.htmlQuote, 'quote');
+          }
+        }
+        // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
+        redactedBody = redactor.apply(messageBody, bodyItems, request.channel, ctx, { audit: false }).content;
+        if (request.channel === 'email' && request.subject) {
+          redactedSubject = redactor.apply(request.subject, subjectItems, request.channel, ctx, { audit: false }).content;
+        }
+      } catch (err) {
+        return this.blockForRedactorError(err, request, messageBody, recipientId, options);
+      }
+    } else if (this.piiRedactor) {
+      // Tier redaction (and band with no review). An email's quoted thread is not scanned or
+      // redacted here: that is the pre-#2312 behavior, unchanged. Band review covers quotes above.
       try {
         const redactionResult = await this.piiRedactor.redact(
           messageBody,
           request.channel,
-          { recipientId, recipientContactId },
+          { recipientId, principalIsSoleRecipient },
         );
         redactedBody = redactionResult.content;
+        for (const r of redactionResult.redactions) {
+          appliedRedactions.push({ label: r.patternLabel, field: 'body' });
+        }
         // Redact the subject too — same channel policy applies.
         if (request.channel === 'email' && request.subject) {
           const subjectResult = await this.piiRedactor.redact(
             request.subject,
             request.channel,
-            { recipientId, recipientContactId },
+            { recipientId, principalIsSoleRecipient },
           );
           redactedSubject = subjectResult.content;
+          for (const r of subjectResult.redactions) {
+            appliedRedactions.push({ label: r.patternLabel, field: 'subject' });
+          }
         }
       } catch (err) {
-        this.log.error(
-          { err, channel: request.channel, recipientId: redactId(recipientId) },
-          'outbound-gateway: PiiRedactor threw — blocking message (fail-closed)',
-        );
-        const blockId = `block_${randomUUID()}`;
-        try {
-          await this.bus.publish('dispatch', createOutboundBlocked({
-            blockId,
-            conversationId: '',
-            channelId: request.channel,
-            // scrubPii() as a safety fallback — the redactor itself failed, so we apply
-            // a best-effort scrub before writing anything to the audit log. This ensures
-            // no raw PII leaks into the audit trail even on a redactor failure path.
-            content: scrubPii(messageBody),
-            recipientId,
-            reason: 'pii_redactor_error',
-            findings: [{ rule: 'pii_redactor_error', detail: 'PiiRedactor threw an unexpected error' }],
-            parentEventId: '',
-          }));
-        } catch (publishErr) {
-          this.log.warn(
-            { publishErr, blockId },
-            'outbound-gateway: failed to publish outbound.blocked event for PII redactor error',
-          );
-        }
-        return { success: false, blockedReason: 'pii_redactor_error' };
+        return this.blockForRedactorError(err, request, messageBody, recipientId, options);
       }
+      sendBody = redactedBody;
+      sendSubject = redactedSubject;
     }
 
     // ------------------------------------------------------------------
@@ -643,8 +1364,6 @@ export class OutboundGateway {
     // potentially dangerous content through an unchecked pipeline.
     let filterPassed = false;
     let filterFindings: Array<{ rule: string; detail: string }> = [];
-
-    const { recipients, principalIncluded, principalIsSoleRecipient } = this.buildFilterRecipients(request);
 
     try {
       const filterResult = await this.contentFilter.check({
@@ -658,9 +1377,13 @@ export class OutboundGateway {
         conversationId: '',
         channelId: request.channel,
         recipientTier,
+        recipientTierUnresolved,
+        principalDirected: options?.principalDirected === true,
         recipients,
         principalIncluded,
         principalIsSoleRecipient,
+        // The send's gating (#2312): the filter's tier-keyed rules follow it, not its constructed value.
+        gating,
       });
       filterPassed = filterResult.passed;
       filterFindings = filterResult.findings;
@@ -687,23 +1410,26 @@ export class OutboundGateway {
       // Full reason string (with detail) goes into the bus event for forensics/audit,
       // NOT into any user-facing or notification surface.
       const fullReason = filterFindings.map((f) => `${f.rule}: ${f.detail}`).join('; ');
-      // Principal-safe reason for the CEO notification: surfaces the judge's abstract
+      // Principal-safe reason for the principal notification: surfaces the judge's abstract
       // reason but never a Stage-1 finding's (potentially sensitive) detail. See
       // buildBlockReasonSummary for the per-rule policy.
       const reasonSummary = buildBlockReasonSummary(filterFindings);
+      // Recipients that match no contact (#2033). The judge reasons about content
+      // only, so without this the agent rewrites the body to a wrong address.
+      const unmatched = await this.findUnmatchedRecipients(request.channel, this.personRecipients(request));
 
       // Publish the blocked event for audit logging and downstream consumers.
       // Capture the event so we can link the outbound.notification to it via parentEventId.
       // Use redactedBody so the audit event itself does not contain unredacted PII.
       const blockedEvent = createOutboundBlocked({
         blockId,
-        conversationId: '',
+        conversationId: options?.conversationId ?? '',
         channelId: request.channel,
         content: redactedBody,
         recipientId,
         reason: fullReason,
         findings: filterFindings,
-        parentEventId: '',
+        parentEventId: options?.parentEventId ?? '',
       });
       try {
         await this.bus.publish('dispatch', blockedEvent);
@@ -714,116 +1440,554 @@ export class OutboundGateway {
         );
       }
 
-      // Publish an outbound.notification event so the CEO alert routes through the
-      // standard safety pipeline via EmailAdapter, rather than bypassing the content
-      // filter with a direct dispatchEmail() call (#206).
+      // Queue an FYI for the principal's digest (#2159). Block notices used to be emailed
+      // on their own; they are informational (#1051) — the agent already has the reason and
+      // may rewrite and retry — so they wait for the digest like other notices.
       //
-      // Recursion safety (two layers):
-      //   1. The notification body is a hardcoded template addressed to ceoEmail (in the
-      //      content filter allowlist), so the filter always passes under normal operation.
-      //   2. The EmailAdapter passes skipNotificationOnBlock: true when calling send() for
-      //      a notification delivery. If the filter is broken (crash → fail-closed), this
-      //      flag prevents send() from re-publishing outbound.notification, breaking the
-      //      cycle: send → block → sendNotification → EmailAdapter → send(skip) → block → stop.
-      const principalEmailForBlock = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-      if (principalEmailForBlock && !options?.skipNotificationOnBlock) {
-        // sendNotification() catches errors internally — await is safe and ensures
-        // the bus.publish call completes before we return the blocked result.
-        await this.sendNotification(
-          {
-            notificationType: 'blocked_content',
-            ceoEmail: principalEmailForBlock,
-            subject: 'Action needed — blocked outbound reply',
-            body: [
-              'An outbound message was blocked by the content filter.',
-              '',
-              `Reason: ${reasonSummary}`,
-              // blockedEvent.timestamp is the audit row's own clock. No principal
-              // timezone is plumbed into the gateway (it is infrastructure, not a
-              // skill with ctx.timezone), so we stamp UTC explicitly rather than
-              // emit an ambiguous bare timestamp.
-              `Time: ${blockedEvent.timestamp.toISOString()} (UTC)`,
-              `Channel: ${request.channel}`,
-              `Intended recipient: ${recipientId}`,
-              '',
-              `Block ID: ${blockId}`,
-              `Audit event ID: ${blockedEvent.id}`,
-              '',
-              'Search the audit log by the audit event ID above for the full record.',
-            ].join('\n'),
-            blockId,
-            originalChannel: request.channel,
-            originalRecipientId: recipientId,
-          },
+      // skipNotificationOnBlock is still honoured: the EmailAdapter sets it when delivering a
+      // system notification, and a blocked notification must not report itself (#206).
+      if (!options?.skipNotificationOnBlock) {
+        await this.queueBlockReport(
+          [
+            `Outbound ${request.channel} message blocked by the content filter. The agent was told why and may rewrite it and retry.`,
+            `Reason: ${reasonSummary}`,
+            ...unmatchedRecipientNotificationLines(recipientId, unmatched),
+            `Block ${blockId}; audit event ${blockedEvent.id}.`,
+          ].join('\n'),
+          options?.conversationId,
           blockedEvent.id,
         );
-      } else if (options?.skipNotificationOnBlock) {
-        // This branch fires when a notification delivery itself gets blocked by the
-        // content filter (e.g. the filter is in a broken state). The recursion guard
-        // prevents an infinite loop. The CEO will not receive this alert.
+      } else {
+        // A system notification's own delivery was blocked (e.g. the filter is in a broken
+        // state). The principal will not hear about this block; the audit log has it.
         this.log.error(
           { blockId, channel: request.channel },
-          'outbound-gateway: notification delivery was blocked by content filter — recursion guard active, CEO will NOT receive this alert',
-        );
-      } else if (!options?.skipNotificationOnBlock) {
-        this.log.error(
-          { blockId, channel: request.channel, recipientId: redactId(recipientId) },
-          'outbound-gateway: principal notification skipped — no principal email identity configured. Block recorded in audit log only.',
+          'outbound-gateway: notification delivery was blocked by content filter — recursion guard active, principal will NOT receive this alert',
         );
       }
-      return { success: false, blockedReason: 'Content blocked by filter' };
+      // Surface the principal-safe reason summary and the rule name(s) to the
+      // caller (#1051). reasonSummary (computed above via buildBlockReasonSummary)
+      // obeys the same per-rule safety contract as the principal notification — it only
+      // includes an LLM-judge finding's abstract detail, never a Stage-1 rule's
+      // matched fragment. Surfacing it here gives the agent's tool-use loop enough
+      // signal to rewrite the message and retry organically; blockedRules carries
+      // the specific rule category (rule names only) so it can fix the root cause.
+      return this.withUnmatchedRecipientNote(
+        {
+          success: false,
+          blockedReason: reasonSummary,
+          blockedRules: filterFindings.map((f) => f.rule),
+        },
+        unmatched,
+      );
     }
+
+    // ------------------------------------------------------------------
+    // Step 2.4: Relay budget (#1320)
+    // ------------------------------------------------------------------
+    // An outside contact can only cause so many immediate messages to the principal. Sends to
+    // the principal alone skip the band review below, so this is the only limit on them. Over
+    // budget, the relay goes to the digest. Runs after the content filter, so blocked content is
+    // never queued and the digest gets redacted text. An email with attachments is never held:
+    // a digest item carries text only, so the files would be lost.
+    const carriesAttachments = request.channel === 'email' && (request.attachments?.length ?? 0) > 0;
+    const relayOriginator = principalIsSoleRecipient && this.relayBudget && !carriesAttachments
+      ? budgetedOriginator(options)
+      : null;
+    // The originator whose slot this send took. Given back below if the send then fails, so a
+    // relay that never reached the principal doesn't count against the contact.
+    let relaySlot: string | null = null;
+    if (relayOriginator) {
+      if (this.relayBudget!.tryAcquire(relayOriginator.contactId) === 'allowed') {
+        relaySlot = relayOriginator.contactId;
+      } else {
+        const deferred = await this.deferRelay(request, redactedBody, redactedSubject, relayOriginator, options);
+        // No withRedactions here: deferral needs principalIsSoleRecipient, which is also the
+        // redactor's bypass, so nothing was redacted.
+        if (deferred) return deferred;
+        // The digest item could not be recorded: deliver after all. Noise beats a lost message.
+      }
+    } else if (
+      principalIsSoleRecipient && this.relayBudget && !options?.originator && options?.taskEventId
+      && !options.isSystemNotification && !options.humanApproved && !options.principalDirected && !options.postTurn
+    ) {
+      // A skill send (it has a task, and it isn't an adapter relay or a system notice) with no
+      // originator. Every send skill should pass one; without it the budget can't count this send.
+      this.log.warn(
+        { channel: request.channel, taskEventId: options.taskEventId },
+        'outbound-gateway: send to the principal alone has no originator — the relay budget cannot count it',
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2.5: Band review (#2159) — under band gating, the judge's brief replaces Stage 2.5.
+    // ------------------------------------------------------------------
+    // Skipped for system notifications, for sends the principal approved (they read this
+    // exact message), and for the principal alone (nobody else reads it).
+    let bandReport: BandReviewReport | undefined;
+    let bandSignals: BandReviewSignals | undefined;
+    // The review would stop the send only for the quote's details: it goes without the quote.
+    let dropQuote = false;
+    if (bandReviewRuns) {
+      // People in the finalized set (Curia's own addresses dropped; a group or channel id is
+      // still not an audience member), so `recipients` and `principalRecipients` agree. A group
+      // send has no person recipients, so the review names the group id instead. A send that
+      // addresses only Curia itself is still reviewed (fail closed), with no outside audience.
+      const people = new Set(this.personRecipients(request).map((p) => p.toLowerCase()));
+      const reviewRecipients = recipients.map((r) => r.email).filter((id) => people.has(id.toLowerCase()));
+      const outcome = await this.runBandReview({
+        request,
+        autonomy,
+        // The message as written: the review rules on the raw detected items it contains.
+        content: sendBody,
+        auditContent: redactedBody,
+        recipients: reviewRecipients.length > 0 || people.size > 0 ? reviewRecipients : [recipientId],
+        principalRecipients: recipients.filter((r) => r.isPrincipal).map((r) => r.email),
+        detectedItems,
+        recipientTier,
+        recipientTiers,
+        ...(Object.keys(recipientContactIds).length > 0 ? { recipientContactIds } : {}),
+        ...(recipientName ? { requester: { id: recipientId, name: recipientName } } : {}),
+        ...(sendSubject !== undefined ? { subject: sendSubject } : {}),
+        options,
+      });
+      if (outcome.result) return outcome.result;
+      bandReport = outcome.report;
+      bandSignals = outcome.signals;
+      dropQuote = outcome.dropQuote !== undefined;
+    }
+
+    // Spot-check pool (#2159 Phase 3): a send Curia made on its own. Not a system notice, a
+    // send the principal approved or directed, or a message to the principal alone.
+    const sampled = !options?.isSystemNotification && !options?.humanApproved
+      && options?.principalDirected !== true && !principalIsSoleRecipient;
+    const sampleArgs = {
+      channel: request.channel,
+      toolName: options?.exportContext?.toolName ?? `${request.channel}-send`,
+      recipientLabel: this.personRecipients(request).join(', ') || recipientId,
+      recipient: {
+        // A Signal group or Slack channel is never a first contact: no contact stands for it.
+        person: recipientId.length > 0
+          && this.personRecipients(request).some((id) => id.toLowerCase() === recipientId.toLowerCase()),
+        contactId: recipientContactId,
+        lookupFailed: recipientTierUnresolved,
+      },
+      band: { report: bandReport, signals: bandSignals },
+      options,
+    };
 
     // ------------------------------------------------------------------
     // Step 3: Channel dispatch + contact promotion
     // ------------------------------------------------------------------
     // After a successful send, promote the recipient contact from provisional →
-    // confirmed (or create one if none exists). The act of sending is the CEO's
+    // confirmed (or create one if none exists). The act of sending is the principal's
     // implicit trust confirmation — replies from this person should never be held.
     //
-    // IMPORTANT: pass redactedBody here, not request.body / request.message.
+    // IMPORTANT: pass sendBody here, not request.body / request.message.
     // The dispatch methods read the body/message field from the request object
     // they receive — if we pass the original `request`, the unredacted content
     // reaches Nylas / signal-cli even though redactedBody was computed above.
+    // sendBody is raw under band review, which authorized every detected item, and on a band
+    // approved replay, which the principal approved as written (#2312).
+    //
+    // The spot-check preview is the redacted copy whenever the wire is raw: a sample row is
+    // not where a disclosure the review authorized should be repeated (#2312).
+    // Only the review fills detectedItems; naming it here keeps a future path that detects
+    // without reviewing from sending raw behind a redacted audit copy.
+    const rawOnWire = bandReviewRuns && detectedItems.length > 0;
+    // The outbound.delivered content never carries raw values: the redacted copy whenever the
+    // wire may be raw (#2312), an intact replay's included.
+    const auditBody = redactedBody;
+    // What the review let go out raw, by label: the audit's record of the disclosure.
+    const disclosed = rawOnWire
+      ? { disclosed: detectedItems.filter((i) => !(dropQuote && i.field === 'quote')).map(({ label, field }) => ({ label, field })) }
+      : {};
     if (request.channel === 'email') {
-      const result = await this.dispatchEmail({ ...request, body: redactedBody, subject: redactedSubject });
-      if (result.success) {
-        await this.promoteOrCreateRecipientContact('email', recipientId);
+      // Provenance lives on the request so a queued payload keeps it. Only send()
+      // options set it; a value already on the request is dropped. dispatchEmail
+      // copies named provider fields, so Nylas never sees these (#2071).
+      const toSend: EmailSendRequest = { ...request, body: sendBody, subject: sendSubject };
+      delete toSend.recipientSource;
+      delete toSend.recipientDisplayName;
+      // Quoted history, not the agent's text: dropping it is not a cut (#2312).
+      if (dropQuote || dropIntactQuote) {
+        delete toSend.htmlQuote;
+        delete toSend.quoteParticipants;
+      }
+      this.signEmail(toSend, options?.isSystemNotification === true);
+      if (options?.recipientSource === 'email_participant') {
+        toSend.recipientSource = 'email_participant';
+        const fromName = options.recipientDisplayName?.trim();
+        if (fromName) toSend.recipientDisplayName = fromName;
+      }
+      const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchEmail(toSend));
+      if (result.success && !result.queued) {
+        // A To copied from Curia's own message has not written to us (#2273).
+        if (toSend.toFromOwnMessage !== true) {
+          await this.promoteOrCreateRecipientContact(
+            'email',
+            recipientId,
+            toSend.recipientSource,
+            toSend.recipientDisplayName,
+          );
+        }
         await this.publishDelivered({
           channel: 'email',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          // Without the model's sign-off when signEmail dropped it: what was sent. Redacted when
+          // the review sent details raw: the audit event never carries them (#2312).
+          content: rawOnWire || sendIntact ? this.redactedCopy(toSend.body, 'email', recipientId) : toSend.body,
+          conversationId: options?.conversationId,
+          taskEventId: options?.taskEventId,
+          messageId: result.messageId,
+          ...(result.threadId ? { threadId: result.threadId } : {}),
+          parentEventId: options?.parentEventId,
+          ...disclosed,
+          ...(exportAuditItems && exportAuditItems.length > 0
+            ? {
+              exportAudit: {
+                destination: formatDestination(extractDestinationFromEmailRequest(request.to)),
+                items: exportAuditItems,
+                toolName: options?.exportContext?.toolName,
+                agentId: options?.exportContext?.agentId,
+              },
+            }
+            : {}),
+        });
+        if (sampled) {
+          await this.recordSentAction({
+            ...sampleArgs,
+            preview: rawOnWire || sendIntact ? (redactedSubject || redactedBody) : (toSend.subject || toSend.body),
+          });
+        }
+      }
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
+      // toSend.body, not redactedBody: signEmail may have dropped the model's sign-off.
+      return this.withRedactions(result, appliedRedactions, toSend.body, toSend.subject);
+    }
+
+    if (request.channel === 'slack') {
+      const toSend = { ...request, message: sendBody };
+      const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSlack(toSend));
+      // Contact resolution uses slackUserId (U…) when provided; inbound auto-creates
+      // contacts from Slack user ids. Skip promoteOrCreate on conversation ids.
+      if (result.success && !result.queued) {
+        await this.publishDelivered({
+          channel: 'slack',
+          recipientId,
+          recipientContactId,
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
           messageId: result.messageId,
           parentEventId: options?.parentEventId,
+          ...disclosed,
         });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
-      return result;
-    } else {
-      const result = await this.dispatchSignal({ ...request, message: redactedBody });
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
+      return this.withRedactions(result, appliedRedactions, sendBody);
+    }
+
+    if (request.channel === 'sms') {
+      const toSend = { ...request, message: sendBody };
+      const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSms(toSend));
+      if (result.success && !result.queued) {
+        await this.promoteOrCreateRecipientContact('sms', request.recipient);
+        await this.publishDelivered({
+          channel: 'sms',
+          recipientId,
+          recipientContactId,
+          content: auditBody,
+          conversationId: options?.conversationId,
+          taskEventId: options?.taskEventId,
+          messageId: result.messageId,
+          parentEventId: options?.parentEventId,
+          ...disclosed,
+        });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
+      }
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
+      return this.withRedactions(result, appliedRedactions, sendBody);
+    }
+
+    {
+      const toSend: SignalOutboundRequest = { ...request, message: sendBody };
+      const result = await this.dispatchOrEnqueue(toSend, () => this.dispatchSignal(toSend));
       // Only promote for 1:1 Signal sends — group sends use a groupId, not an individual
       // phone number. Creating a contact for a group token would pollute the contacts table
       // and would not help with inbound replies (which come from member numbers, not the group ID).
-      if (result.success && request.recipient) {
+      if (result.success && !result.queued && request.recipient) {
         await this.promoteOrCreateRecipientContact('signal', request.recipient);
       }
       // Emit the audit event for all successful Signal sends (both 1:1 and group).
-      // messageId is intentionally omitted — signal-cli RPC returns no ID.
-      if (result.success) {
+      // messageId is the signal-cli send timestamp — correlates with reaction targetTimestamp (#1479).
+      if (result.success && !result.queued) {
         await this.publishDelivered({
           channel: 'signal',
           recipientId,
           recipientContactId,
-          content: redactedBody,
+          content: auditBody,
           conversationId: options?.conversationId,
           taskEventId: options?.taskEventId,
+          messageId: result.messageId,
           parentEventId: options?.parentEventId,
-          // messageId intentionally omitted — signal-cli RPC returns no ID
+          ...disclosed,
         });
+        if (sampled) await this.recordSentAction({ ...sampleArgs, preview: redactedBody });
       }
-      return result;
+      if (bandReport && result.success) await this.publishBandReport(bandReport, options);
+      if (relaySlot && !result.success) this.relayBudget!.release(relaySlot);
+      return this.withRedactions(result, appliedRedactions, sendBody);
+    }
+  }
+
+  /**
+   * Attach what redaction changed to a successful send result (#2312). Failures carry nothing:
+   * nothing reached the recipient, so there is no delivered content to report.
+   */
+  private withRedactions(
+    result: OutboundSendResult,
+    applied: NonNullable<OutboundSendResult['redactions']>,
+    sentContent: string,
+    sentSubject?: string,
+  ): OutboundSendResult {
+    if (!result.success || applied.length === 0) return result;
+    return { ...result, redactions: [...applied], sentContent, ...(sentSubject !== undefined ? { sentSubject } : {}) };
+  }
+
+  /**
+   * A redacted copy of sent text for an audit event (#2312): what tier redaction would have
+   * sent, never published as a redaction. Without a redactor, or if it throws, the best-effort
+   * scrubber stands in: the audit must not carry values.
+   */
+  private redactedCopy(text: string, channel: string, recipientId: string): string {
+    if (!this.piiRedactor) return scrubPii(text);
+    try {
+      const ctx = { recipientId };
+      return this.piiRedactor.apply(text, this.piiRedactor.detect(text, channel, ctx), channel, ctx, { audit: false }).content;
+    } catch (err) {
+      this.log.warn({ err, channel }, 'outbound-gateway: PII redactor threw building an audit copy — scrubbing it instead');
+      return scrubPii(text);
+    }
+  }
+
+  /**
+   * Step 1.5's fail-closed path: the PII redactor threw, so the message is blocked. Sending
+   * unredacted PII through a broken redactor is worse than dropping the message.
+   */
+  private async blockForRedactorError(
+    err: unknown,
+    request: OutboundSendRequest,
+    messageBody: string,
+    recipientId: string,
+    options: { conversationId?: string; parentEventId?: string } | undefined,
+  ): Promise<OutboundSendResult> {
+    this.log.error(
+      { err, channel: request.channel, recipientId: redactId(recipientId) },
+      'outbound-gateway: PiiRedactor threw — blocking message (fail-closed)',
+    );
+    const blockId = `block_${randomUUID()}`;
+    try {
+      await this.bus.publish('dispatch', createOutboundBlocked({
+        blockId,
+        conversationId: options?.conversationId ?? '',
+        channelId: request.channel,
+        // scrubPii() as a safety fallback — the redactor itself failed, so we apply
+        // a best-effort scrub before writing anything to the audit log. This ensures
+        // no raw PII leaks into the audit trail even on a redactor failure path.
+        content: scrubPii(messageBody),
+        recipientId,
+        reason: 'pii_redactor_error',
+        findings: [{ rule: 'pii_redactor_error', detail: 'PiiRedactor threw an unexpected error' }],
+        parentEventId: options?.parentEventId ?? '',
+      }));
+    } catch (publishErr) {
+      this.log.warn(
+        { publishErr, blockId },
+        'outbound-gateway: failed to publish outbound.blocked event for PII redactor error',
+      );
+    }
+    return this.withUnmatchedRecipientNote(
+      { success: false, blockedReason: 'pii_redactor_error' },
+      await this.findUnmatchedRecipients(request.channel, this.personRecipients(request)),
+    );
+  }
+
+  /** Whether this channel is registered for durable queueing (#1380). */
+  private isQueueableChannel(channel: string): boolean {
+    return !!this.outboundQueue && this.outboundQueueReadiness.has(channel);
+  }
+
+  /** Transport ready for wire dispatch; unknown channels are treated as ready. */
+  private isChannelOutboundReady(channel: string): boolean {
+    const probe = this.outboundQueueReadiness.get(channel);
+    return probe ? probe() : true;
+  }
+
+  /**
+   * Dispatch immediately, or enqueue when the channel opted into outbound
+   * queueing and is currently unavailable (#1380).
+   */
+  private async dispatchOrEnqueue(
+    request: OutboundSendRequest,
+    dispatch: () => Promise<OutboundSendResult>,
+  ): Promise<OutboundSendResult> {
+    if (this.isQueueableChannel(request.channel) && !this.isChannelOutboundReady(request.channel)) {
+      return this.enqueueInsteadOfDrop(request);
+    }
+    const result = await dispatch();
+    if (
+      !result.success
+      && result.queueable
+      && this.isQueueableChannel(request.channel)
+    ) {
+      const queued = await this.enqueueInsteadOfDrop(request);
+      // HTTP channels (SMS) may stay "ready" while the provider is briefly down —
+      // schedule a flush retry since no socket reconnect event will fire.
+      if (queued.queued && this.isChannelOutboundReady(request.channel)) {
+        this.scheduleFlushRetry(request.channel);
+      }
+      return queued;
+    }
+    return result;
+  }
+
+  /** Retry flush after a transient queueable failure with no disconnect event. */
+  private scheduleFlushRetry(channel: string, delayMs = 30_000): void {
+    if (this.flushRetryTimers.has(channel)) return;
+    const timer = setTimeout(() => {
+      this.flushRetryTimers.delete(channel);
+      void this.flushChannel(channel).catch((err) => {
+        this.log.error({ err, channel }, 'outbound-gateway: scheduled queue flush failed');
+      });
+    }, delayMs);
+    // Don't keep the process alive solely for a flush retry.
+    if (typeof timer === 'object' && 'unref' in timer) timer.unref();
+    this.flushRetryTimers.set(channel, timer);
+  }
+
+  /**
+   * Persist a post-policy send for later delivery (#1380).
+   * Returns success+queued so callers do not treat a durable queue as a drop.
+   */
+  private async enqueueInsteadOfDrop(
+    request: OutboundSendRequest,
+  ): Promise<OutboundSendResult> {
+    if (!this.outboundQueue) {
+      return { success: false, blockedReason: 'Outbound queue not configured' };
+    }
+    try {
+      const { id } = await this.outboundQueue.enqueue(request);
+      this.log.info(
+        { channel: request.channel, queueId: id },
+        'outbound-gateway: channel disconnected — message queued for reconnect flush',
+      );
+      return { success: true, queued: true, messageId: id };
+    } catch (err) {
+      if (err instanceof OutboundQueueFullError) {
+        this.log.warn({ channel: request.channel }, err.message);
+        return { success: false, blockedReason: err.message };
+      }
+      this.log.error({ err, channel: request.channel }, 'outbound-gateway: failed to enqueue message');
+      return { success: false, blockedReason: 'Failed to queue message while channel disconnected' };
+    }
+  }
+
+  /**
+   * Flush pending queue rows for a channel after reconnect (#1380).
+   * Delete + audit each successful send immediately — external dispatch cannot
+   * roll back, so an all-or-nothing DELETE after the loop would duplicate-deliver
+   * earlier rows on the next flush. Stop on first failure; later rows stay queued.
+   */
+  async flushChannel(channel: string): Promise<{ flushed: number; skipped: boolean }> {
+    if (!this.outboundQueue) return { flushed: 0, skipped: true };
+    if (this.flushInFlight.has(channel)) {
+      return { flushed: 0, skipped: true };
+    }
+    this.flushInFlight.add(channel);
+    try {
+      if (!this.isChannelOutboundReady(channel)) {
+        this.log.debug({ channel }, 'outbound-gateway: flush skipped — still unavailable');
+        return { flushed: 0, skipped: true };
+      }
+
+      const pending = await this.outboundQueue.listPending(channel);
+      if (pending.length === 0) return { flushed: 0, skipped: false };
+
+      let flushed = 0;
+      for (const row of pending) {
+        let result: OutboundSendResult;
+        if (row.payload.channel === 'signal') {
+          result = await this.dispatchSignal(row.payload);
+        } else if (row.payload.channel === 'slack') {
+          result = await this.dispatchSlack(row.payload);
+        } else if (row.payload.channel === 'sms') {
+          result = await this.dispatchSms(row.payload);
+        } else if (row.payload.channel === 'email') {
+          result = await this.dispatchEmail(row.payload);
+        } else {
+          result = { success: false, blockedReason: `Unknown channel in queue: ${row.channel}` };
+        }
+
+        if (!result.success) {
+          this.log.warn(
+            { channel, queueId: row.id, blockedReason: result.blockedReason },
+            'outbound-gateway: flush stopped — remaining rows stay queued for next reconnect',
+          );
+          // Transient provider outage — try again later without waiting for a socket event.
+          if (result.queueable) {
+            this.scheduleFlushRetry(channel);
+          }
+          break;
+        }
+
+        // External send already happened — delete this row before the next dispatch.
+        await this.outboundQueue.deleteByIds([row.id]);
+
+        const sent = row.payload.channel === 'email'
+          ? row.payload.body
+          : row.payload.message;
+        // A row queued under band gating may hold details the review authorized raw, and the
+        // gating may have changed since it was queued: the audit event always gets a redacted
+        // copy (#2312), so it never carries them.
+        const content = this.redactedCopy(sent, row.payload.channel, row.recipient);
+        if (row.payload.channel === 'signal' && row.payload.recipient) {
+          await this.promoteOrCreateRecipientContact('signal', row.payload.recipient);
+        } else if (row.payload.channel === 'sms') {
+          await this.promoteOrCreateRecipientContact('sms', row.payload.recipient);
+        } else if (row.payload.channel === 'email' && row.payload.toFromOwnMessage !== true) {
+          const provenance = emailProvenanceFromPayload(row.payload);
+          await this.promoteOrCreateRecipientContact(
+            'email',
+            row.payload.to,
+            provenance.source,
+            provenance.displayName,
+          );
+        }
+
+        await this.publishDelivered({
+          channel: row.payload.channel,
+          recipientId: row.recipient,
+          content,
+          messageId: result.messageId,
+          // A queued approval email binds its thread from this (#2333): reaction-approval-mapper.
+          ...(result.threadId ? { threadId: result.threadId } : {}),
+        });
+        flushed += 1;
+      }
+
+      this.log.info(
+        { channel, flushed, pending: pending.length },
+        'outbound-gateway: queue flush complete',
+      );
+      return { flushed, skipped: false };
+    } finally {
+      this.flushInFlight.delete(channel);
     }
   }
 
@@ -834,7 +1998,7 @@ export class OutboundGateway {
    *
    * This replaces the former direct dispatchEmail() calls that bypassed the content
    * filter. The notification body is always a hardcoded template (no LLM-generated
-   * content) addressed to the CEO email (which is in the content filter allowlist),
+   * content) addressed to the principal email (which is in the content filter allowlist),
    * so the filter will always pass.
    *
    * Callers: the blocked-content path in send().
@@ -862,23 +2026,720 @@ export class OutboundGateway {
   }
 
   /**
+   * Give the gateway the approval-delivery service (#2159). Set after construction because
+   * ApprovalDelivery sends through this gateway; without it the gate sites still write rows
+   * and the delivered approval renders the stored payload.
+   */
+  setApprovalDelivery(approvalDelivery: Pick<ApprovalDelivery, 'registerDisplay'>): void {
+    this.approvalDelivery = approvalDelivery;
+  }
+
+  /**
+   * Write a pending_approval row for a held send, register what the principal will be shown,
+   * queue its one digest mention, and wake the coordinator for a relayed reply (#2159).
+   * Nobody is notified here: the agent that tried the send delivers the approval on one
+   * channel with deliver-approval. Returns the short ref and approval number (#2159 Phase 3;
+   * null when the row has none), or undefined when there is no action log or the row could not
+   * be written (the send stays held either way). `preamble` replaces the recipe's description
+   * at the top of what the principal is shown (an ask's question, #2312); the row and its
+   * digest mention keep the description. `disclosureAsk` is stored in its own column, never
+   * in the replayed payload, so approving or denying the row records the principal's answer.
+   * `ask` tells a relayed reply's coordinator wake that this is a personal-data request.
+   */
+  private async raiseSendApproval(
+    request: OutboundSendRequest,
+    recipe: SendRecipe,
+    ctx: { taskEventId: string; conversationId?: string | null; postTurn?: boolean },
+    extraLines: string[],
+    preamble?: string,
+    disclosureAsk?: DisclosureAsk,
+    ask?: BandReviewAsk,
+  ): Promise<{ shortRef: string; approvalNumber: number | null } | undefined> {
+    const actionLogRepo = this.actionLogRepo;
+    if (!actionLogRepo) {
+      this.log.warn({ channel: request.channel }, 'outbound-gateway: no action log wired — a held send cannot raise an approval');
+      return undefined;
+    }
+    // Hoist candidateRef so the display registration names the row the insert wrote.
+    const candidateRef = generateShortRef();
+    let rowId: number;
+    try {
+      rowId = await actionLogRepo.insert({
+        taskId: ctx.taskEventId,
+        conversationId: ctx.conversationId ?? undefined,
+        toolName: recipe.toolName,
+        actionRisk: 'medium',
+        outcome: 'pending_approval',
+        shortRef: candidateRef,
+        description: recipe.description,
+        payload: recipe.partialPayload ?? {},
+        ...(disclosureAsk ? { disclosureAsk } : {}),
+        expiresAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+      });
+    } catch (err) {
+      this.log.error(
+        { err, channel: request.channel, taskEventId: ctx.taskEventId },
+        'outbound-gateway: failed to write action_log row for a held send — send is still blocked, actionRef will be absent',
+      );
+      return undefined;
+    }
+    // insert() allocated the number inside its transaction but returns only the id.
+    const approvalNumber = await readApprovalNumber(actionLogRepo, rowId, this.log);
+    // Show the principal the resolved recipients, not the stored contact references (#2033).
+    const displayPayload = enrichGatewayApprovalPayload(
+      withoutRecipientReferences(recipe.partialPayload ?? {}),
+      request.channel === 'email'
+        ? { to: emailToAddresses(request).join(', '), cc: request.cc?.join(', '), subject: request.subject, body: request.body }
+        : request.channel === 'slack'
+          // `recipient` is the field the approval renderer shows (#2033).
+          ? { slackChannelId: request.slackChannelId, recipient: request.slackUserId ?? request.slackChannelId, message: request.message }
+          : { recipient: request.recipient, message: request.message },
+    );
+    this.approvalDelivery?.registerDisplay(candidateRef, {
+      preamble: preamble ?? recipe.description,
+      payload: displayPayload,
+      extraLines,
+      approvalNumber,
+    });
+    await this.queueApprovalMention(candidateRef, recipe.description, ctx.taskEventId, ctx.conversationId ?? undefined);
+    if (ctx.postTurn) {
+      await this.wakeCoordinatorToDeliver(candidateRef, recipe.description, ctx.taskEventId, ask ? wakeAskFor(request, ask) : undefined);
+    }
+    return { shortRef: candidateRef, approvalNumber };
+  }
+
+  /**
+   * Whether a send went to someone Curia has not dealt with before, for the spot-check pool
+   * (#2159 Phase 3). Send skills address recipients by contact UUID (ADR-047), so a
+   * first-time recipient normally already has a contact, made moments earlier by
+   * contact-create. "First contact" therefore means a person recipient whose contact is
+   * under a day old, or who has no contact at all. A group or channel is never one, and
+   * neither is a recipient whose lookup failed: an outage is not evidence of novelty.
+   * Never throws.
+   */
+  private async isFirstContact(recipient: FirstContactProbe): Promise<boolean> {
+    if (!recipient.person || recipient.lookupFailed) return false;
+    if (recipient.contactId === undefined) return true;
+    try {
+      const contact = await this.contactService.getContact(recipient.contactId);
+      // Resolved a moment ago but gone now (merged or deleted): no contact exists, which
+      // is the no-contact case above.
+      if (!contact) return true;
+      return Date.now() - contact.createdAt.getTime() < FIRST_CONTACT_WINDOW_MS;
+    } catch (err) {
+      this.log.warn(
+        { err, contactId: recipient.contactId },
+        'outbound-gateway: could not read the recipient contact for the spot-check first contact signal — recording it as not a first contact',
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Put an autonomous send in the spot-check pool (#2159 Phase 3). Not for system notices,
+   * principal-approved or principal-directed sends, or the principal alone: those are not
+   * Curia acting on its own. Never throws; the send has already gone out.
+   */
+  private async recordSentAction(args: {
+    channel: OutboundSendRequest['channel'];
+    toolName: string;
+    recipientLabel: string;
+    preview: string;
+    /** The send's primary recipient, as Step 1 resolved it; decides the firstContact signal. */
+    recipient: FirstContactProbe;
+    band: { report?: BandReviewReport; signals?: BandReviewSignals } | undefined;
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string | null } | undefined;
+  }): Promise<void> {
+    if (!this.actionLogRepo) return;
+    const { band } = args;
+    const firstContact = await this.isFirstContact(args.recipient);
+    // One review outcome per row, most telling first: an unreviewed send says more than a
+    // bounce the drafter then fixed.
+    const review = band?.report?.source === 'sent_without_review' ? 'unreviewed'
+      : band?.signals?.bounced ? 'bounced' : undefined;
+    try {
+      await this.actionLogRepo.insertSampled({
+        taskId: args.options?.taskEventId ?? args.options?.parentEventId ?? 'system',
+        ...(args.options?.conversationId ? { conversationId: args.options.conversationId } : {}),
+        toolName: args.toolName,
+        actionRisk: 'medium',
+        summary: `${SENT_VERB[args.channel]} ${args.recipientLabel}: "${truncatePreview(args.preview)}"`,
+        signals: {
+          ...(firstContact ? { firstContact: true } : {}),
+          ...(band?.signals?.speaksAsPrincipal ? { speaksAsPrincipal: true } : {}),
+          ...(review ? { review } : {}),
+        },
+      });
+    } catch (err) {
+      // error, like the gateway's other action_log insert failures: a pool that silently
+      // stops filling starves the spot check. The pg SQLSTATE code, when there is one, tells
+      // a schema problem from an outage. Not rethrown: the send has already gone out.
+      const code = (err as { code?: unknown } | null)?.code;
+      this.log.error(
+        {
+          err, channel: args.channel, toolName: args.toolName, taskEventId: args.options?.taskEventId,
+          ...(typeof code === 'string' ? { code } : {}),
+        },
+        'outbound-gateway: could not record the send for spot checks — it went out, but will not be sampled',
+      );
+    }
+  }
+
+  /**
+   * Step 2.5 under band gating (#2159): ask the band review, and act on its decision.
+   * Returns `result` when the send must not go out (bounce, block or hold), otherwise any
+   * report item to publish once it is delivered. The message itself is never changed: the
+   * review sends it as written or asks the drafter to rewrite it (#2312).
+   */
+  private async runBandReview(args: {
+    request: OutboundSendRequest;
+    content: string;
+    /** The send's one autonomy read (#2312): the review's score comes from it. */
+    autonomy: AutonomyRead;
+    /** What a bounce's outbound.blocked event carries: the redacted copy, never raw values (#2312). Defaults to content. */
+    auditContent?: string;
+    recipients: readonly string[];
+    principalRecipients: readonly string[];
+    /** The personal data detected in the send, and the primary recipient's tier (#2312). */
+    detectedItems?: readonly BriefDetectedItem[];
+    recipientTier?: ContactTier;
+    /** Every resolved person recipient's tier, by normalized id: an ask needs each one askable (#2312). */
+    recipientTiers?: Readonly<Record<string, ContactTier>>;
+    /** The primary recipient's resolved contact id, by lowercased id: a link's counterparty check (#2312). */
+    recipientContactIds?: Readonly<Record<string, string>>;
+    /** The email subject as it will be sent: the review scans it for redaction tokens. */
+    subject?: string;
+    /** The primary recipient and their contact record's name: an ask names them (#2312). Display only. */
+    requester?: { id: string; name: string };
+    options: {
+      taskEventId?: string;
+      conversationId?: string | null;
+      parentEventId?: string;
+      postTurn?: boolean;
+      reportedToPrincipal?: string;
+      principalDirected?: boolean;
+      holdRecipe?: SendRecipe;
+      reExecRecipe?: SendRecipe;
+    } | undefined;
+    /**
+     * False for a saved draft: its drafter cannot rewrite it, so a block holds instead, and so
+     * does a bounce when it holds personal data (#2312).
+     */
+    editable?: boolean;
+  }): Promise<{
+    result?: OutboundSendResult; report?: BandReviewReport; signals?: BandReviewSignals;
+    dropQuote?: { labels: string[] };
+  }> {
+    const { request, content, recipients, principalRecipients, options } = args;
+    const score = this.bandScore(args.autonomy);
+    let decision: Awaited<ReturnType<BandSendReview['review']>>;
+    try {
+      decision = await this.bandReview!.review({
+        content,
+        channel: request.channel,
+        recipients,
+        principalRecipients,
+        score,
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
+        principalDirected: options?.principalDirected === true,
+        postTurn: options?.postTurn === true,
+        ...(options?.reportedToPrincipal ? { reportedToPrincipal: options.reportedToPrincipal } : {}),
+        ...(args.detectedItems && args.detectedItems.length > 0 ? { detectedItems: args.detectedItems } : {}),
+        ...(args.recipientTier ? { recipientTier: args.recipientTier } : {}),
+        ...(args.recipientTiers ? { recipientTiers: args.recipientTiers } : {}),
+        ...(args.recipientContactIds ? { recipientContactIds: args.recipientContactIds } : {}),
+        ...(args.subject !== undefined ? { subject: args.subject } : {}),
+      });
+    } catch (err) {
+      // BandSendReview is not meant to throw; if it does, the send was not reviewed. Hold.
+      this.log.error({ err, channel: request.channel }, 'outbound-gateway: band review threw — holding the send');
+      const reason = 'Held for the principal: the send review failed.';
+      decision = { kind: 'hold', reason, findings: [{ rule: BAND_RULES.unreviewed, detail: reason }] };
+    }
+
+    // A block asks the drafter to rewrite, so it needs one waiting. A dispatcher relay's
+    // drafter is gone and a saved draft cannot be rewritten in place: the principal decides.
+    if (decision.kind === 'block' && (options?.postTurn === true || args.editable === false)) {
+      // A hold the block outranked comes along (#2333): the principal sees its warning.
+      const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
+      const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
+      decision = {
+        kind: 'hold',
+        reason: `Held for the principal: after one rewrite it still has these problems (${rules}).${heldBesideNote(decision.heldBeside)}`,
+        findings,
+      };
+    }
+
+    // A cold stranger's request in a saved draft (#2312): nobody is asked, as for a live send,
+    // so it is not held either. Refused, with the digest note. Labels only, never values.
+    if (args.editable === false && decision.kind === 'bounce' && decision.strangerRequest) {
+      const { requester, labels } = decision.strangerRequest;
+      const details = describePiiLabels(labels);
+      // A steering hold the bounce outranked is still said (#2333).
+      const beside = heldBesideNote(decision.heldBeside);
+      await this.queueBlockReport(
+        `${normalizeCounterparty(requester)} asked for your ${details}. Curia didn't send the saved draft that shared it.${beside}`,
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+      return {
+        result: {
+          success: false,
+          blockedReason: `Not sent: this saved draft shares the principal's ${details} with someone who asked for it, and nothing authorizes that. Save a version without them, or tell the principal.${beside}`,
+          blockedRules: [...new Set([...decision.findings, ...(decision.heldBeside ?? [])].map((f) => f.rule))],
+        },
+      };
+    }
+
+    // A saved draft with personal data in it is sent as written or not at all (#2312). A bounce
+    // asks for a rewrite it cannot get, and copying the principal would change its stored
+    // recipients: the principal decides either way. Rule names and labels only, never values.
+    if (args.editable === false && (args.detectedItems?.length ?? 0) > 0 && decision.kind === 'bounce') {
+      // A steering hold the bounce outranked comes along (#2333): the principal sees its warning.
+      const findings = [...decision.findings, ...(decision.heldBeside ?? [])];
+      const rules = [...new Set(findings.map((f) => f.rule))].join(', ');
+      const beside = heldBesideNote(decision.heldBeside);
+      decision = {
+        kind: 'hold',
+        reason: `Held for the principal: a saved draft can't be rewritten in place, and the review found these problems (${rules}).${beside}`,
+        findings,
+      };
+    }
+
+    if (decision.kind === 'send') {
+      if (decision.dropQuote) {
+        this.log.info({ channel: request.channel, labels: decision.dropQuote.labels }, 'outbound-gateway: band review sends without the quoted message — its details are not authorized for every recipient');
+      }
+      return {
+        ...(decision.report ? { report: decision.report } : {}),
+        ...(decision.signals ? { signals: decision.signals } : {}),
+        ...(decision.dropQuote ? { dropQuote: decision.dropQuote } : {}),
+      };
+    }
+
+    if (decision.kind === 'bounce') {
+      // Published so the dispatcher's relay rewrite (#1355) sees it, and for audit. No block
+      // report: a bounce is between Curia and its own drafter.
+      const blockId = `block_${randomUUID()}`;
+      try {
+        await this.bus.publish('dispatch', createOutboundBlocked({
+          blockId,
+          conversationId: options?.conversationId ?? '',
+          channelId: request.channel,
+          content: args.auditContent ?? content,
+          recipientId: recipients[0] ?? '',
+          reason: decision.findings.map((f) => `${f.rule}: ${f.detail}`).join('; '),
+          findings: decision.findings,
+          parentEventId: options?.parentEventId ?? '',
+        }));
+      } catch (err) {
+        this.log.warn({ err, blockId }, 'outbound-gateway: failed to publish outbound.blocked for a band bounce — the send is still bounced');
+      }
+      if (decision.strangerRequest) {
+        // A cold stranger asked for the principal's data: nobody can be asked, so the digest
+        // says it was not shared (#2312), not that a reply went: the drafter may not rewrite.
+        // Labels only, never the values.
+        const { requester, labels } = decision.strangerRequest;
+        await this.queueBlockReport(
+          `${normalizeCounterparty(requester)} asked for your ${describePiiLabels(labels)}. Curia didn't share it.`,
+          options?.conversationId ?? undefined,
+          options?.taskEventId ?? options?.parentEventId ?? 'system',
+        );
+      }
+      return {
+        result: {
+          success: false,
+          blockedReason: buildBlockReasonSummary(decision.findings),
+          blockedRules: decision.findings.map((f) => f.rule),
+        },
+      };
+    }
+
+    if (decision.kind === 'block') {
+      // The rewrite did not fix it. Not sent, and no outbound.blocked: on a relay it would
+      // start the #1355 rewrite loop again. The drafter is told in the result; the digest
+      // gets the rule labels (never the quoted sentences) so a relayed reply's block, whose
+      // drafter may be gone, still reaches someone.
+      const rules = decision.findings.map((f) => f.rule);
+      this.log.info({ channel: request.channel, rules }, 'outbound-gateway: band review blocked the send');
+      await this.queueBlockReport(
+        `Outbound ${request.channel} message to ${recipients.join(', ')} was not sent: after one rewrite it still had these problems (${rules.join(', ')}).`,
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+      return {
+        result: {
+          success: false,
+          blockedReason: `${decision.reason}\n${buildBlockReasonSummary(decision.findings)}`,
+          blockedRules: rules,
+        },
+      };
+    }
+
+    // Hold. Never publish outbound.blocked here: on a relay it would start the #1355
+    // rewrite loop, and this message needs the principal, not a rewrite.
+    const rule = decision.findings[0]?.rule ?? BAND_RULES.unreviewed;
+    const baseRecipe = options?.holdRecipe ?? options?.reExecRecipe;
+    const recipe = decision.ask && baseRecipe?.askDescription ? { ...baseRecipe, description: baseRecipe.askDescription } : baseRecipe;
+    this.log.info({ channel: request.channel, rule, hasRecipe: recipe !== undefined }, 'outbound-gateway: band review held the send');
+    // A hold with no approval behind it reaches nobody unless it is reported: the agent may
+    // be gone (a relayed reply), and nothing else records it. The digest gets it then.
+    const reportUnapprovedHold = async (why: string): Promise<void> => {
+      this.log.warn({ channel: request.channel, rule, why }, 'outbound-gateway: band hold raised no approval — reporting it to the digest');
+      await this.queueBlockReport(
+        [
+          `Outbound ${request.channel} message to ${recipients.join(', ')} was held by the send review, and no approval request could be raised (${why}).`,
+          `Reason: ${decision.reason}`,
+        ].join('\n'),
+        options?.conversationId ?? undefined,
+        options?.taskEventId ?? options?.parentEventId ?? 'system',
+      );
+    };
+    if (recipe && options?.taskEventId) {
+      // An ask leads with the question; the personal-details line and the draft follow (#2312).
+      const ask = decision.ask;
+      // The question is worded from the stored ask, so it names the requester as a re-delivery does.
+      const stored = ask ? this.disclosureAskFor(ask, options.conversationId, args.requester) : undefined;
+      const raised = await this.raiseSendApproval(
+        request,
+        recipe,
+        { taskEventId: options.taskEventId, conversationId: options.conversationId, postTurn: options.postTurn },
+        ask ? alsoHeld(decision.findings) : [`Held by the send review: ${decision.reason}`],
+        ask ? askPreamble({ ...ask, ...this.requesterNameFor(ask, args.requester) }) : undefined,
+        stored,
+        ask,
+      );
+      if (!raised) await reportUnapprovedHold('the approval row could not be written');
+      const askGuidance = ask && raised
+        ? ` This is waiting on the principal. Deliver approval ${raised.approvalNumber ?? raised.shortRef} to them now with deliver-approval on their urgent channel, then send ${normalizeCounterparty(ask.requester)} a short holding reply that doesn't include the requested details.`
+        : '';
+      return {
+        result: {
+          success: false,
+          gated: true,
+          ...(raised ? { actionRef: raised.shortRef } : {}),
+          blockedReason: raised
+            ? `${decision.reason} ${approvalAdvisory(raised.shortRef, undefined, raised.approvalNumber)}${askGuidance}`
+            : `${decision.reason} No approval request could be recorded — ask the principal before sending it.`,
+        },
+      };
+    }
+    await reportUnapprovedHold(recipe ? 'the send has no task to attach it to' : 'this send has no way to replay it');
+    return {
+      result: { success: false, blockedReason: `${decision.reason} Ask the principal before sending it.`, blockedRules: [rule] },
+    };
+  }
+
+  /**
+   * The ask as its approval row stores it (#2312), keyed by the thread the principal's answer
+   * applies to. Without a conversation there is no thread to remember it for: the question is
+   * still asked, but the answer decides this one send only.
+   */
+  /**
+   * The requester's name for an ask's wording (#2312): only when it is the primary recipient's
+   * own (the ask's requester), and only when it says more than the address (an auto-created
+   * contact is often named by it).
+   */
+  private requesterNameFor(ask: BandReviewAsk, named: { id: string; name: string } | undefined): { requesterName?: string } {
+    if (!named || normalizeCounterparty(named.id) !== normalizeCounterparty(ask.requester)) return {};
+    const name = displayName(named.name);
+    return name && name.toLowerCase() !== normalizeCounterparty(ask.requester) ? { requesterName: name } : {};
+  }
+
+  private disclosureAskFor(ask: BandReviewAsk, conversationId: string | null | undefined, named?: { id: string; name: string }): DisclosureAsk | undefined {
+    if (!conversationId || ask.counterparties.length === 0) {
+      this.log.warn({ labels: ask.labels, hasConversation: Boolean(conversationId) }, 'outbound-gateway: a personal-data ask has no thread or recipient to remember the answer for');
+      return undefined;
+    }
+    return {
+      conversationId,
+      counterparties: ask.counterparties,
+      labels: ask.labels,
+      requester: normalizeCounterparty(ask.requester),
+      ...(ask.outreachId ? { outreachId: ask.outreachId } : {}),
+      ...(ask.taskTitle ? { taskTitle: ask.taskTitle } : {}),
+      ...this.requesterNameFor(ask, named),
+    };
+  }
+
+  /**
+   * The autonomy config, read once per send (#2312) and shared by the autonomy gate, the
+   * gating and the band review's score. Never throws: a failed read is reported in the result
+   * and each user fails open or closed as it always has.
+   */
+  private async readAutonomy(): Promise<AutonomyRead> {
+    if (!this.autonomyService) return { config: null, failed: false };
+    try {
+      return { config: await this.autonomyService.getConfig(), failed: false };
+    } catch (err) {
+      return { config: null, failed: true, error: err };
+    }
+  }
+
+  /**
+   * The gating this send follows (#2312): the autonomy config's, else the constructed value.
+   * Production's AutonomyService stamps the configured gating on every read, so the two agree
+   * there; the scenario suite's fixture service pins it per case on one shared gateway. An
+   * unreadable config keeps the constructed gating, as before this was read per send.
+   */
+  private currentGating(autonomy: AutonomyRead): AutonomyGating {
+    return autonomy.config?.gating ?? this.gating;
+  }
+
+  /** The live score for band review, from the send's read. Unreadable counts as 0: below 80, failures hold. */
+  private bandScore(autonomy: AutonomyRead): number {
+    if (!this.autonomyService) return 0;
+    if (autonomy.failed) {
+      this.log.warn({ err: autonomy.error }, 'outbound-gateway: autonomy score unreadable for band review — reviewing as score 0');
+      return 0;
+    }
+    if (autonomy.config === null) {
+      this.log.warn('outbound-gateway: no autonomy score for band review — reviewing as score 0');
+      return 0;
+    }
+    return autonomy.config.score;
+  }
+
+  /**
+   * Publish a band report item once its send is delivered (#2159). A "sent without review"
+   * item is then the only record that nothing checked the message, so if it cannot be
+   * recorded the principal is emailed directly.
+   */
+  private async publishBandReport(
+    report: BandReviewReport,
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string | null } | undefined,
+  ): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary: report.summary,
+        urgency: 'digest',
+        source: report.source,
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error({ err, source: report.source }, 'outbound-gateway: failed to record a band report item');
+      if (report.source === 'sent_without_review') {
+        await this.emailPrincipal('Curia: a message went out without review', report.summary);
+      }
+    }
+  }
+
+  /**
+   * Hold an over-budget relay for the principal's digest (#1320): record the digest item, send
+   * the once-per-window notice, log and audit it. Returns null when the digest item could not be
+   * recorded, so the caller delivers the relay instead of losing it. Never throws.
+   */
+  private async deferRelay(
+    request: OutboundSendRequest,
+    body: string,
+    subject: string | undefined,
+    originator: TaskOriginator,
+    options: { taskEventId?: string; parentEventId?: string; conversationId?: string } | undefined,
+  ): Promise<OutboundSendResult | null> {
+    const name = await this.originatorName(originator.contactId);
+    const summary = [
+      `Held for your digest (relay limit reached for ${name ?? 'a contact'}):`,
+      ...(request.channel === 'email' && subject ? [`Subject: ${subject}`] : []),
+      body,
+    ].join('\n');
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary,
+        urgency: 'digest',
+        source: 'relay_deferred',
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        parentEventId: options?.taskEventId ?? options?.parentEventId ?? 'system',
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error(
+        { err, originatorContactId: loggableContactId(originator.contactId), channel: request.channel },
+        'outbound-gateway: relay over budget, but its digest item could not be recorded — delivering it now',
+      );
+      return null;
+    }
+
+    // Marked only once delivered: a notice that failed is tried again on the next deferral.
+    const noticeSent = this.relayBudget!.noticeDue(originator.contactId)
+      ? await this.sendRelayNotice(request, name ?? 'A contact', options)
+      : false;
+    if (noticeSent) this.relayBudget!.markNotified(originator.contactId);
+    const tier = originator.tier ?? 'unknown';
+    this.log.warn(
+      { originatorContactId: loggableContactId(originator.contactId), tier, channel: request.channel, count: this.relayBudget!.count(originator.contactId), noticeSent },
+      'outbound-gateway: relay budget reached — relay held for the digest',
+    );
+    try {
+      await this.bus.publish('dispatch', createAutonomyRelayDeferred({
+        originatorContactId: originator.contactId,
+        tier,
+        channel: request.channel,
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
+        noticeSent,
+      }, options?.taskEventId));
+    } catch (err) {
+      // The relay is already safe in the digest; only the audit row is missing.
+      this.log.error({ err, originatorContactId: loggableContactId(originator.contactId) }, 'AUDIT FAILURE: autonomy.relay_deferred could not be published');
+    }
+    return { success: true, deferredToDigest: true };
+  }
+
+  /** The once-per-window "holding them for your digest" line (#1320). True if delivered. Never throws. */
+  private async sendRelayNotice(
+    request: OutboundSendRequest,
+    name: string,
+    options: { taskEventId?: string; conversationId?: string } | undefined,
+  ): Promise<boolean> {
+    const notice = relayNoticeRequest(request, `${name} has more updates. I'm holding them for your digest, or ask me for them anytime.`, `Holding updates from ${name}`);
+    try {
+      // A system notification: never budgeted, so this cannot recurse into another deferral.
+      const result = await this.send(notice, {
+        isSystemNotification: true,
+        skipNotificationOnBlock: true,
+        ...(options?.taskEventId ? { taskEventId: options.taskEventId } : {}),
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+      });
+      if (!result.success) {
+        this.log.warn({ channel: request.channel, reason: result.blockedReason }, 'outbound-gateway: relay-budget notice was not delivered');
+      }
+      return result.success;
+    } catch (err) {
+      this.log.warn({ err, channel: request.channel }, 'outbound-gateway: relay-budget notice threw');
+      return false;
+    }
+  }
+
+  /**
+   * The originator's display name, or null when there is none or the lookup fails. Never throws.
+   * An unresolved sender has no contact: stampOriginator uses its raw address as the id, and that
+   * address is the best name the principal can be given.
+   */
+  private async originatorName(contactId: string): Promise<string | null> {
+    // Trimmed before the check: isUuid() is a type guard, and narrows a non-UUID string to never.
+    const raw = contactId.trim();
+    if (!isUuid(contactId)) return raw || null;
+    try {
+      const name = (await this.contactService.getContact(contactId))?.displayName?.trim();
+      return name ? name : null;
+    } catch (err) {
+      this.log.warn({ err, contactId }, 'outbound-gateway: could not look up the relay originator\'s name');
+      return null;
+    }
+  }
+
+  /** Email the principal directly, as a system notification. Never throws. */
+  private async emailPrincipal(subject: string, body: string): Promise<void> {
+    const to = this.principalIdentities.find((i) => i.channel === 'email' && i.verified && i.status === 'active')?.channelIdentifier;
+    if (!to) {
+      this.log.error({ subject }, 'outbound-gateway: no verified principal email to notify — the notice is only in this log');
+      return;
+    }
+    try {
+      const result = await this.send({ channel: 'email', to, subject, body }, { isSystemNotification: true, skipNotificationOnBlock: true });
+      if (!result.success) {
+        this.log.error({ subject, reason: result.blockedReason }, 'outbound-gateway: principal notice was not delivered');
+      }
+    } catch (err) {
+      this.log.error({ err, subject }, 'outbound-gateway: principal notice threw');
+    }
+  }
+
+  /** Wake the coordinator to deliver an approval nobody is there to deliver (#2159). Never throws. */
+  private async wakeCoordinatorToDeliver(shortRef: string, description: string, taskEventId: string, ask?: ApprovalWakeAsk): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', buildApprovalDeliveryWake(shortRef, description, taskEventId, ask));
+    } catch (err) {
+      this.log.error({ err, shortRef }, 'outbound-gateway: could not wake the coordinator — the expiry sweep will deliver the approval');
+    }
+  }
+
+  /** Queue a gate-raised approval's one digest mention (#2159). Never throws. */
+  private async queueApprovalMention(shortRef: string, description: string, taskEventId: string, conversationId: string | undefined): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary: `Waiting for your approval: ${description}`,
+        urgency: 'digest',
+        source: 'approval_pending',
+        ...(conversationId ? { conversationId } : {}),
+        actionShortRef: shortRef,
+        parentEventId: taskEventId,
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error({ err, shortRef }, 'outbound-gateway: failed to queue the approval mention — the approval still exists');
+    }
+  }
+
+  /**
+   * Queue a content-filter block notice for the principal's digest (#2159). The summary must
+   * already obey buildBlockReasonSummary's per-rule contract: never a Stage-1 rule's matched
+   * fragment. Never throws — the block itself has already happened and is in the audit log.
+   */
+  private async queueBlockReport(summary: string, conversationId: string | undefined, blockedEventId: string): Promise<void> {
+    try {
+      await this.bus.publish('dispatch', createPrincipalReport({
+        summary,
+        urgency: 'digest',
+        source: 'blocked_content',
+        ...(conversationId ? { conversationId } : {}),
+        parentEventId: blockedEventId,
+        sourceLayer: 'dispatch',
+      }));
+    } catch (err) {
+      this.log.error(
+        { err, blockedEventId },
+        'outbound-gateway: failed to queue the block notice — the block is only in the audit log',
+      );
+    }
+  }
+
+  /**
    * Publish the canonical outbound.delivered audit event. Called from every
    * successful wire-level dispatch path. Failures here are logged but never
    * propagate — the message already went out, and we will not make the user's
    * send conditional on the audit subsystem.
    */
   private async publishDelivered(payload: {
-    channel: 'signal' | 'email';
+    channel: 'signal' | 'email' | 'slack' | 'sms';
     recipientId: string;
     recipientContactId?: string;
     content: string;
     conversationId?: string;
     taskEventId?: string;
     messageId?: string;
+    threadId?: string;
     parentEventId?: string;
+    exportAudit?: {
+      destination: string;
+      items: ExportItem[];
+      toolName?: string;
+      agentId?: string;
+    };
+    disclosed?: Array<{ label: string; field: 'body' | 'subject' | 'quote' }>;
   }): Promise<void> {
     try {
-      await this.bus.publish('dispatch', createOutboundDelivered(payload));
+      const { exportAudit, ...rest } = payload;
+      await this.bus.publish('dispatch', createOutboundDelivered({
+        ...rest,
+        ...(exportAudit
+          ? {
+            exportAudit: {
+              destination: exportAudit.destination,
+              items: exportAudit.items.map((i) => ({
+                nodeId: i.nodeId,
+                label: i.label,
+                sensitivity: i.sensitivity,
+              })),
+              toolName: exportAudit.toolName,
+              agentId: exportAudit.agentId,
+            },
+          }
+          : {}),
+      }));
     } catch (err) {
       this.log.error(
         { err, channel: payload.channel, recipientId: redactId(payload.recipientId) },
@@ -888,87 +2749,356 @@ export class OutboundGateway {
   }
 
   /**
-   * Check whether the recipient is the principal (the human Curia serves).
-   * Resolves against the principal contact's verified channel identities,
-   * loaded from the database at startup.
+   * Project an outbound request onto recipient identifiers for principal checks.
+   *
+   * Delegates to the channel's `PrincipalChannelRules.extractRecipients` (ADR-035).
+   * Unregistered channels / unrecognized shapes fail closed (empty list ⇒ no
+   * principal carve-out). `isPrincipalRecipient` and `buildFilterRecipients`
+   * both derive from this.
+   */
+  private projectRecipients(request: OutboundSendRequest): ProjectedRecipient[] {
+    const rules = findPrincipalChannelRules(request.channel);
+    return rules?.extractRecipients(request) ?? [];
+  }
+
+  /**
+   * Resolve a send skill's recipient reference — a contact UUID or the alias
+   * `principal` — to the address on that contact's verified, active identity
+   * for `channel` (#2033, ADR-047). `value` may carry a `#label` hint
+   * (`principal#personal`); it is part of the string, so every caller resolves
+   * the same identity (#2047). Fails closed with an agent-facing error.
+   *
+   * The principal's contact ID comes from the hot-reloaded identity snapshot
+   * (verified + active rows only), so the alias has no target when the
+   * principal has no verified identity at all.
+   */
+  async resolveRecipientReference(
+    channel: string,
+    value: string,
+    fields: RecipientReferenceFields,
+  ): Promise<RecipientResolution> {
+    const result = await resolveRecipientReference(value, channel, fields, {
+      contactService: this.contactService,
+      principalContactId: this.principalIdentities[0]?.contactId,
+    });
+    if (!result.ok && result.cause !== undefined) {
+      this.log.warn(
+        { err: result.cause, channel },
+        'outbound-gateway: recipient reference lookup failed — send refused (fail-closed)',
+      );
+    }
+    return result;
+  }
+
+  /**
+   * Whether a quote is exempt from review (#2312): every recipient was on the quoted message,
+   * by that message's own headers. The caller's `quoteParticipants` is a claim, not evidence:
+   * any code holding the gateway can build a request. So the exemption holds only when the
+   * message the reply answers (`replyToMessageId`), fetched here, confirms it. Anything that
+   * cannot confirm (no id, no client, a failed fetch) reviews the quote: fail closed.
+   */
+  private async quoteIsExempt(request: EmailSendRequest, recipients: readonly FilterRecipient[]): Promise<boolean> {
+    // A claim that already fails needs no fetch.
+    if (!this.quoteIsRecipients(request, recipients)) return false;
+    const client = request.replyToMessageId ? this.getNylasClient(request.accountId) : undefined;
+    if (!client || !request.replyToMessageId) return false;
+    try {
+      const original = await client.getMessage(request.replyToMessageId);
+      return this.quoteIsRecipients({ ...request, quoteParticipants: quoteParticipants(original) }, recipients);
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: could not fetch the quoted message to confirm its participants — reviewing the quote');
+      return false;
+    }
+  }
+
+  /**
+   * Whether everyone this email reaches, besides the principal, was on the message it quotes
+   * (#2312): the quote then only shows them what they already had. Compared as band review
+   * compares recipients. No participants recorded is never true: the quote is reviewed.
+   */
+  private quoteIsRecipients(request: EmailSendRequest, recipients: readonly FilterRecipient[]): boolean {
+    if (!request.quoteParticipants || request.quoteParticipants.length === 0) return false;
+    const participants = new Set(request.quoteParticipants.map(normalizeCounterparty));
+    const people = new Set(this.personRecipients(request).map(normalizeCounterparty));
+    return recipients
+      .filter((r) => !r.isPrincipal && people.has(normalizeCounterparty(r.email)))
+      .every((r) => participants.has(normalizeCounterparty(r.email)));
+  }
+
+  /** Recipient identifiers that name a person (never a group or conversation id). */
+  private personRecipients(request: OutboundSendRequest): string[] {
+    return this.projectRecipients(request)
+      .filter((r) => r.principalEligible)
+      .map((r) => r.identifier);
+  }
+
+  /**
+   * The identifiers among `identifiers` that match no contact on `channel` (#2033).
+   * Called only on a block, so ordinary sends pay no extra lookups. A lookup
+   * error leaves that identifier out: the note says "matches no contact" only
+   * when the lookup confirmed it.
+   */
+  private async findUnmatchedRecipients(channel: string, identifiers: readonly string[]): Promise<UnmatchedRecipient[]> {
+    const unmatched: UnmatchedRecipient[] = [];
+    const seen = new Set<string>();
+    for (const identifier of identifiers) {
+      const key = identifier.toLowerCase();
+      if (identifier.length === 0 || seen.has(key)) continue;
+      seen.add(key);
+      try {
+        const contact = await this.contactService.resolveByChannelIdentity(channel, identifier);
+        if (contact === null) unmatched.push({ identifier, reason: 'no-contact' });
+        else if (!contact.verified) unmatched.push({ identifier, reason: 'unverified' });
+      } catch (err) {
+        this.log.warn(
+          { err, channel, recipientId: redactId(identifier) },
+          'outbound-gateway: recipient lookup for the block note failed — note omits this recipient',
+        );
+      }
+    }
+    return unmatched;
+  }
+
+  /**
+   * The first of `identifiers` that is a blocked contact on `channel` (#2273).
+   * The primary recipient's own check also captures its tier; this covers the
+   * rest of the envelope (further To, CC), so a blocked contact anywhere on it
+   * is refused. On a lookup error, `failClosed` returns `lookup-failed`;
+   * otherwise that identifier is logged and skipped, as the primary check does.
+   * `opts.tiers`, when given, collects each resolved contact's tier by normalized
+   * identifier, for the band review's ask (#2312), and `opts.contactIds` its contact id when
+   * the identity is verified, for matching a linked outreach row.
+   */
+  private async findBlockedRecipient(
+    channel: string,
+    identifiers: readonly string[],
+    opts: { failClosed: boolean; tiers?: Record<string, ContactTier>; contactIds?: Record<string, string> },
+  ): Promise<{ kind: 'blocked'; identifier: string; contactId: string } | { kind: 'lookup-failed'; identifier: string } | null> {
+    const seen = new Set<string>();
+    for (const identifier of identifiers) {
+      const key = identifier.toLowerCase();
+      if (identifier.length === 0 || seen.has(key)) continue;
+      seen.add(key);
+      try {
+        const contact = await this.contactService.resolveByChannelIdentity(channel, identifier);
+        // Uses tier for the blocked check (issue #945); tier='blocked' == old status='blocked'.
+        if (contact !== null && contact.tier === 'blocked') {
+          return { kind: 'blocked', identifier, contactId: contact.contactId };
+        }
+        if (contact !== null) {
+          if (opts.tiers) opts.tiers[normalizeCounterparty(identifier)] = contact.tier;
+          if (opts.contactIds && contact.verified === true) opts.contactIds[normalizeCounterparty(identifier)] = contact.contactId;
+        }
+      } catch (err) {
+        this.log.warn(
+          { err, channel, recipientId: redactId(identifier), failClosed: opts.failClosed },
+          'outbound-gateway: blocked-contact lookup failed for a non-primary recipient',
+        );
+        if (opts.failClosed) return { kind: 'lookup-failed', identifier };
+      }
+    }
+    return null;
+  }
+
+  /** Append the unmatched-recipient note to a blocked result (#2033). */
+  private withUnmatchedRecipientNote(
+    result: OutboundSendResult,
+    unmatched: readonly UnmatchedRecipient[],
+  ): OutboundSendResult {
+    if (unmatched.length === 0) return result;
+    return {
+      ...result,
+      blockedReason: `${result.blockedReason ?? 'Send blocked'}\n\n${formatUnmatchedRecipientNote(unmatched)}`,
+      unmatchedRecipients: unmatched.map((u) => u.identifier),
+    };
+  }
+
+  /**
+   * Check whether the principal (the human Curia serves) is the send's only
+   * recipient, over the full projection: email To, further To and CC (#2273),
+   * Signal `recipient`, Slack `slackUserId`. A principal on To with anyone else
+   * on the send is not agent-to-principal communication, so the autonomy gate
+   * and the identity gate still run.
    */
   private isPrincipalRecipient(request: OutboundSendRequest): boolean {
-    if (this.principalIdentities.length === 0) return false;
-
-    if (request.channel === 'email' && request.to) {
-      const normalized = request.to.toLowerCase();
-      return this.principalIdentities.some(
-        (id) => id.channel === 'email' && id.channelIdentifier.toLowerCase() === normalized,
-      );
-    }
-    if (request.channel === 'signal' && 'recipient' in request && request.recipient) {
-      return this.principalIdentities.some(
-        (id) => id.channel === 'signal' && id.channelIdentifier === request.recipient,
-      );
-    }
-    return false;
+    return this.buildFilterRecipients(request).principalIsSoleRecipient;
   }
 
   /**
-   * Check whether an email address belongs to the principal.
-   * Used by sendEmailDraft() for the autonomy bypass.
+   * Publish and return an unresolved-identity block, or null when the send
+   * may proceed. Shared by send() and sendEmailDraft() (#1818).
+   *
+   * `identityGate: off` skips the check. `shadow` logs what enforce would
+   * have blocked and lets the send continue. `enforce` blocks.
    */
-  private isPrincipalEmail(email: string | undefined | null): boolean {
-    if (!email || this.principalIdentities.length === 0) return false;
-    const normalized = email.toLowerCase();
-    return this.principalIdentities.some(
-      (id) => id.channel === 'email' && id.channelIdentifier.toLowerCase() === normalized,
+  private async blockForUnresolvedIdentity(args: {
+    request: OutboundSendRequest;
+    messageBody: string;
+    recipientId: string;
+    options?: {
+      humanApproved?: boolean;
+      isSystemNotification?: boolean;
+      taskEventId?: string;
+      conversationId?: string;
+      parentEventId?: string;
+    };
+    draftId?: string;
+  }): Promise<OutboundSendResult | null> {
+    if (this.identityGate === 'off') return null;
+    const identityReason = await this.unresolvedIdentityReason(args.request, args.options);
+    if (!identityReason) return null;
+    if (this.identityGate === 'shadow') {
+      this.log.warn(
+        {
+          channel: args.request.channel,
+          recipientId: redactId(args.recipientId),
+          draftId: args.draftId,
+          identityGate: 'shadow',
+        },
+        'outbound-gateway: unresolved identity would have blocked this send',
+      );
+      return null;
+    }
+    this.log.warn(
+      {
+        channel: args.request.channel,
+        recipientId: redactId(args.recipientId),
+        draftId: args.draftId,
+      },
+      'outbound-gateway: send blocked — unresolved identity',
+    );
+    const blockId = `block_${randomUUID()}`;
+    try {
+      await this.bus.publish('dispatch', createOutboundBlocked({
+        blockId,
+        conversationId: args.options?.conversationId ?? '',
+        channelId: args.request.channel,
+        content: scrubPii(args.messageBody),
+        recipientId: args.recipientId,
+        reason: 'unresolved_identity',
+        findings: [{
+          rule: 'unresolved-identity',
+          detail: 'Outbound message names a person who is not resolved to a contact ID in this turn',
+        }],
+        parentEventId: args.options?.parentEventId ?? '',
+      }));
+    } catch (publishErr) {
+      this.log.warn(
+        { publishErr, blockId, draftId: args.draftId },
+        'outbound-gateway: failed to publish outbound.blocked event for unresolved identity — message is still blocked',
+      );
+    }
+    return { success: false, blockedReason: identityReason, blockedRules: ['unresolved-identity'] };
+  }
+
+  /**
+   * Why an external send must not go out, or null when it may proceed (#1818).
+   *
+   * Fail-open on three paths, on purpose:
+   *   1. no conversation-entity service was wired
+   *   2. the send has no taskEventId
+   *   3. this task never called begin() — a specialist turn that does not
+   *      track identities, or a send from outside an agent task
+   * Those sends are not identity-checked. A tracked turn whose contact load
+   * failed still called begin() with an empty set, so a person-shaped
+   * external send on that turn fails closed. Do not flip the three skips
+   * to fail-closed; that would block system and untracked sends that have
+   * no resolved set.
+   */
+  private async unresolvedIdentityReason(
+    request: OutboundSendRequest,
+    options?: {
+      humanApproved?: boolean;
+      isSystemNotification?: boolean;
+      taskEventId?: string;
+    },
+  ): Promise<string | null> {
+    const state = this.conversationEntities;
+    if (!state) return null;
+    if (options?.humanApproved || options?.isSystemNotification) return null;
+    if (this.isPrincipalRecipient(request)) return null;
+    const taskEventId = options?.taskEventId;
+    if (!taskEventId || !state.turnIdentities.has(taskEventId)) return null;
+
+    const covered: string[] = [...state.principalNames];
+    for (const card of state.turnIdentities.get(taskEventId)) {
+      covered.push(card.displayName);
+      if (card.preferredName) covered.push(card.preferredName);
+    }
+
+    const principalId = this.principalIdentities[0]?.contactId;
+    if (principalId) {
+      try {
+        const principal = await this.contactService.getContact(principalId);
+        if (principal) {
+          covered.push(principal.displayName);
+          if (principal.preferredName) covered.push(principal.preferredName);
+        }
+      } catch (err) {
+        this.log.warn(
+          { err },
+          'outbound-gateway: principal name lookup failed — identity gate using startup names only',
+        );
+      }
+    }
+
+    try {
+      for (const recipient of this.projectRecipients(request)) {
+        covered.push(...emailLocalNameTokens(recipient.identifier));
+        const contact = await this.contactService.resolveByChannelIdentity(request.channel, recipient.identifier);
+        if (contact?.displayName) covered.push(contact.displayName);
+      }
+    } catch (err) {
+      this.log.warn(
+        { err, channel: request.channel },
+        'outbound-gateway: recipient name lookup failed — identity gate continuing without recipient names',
+      );
+    }
+
+    // Subject is hedges-only. A Title Case subject must not block a clean body.
+    return describeUnresolvedIdentity(
+      request.channel === 'email'
+        ? { body: request.body, subject: request.subject }
+        : { body: request.message },
+      covered,
     );
   }
 
   /**
-   * Check whether a Signal identifier (E.164 phone) belongs to the principal.
-   * Matches against the principal's verified SIGNAL channel identities — the email
-   * matcher (isPrincipalEmail) must NOT be used for Signal, or a 1:1 principal Signal
-   * reply would be mis-tagged as a third party and lose its private-channel skip.
+   * Channel-parameterized principal identity check. Must pass the channel that
+   * owns the identifier (email matcher must NOT be used for Signal/Slack).
    */
-  private isPrincipalSignal(identifier: string | undefined | null): boolean {
-    if (!identifier || this.principalIdentities.length === 0) return false;
-    return this.principalIdentities.some(
-      (id) => id.channel === 'signal' && id.channelIdentifier === identifier,
-    );
+  private isPrincipalOnChannel(
+    channel: string,
+    identifier: string | undefined | null,
+  ): boolean {
+    return isPrincipalIdentity(channel, identifier, this.principalIdentities);
   }
 
   /**
    * Build the structural recipient set for the content filter's Stage 2 judge.
-   * `isPrincipal` is computed from the principal's verified channel identities —
-   * channel-aware (email matcher for email, Signal matcher for Signal) — NOT the
-   * free-text contact role.
-   *
-   * For email: To + CC merged, in order. For Signal: the single recipient (matched
-   * via the principal's Signal identity) or a groupId (never a sole-principal channel,
-   * since a group carries other members, so isPrincipal is false there).
+   * Recipients come from `projectRecipients`; `isPrincipal` requires both
+   * principalEligible and a verified identity match on that channel.
    */
   private buildFilterRecipients(request: OutboundSendRequest): {
     recipients: FilterRecipient[];
     principalIncluded: boolean;
     principalIsSoleRecipient: boolean;
   } {
-    let tagged: FilterRecipient[];
-    if (request.channel === 'email') {
-      const emails = [request.to, ...(request.cc ?? [])];
-      tagged = emails
-        .filter((e) => e.length > 0)
-        .map((email) => ({ email, isPrincipal: this.isPrincipalEmail(email) }));
-    } else {
-      // Signal: tag via the principal's verified Signal identity. A groupId is never
-      // the principal's private channel, so it is always a non-principal recipient.
-      const identifier = request.recipient ?? request.groupId ?? '';
-      const isPrincipal = request.recipient ? this.isPrincipalSignal(request.recipient) : false;
-      tagged = identifier.length > 0 ? [{ email: identifier, isPrincipal }] : [];
-    }
+    const tagged: FilterRecipient[] = this.projectRecipients(request).map((r) => ({
+      email: r.identifier,
+      isPrincipal:
+        r.principalEligible
+        && this.isPrincipalOnChannel(request.channel, r.identifier),
+    }));
     return this.finalizeRecipientSet(tagged);
   }
 
   /**
    * Build the structural recipient set from a flat list of recipient emails.
-   * `isPrincipal` is from the principal's verified email identities (isPrincipalEmail),
-   * never the contact role. Used by the email draft-send path (drafts are email-only).
+   * `isPrincipal` is from the principal's verified email identities
+   * (`isPrincipalIdentity('email', …)`), never the contact role. Used by the
+   * email draft-send path (drafts are email-only).
    */
   private buildRecipientSet(emails: string[]): {
     recipients: FilterRecipient[];
@@ -977,7 +3107,7 @@ export class OutboundGateway {
   } {
     const tagged: FilterRecipient[] = emails
       .filter((e) => e.length > 0)
-      .map((email) => ({ email, isPrincipal: this.isPrincipalEmail(email) }));
+      .map((email) => ({ email, isPrincipal: this.isPrincipalOnChannel('email', email) }));
     return this.finalizeRecipientSet(tagged);
   }
 
@@ -987,38 +3117,147 @@ export class OutboundGateway {
    * To/CC/BCC counts once — otherwise a principal listed twice (e.g. To + CC) would
    * make `principalIsSoleRecipient` false and the judge would run on an effectively
    * single-recipient principal-only send. `principalIsSoleRecipient` is true ONLY when
-   * exactly one (deduped) recipient remains and it is the principal.
+   * every recipient is a verified principal identity (#2312).
    */
   private finalizeRecipientSet(tagged: FilterRecipient[]): {
     recipients: FilterRecipient[];
     principalIncluded: boolean;
     principalIsSoleRecipient: boolean;
   } {
+    // Curia's own mailboxes and Signal number are not an audience: a status email addressed to
+    // Curia with the principal on CC is a principal-only message, not a send to a third party.
+    const ownAddresses = new Set([
+      ...[...this.emailAccountAddresses.values()].map((a) => a.toLowerCase()),
+      ...(this.signalPhoneNumber ? [this.signalPhoneNumber.toLowerCase()] : []),
+    ]);
     const seen = new Set<string>();
     const recipients: FilterRecipient[] = [];
     for (const r of tagged) {
       const key = r.email.toLowerCase();
+      if (ownAddresses.has(key)) continue;
       if (seen.has(key)) continue;
       seen.add(key);
       recipients.push(r);
     }
     const principalIncluded = recipients.some((r) => r.isPrincipal);
-    const principalIsSoleRecipient = recipients.length === 1 && recipients[0]!.isPrincipal;
+    const principalIsSoleRecipient = computePrincipalIsSoleRecipient(
+      recipients.map((r) => ({ identifier: r.email, isPrincipal: r.isPrincipal })),
+    );
     return { recipients, principalIncluded, principalIsSoleRecipient };
+  }
+
+  /**
+   * True when an `email_participant` opt-in may verify this address (#2071).
+   * A taken identifier or a candidate (near-miss address, same or similar name)
+   * withholds verification. A lookup error withholds it too. The send already
+   * happened, so this never throws.
+   */
+  private async replyProvenanceClearsDuplicates(
+    recipientId: string,
+    displayName: string | undefined,
+    excludeContactId?: string,
+  ): Promise<boolean> {
+    try {
+      const dup = await this.contactService.findLikelyDuplicates({
+        ...(displayName ? { displayName } : {}),
+        identities: [{ channel: 'email', identifier: recipientId }],
+        ...(excludeContactId ? { excludeContactId } : {}),
+      });
+      if (dup.taken.length > 0 || dup.candidates.length > 0) {
+        this.log.info(
+          {
+            recipientId: redactId(recipientId),
+            taken: dup.taken.length,
+            candidates: dup.candidates.length,
+          },
+          'outbound-gateway: reply provenance withheld — address or name matches another contact',
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      this.log.warn(
+        { err, recipientId: redactId(recipientId) },
+        'outbound-gateway: duplicate check failed — recording the recipient unverified',
+      );
+      return false;
+    }
+  }
+
+  /**
+   * A later authenticated reply verifies an existing unverified `outbound_recipient`
+   * identity in place and keeps that source (#2071). Other sources stay as they are.
+   * Blocked contacts are not passed here.
+   */
+  private async verifyExistingReplyRecipient(
+    contactId: string,
+    channel: string,
+    recipientId: string,
+    displayName: string | undefined,
+  ): Promise<void> {
+    if (channel !== 'email') return;
+    let identities: ChannelIdentity[];
+    try {
+      identities = await this.contactService.getIdentitiesForContact(contactId);
+    } catch (err) {
+      this.log.warn(
+        { err, contactId, recipientId: redactId(recipientId) },
+        'outbound-gateway: could not load identities to verify a reply recipient',
+      );
+      return;
+    }
+    const needle = recipientId.toLowerCase();
+    const identity = identities.find((row) =>
+      row.channel === channel
+      && row.channelIdentifier.toLowerCase() === needle
+      && row.source === 'outbound_recipient'
+      && row.status === 'active'
+      && !row.verified,
+    );
+    if (!identity) return;
+    const clear = await this.replyProvenanceClearsDuplicates(recipientId, displayName, contactId);
+    if (!clear) return;
+    try {
+      await this.contactService.verifyIdentity(identity.id);
+      this.log.info(
+        { contactId, identityId: identity.id, recipientId: redactId(recipientId) },
+        'outbound-gateway: verified existing outbound_recipient identity from an authenticated reply',
+      );
+    } catch (err) {
+      this.log.warn(
+        { err, contactId, identityId: identity.id },
+        'outbound-gateway: verifyIdentity failed after an authenticated reply — identity stays unverified',
+      );
+    }
   }
 
   /**
    * After a successful outbound send, ensure the recipient has a confirmed contact record.
    *
    * - If the contact exists and is provisional: promote to confirmed.
-   * - If no contact record exists: create one with status confirmed, using the
-   *   channel identifier as a placeholder display name (enrichment happens later).
-   * - If the contact is already confirmed or blocked: no-op.
+   * - If no contact record exists: create one at tier known, using the channel
+   *   identifier as a placeholder display name (enrichment happens later).
+   *   Provenance defaults to `outbound_recipient` (unverified). `email_participant`
+   *   is recorded only when the caller opted in and the duplicate check is clear
+   *   (#2033, #2040, #2071, ADR-047).
+   * - An existing unverified `outbound_recipient` identity is verified in place
+   *   when the caller opted in and the same check is clear. The source stays.
+   * - If the contact is already confirmed or blocked: no tier change. Blocked
+   *   contacts are not verified.
    *
    * Fail-open: the message was already sent, so a DB error here must not surface
    * as a send failure. Log at warn so anomalies are visible without alarming callers.
    */
-  private async promoteOrCreateRecipientContact(channel: string, recipientId: string): Promise<void> {
+  private async promoteOrCreateRecipientContact(
+    channel: string,
+    recipientId: string,
+    recipientSource?: EmailRecipientSource,
+    recipientDisplayName?: string,
+  ): Promise<void> {
+    // Callers and the queue read already narrowed this to the one opt-in or
+    // undefined. Undefined is the unverified default (#2071).
+    let source: EmailRecipientSource = recipientSource ?? 'outbound_recipient';
+    const displayName = recipientDisplayName?.trim() || undefined;
     let contact;
     try {
       contact = await this.contactService.resolveByChannelIdentity(channel, recipientId);
@@ -1033,17 +3272,31 @@ export class OutboundGateway {
     if (contact === null) {
       // No contact record yet — create one so replies from this person are not held.
       // displayName defaults to the identifier (e.g. email address) as a placeholder
-      // until the contact is enriched or the CEO assigns a proper name.
+      // until the contact is enriched or the principal assigns a proper name.
+      // A likely duplicate, or a duplicate check that itself fails, withholds
+      // verification: the contact is still created, as unverified outbound_recipient.
+      if (source === 'email_participant') {
+        const clear = await this.replyProvenanceClearsDuplicates(recipientId, displayName);
+        if (!clear) source = 'outbound_recipient';
+      }
       let created;
       try {
-        // Explicit tier: the outbound recipient (someone the CEO is emailing) is
-        // CEO-trusted — equivalent to the former status='confirmed'→tier='known' path.
-        // Set tier='known' explicitly so this intent survives Task 5, which removes
-        // createContact's internal status default (#955).
+        // Source is the caller's provenance, never ceo_stated (#2033). ceo_stated
+        // made an invented address look principal-confirmed (the 2026-10-07 contact).
+        // email_participant is only set when the caller opted in and the duplicate
+        // check above was clear (#2071). Every other caller stays outbound_recipient.
+        //
+        // Tier: known (#2040, ADR-047). Send skills address recipients by contact
+        // ID (#2041), so this branch runs only for send-draft, which needs a
+        // principal-originated task, and for email-reply, whose To is the From of
+        // the message being answered. Neither address was typed by an agent. The
+        // unknown-tier branch below promotes an existing contact on send, so a
+        // new one is treated the same. At 'unknown', Gate C would escalate every
+        // external send a reply led to, a relay to the principal included.
         created = await this.contactService.createContact({
           displayName: recipientId,
           fallbackDisplayName: recipientId,
-          source: 'ceo_stated',
+          source,
           tier: 'known',
         });
       } catch (err) {
@@ -1055,15 +3308,23 @@ export class OutboundGateway {
       }
 
       try {
+        // outbound_recipient is not auto-verified, so that identity lands
+        // unverified and a later send by contact ID fails closed until the
+        // principal verifies it, an agent re-states it (#2041), or a later
+        // authenticated reply verifies it in place (#2071). An inbound reply
+        // does not verify it (#2040). email_participant is auto-verified, and
+        // this path uses it only after the duplicate check.
         await this.contactService.linkIdentity({
           contactId: created.id,
           channel,
           channelIdentifier: recipientId,
-          source: 'ceo_stated',
+          source,
         });
         this.log.info(
-          { channel, recipientId: redactId(recipientId), contactId: created.id },
-          'outbound-gateway: created confirmed contact for outbound recipient',
+          { channel, recipientId: redactId(recipientId), contactId: created.id, source },
+          source === 'email_participant'
+            ? 'outbound-gateway: created known-tier contact (verified email_participant) for reply recipient'
+            : 'outbound-gateway: created known-tier contact (unverified identity) for first-time outbound recipient',
         );
       } catch (err) {
         // createContact committed but linkIdentity failed — the contact exists with no
@@ -1104,9 +3365,13 @@ export class OutboundGateway {
       return;
     }
 
+    if (source === 'email_participant') {
+      await this.verifyExistingReplyRecipient(contact.contactId, channel, recipientId, displayName);
+    }
+
     if (contact.tier === 'unknown') {
       // tier='unknown' == old status='provisional'. The outbound send implicitly confirms
-      // this contact — we know the CEO's system is reaching out to them, so they're trusted
+      // this contact — we know the principal's system is reaching out to them, so they're trusted
       // enough to receive replies. Promote unknown → known via elevateTierToKnown, which
       // is a no-op for already-higher tiers (so a trusted contact is never downgraded) and
       // is non-throwing (returns false on error). Uses tier for the gate check (issue #945).
@@ -1160,6 +3425,35 @@ export class OutboundGateway {
   }
 
   /**
+   * True when `accountId` (the primary account when omitted) is a mailbox whose own
+   * address is one of the principal's verified email identities. The principal's mailbox
+   * belongs to ceo-inbox, so the coordinator does not draft in it (prompt trim PR 6).
+   */
+  isPrincipalMailbox(accountId?: string): boolean {
+    // Blank selects the primary account, as getNylasClient() does.
+    const name = accountId || this.nylasClients.keys().next().value;
+    if (name === undefined) return false;
+    const address = this.emailAccountAddresses.get(name);
+    return address !== undefined && this.isPrincipalOnChannel('email', address);
+  }
+
+  /**
+   * Reject a mailbox name that is not configured, without fetching a message.
+   *
+   * Gate C skips recipient resolution when both policy axes already escalate
+   * (unknown/blocked tier). A misspelled `account` must still surface as
+   * `UnknownEmailAccountError` instead of a generic approval (#1832).
+   * No clients configured is a different failure (`getEmailMessage` throws
+   * "no nylasClient is configured") and is left to that path.
+   */
+  requireKnownEmailAccount(accountId: string): void {
+    if (this.nylasClients.size === 0) return;
+    if (!this.nylasClients.has(accountId)) {
+      throw new UnknownEmailAccountError(accountId, this.listAccountIds());
+    }
+  }
+
+  /**
    * Fetch a single email message by its Nylas message ID.
    * Read-only — no security filtering applied.
    *
@@ -1169,9 +3463,15 @@ export class OutboundGateway {
   async getEmailMessage(messageId: string, accountId?: string): Promise<NylasMessage> {
     const client = this.getNylasClient(accountId);
     if (!client) {
+      if (accountId && this.nylasClients.size > 0) {
+        throw new UnknownEmailAccountError(accountId, this.listAccountIds());
+      }
       throw new Error('outbound-gateway: getEmailMessage called but no nylasClient is configured');
     }
-    return client.getMessage(messageId);
+    // Always request headers. Gate C and email-reply share one cached getEmailMessage,
+    // and that cache drops any extra argument, so a header-less fetch first would hide
+    // Authentication-Results from the reply provenance check (#2071).
+    return client.getMessage(messageId, { includeHeaders: true });
   }
 
   /**
@@ -1204,9 +3504,29 @@ export class OutboundGateway {
   async listEmailMessages(options?: ListMessagesOptions, accountId?: string): Promise<NylasMessage[]> {
     const client = this.getNylasClient(accountId);
     if (!client) {
+      // Same split as getEmailMessage: a misspelled mailbox name is named, with the
+      // configured ones, so email-get-thread can tell the model what to fix (#1957).
+      if (accountId && this.nylasClients.size > 0) {
+        throw new UnknownEmailAccountError(accountId, this.listAccountIds());
+      }
       throw new Error('outbound-gateway: listEmailMessages called but no nylasClient is configured');
     }
     return client.listMessages(options);
+  }
+
+  /**
+   * Fetch one draft by ID from a configured account, or null when that account has
+   * no such draft. Read-only — no security filtering applied.
+   */
+  async getEmailDraft(draftId: string, accountId?: string): Promise<NylasMessage | null> {
+    const client = this.getNylasClient(accountId);
+    if (!client) {
+      if (accountId && this.nylasClients.size > 0) {
+        throw new UnknownEmailAccountError(accountId, this.listAccountIds());
+      }
+      throw new Error('outbound-gateway: getEmailDraft called but no nylasClient is configured');
+    }
+    return client.getDraft(draftId);
   }
 
   /**
@@ -1218,12 +3538,9 @@ export class OutboundGateway {
    * mailbox until explicitly sent). The reply goes through the full pipeline when the
    * draft is eventually approved and sent.
    *
-   * Drafts are created silently — no notification is sent. The CEO discovers them
+   * Drafts are created silently — no notification is sent. The principal discovers them
    * through the end-of-day Signal digest (see the scheduled digest job) or by checking
    * their Drafts folder directly.
-   *
-   * TODO(#278): approval interface and send-on-approval remain deferred — see issue for
-   * future options (CLI command, Signal reply, webhook).
    */
   async createEmailDraft(request: EmailSendRequest): Promise<OutboundDraftResult> {
     const recipientId = request.to;
@@ -1252,7 +3569,69 @@ export class OutboundGateway {
       return { success: false, blockedReason: 'Contact resolution failed; draft not created' };
     }
 
-    return this.dispatchEmailDraft(request);
+    // The rest of the envelope (#2273), fail-closed for the same reason as above.
+    const blockedOther = await this.findBlockedRecipient(
+      'email',
+      [...(request.additionalTo ?? []), ...(request.cc ?? [])],
+      { failClosed: true },
+    );
+    if (blockedOther?.kind === 'blocked') {
+      this.log.warn(
+        { channel: 'email', recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
+        'outbound-gateway: draft blocked — a recipient is blocked',
+      );
+      return { success: false, blockedReason: 'Recipient is blocked' };
+    }
+    if (blockedOther?.kind === 'lookup-failed') {
+      return { success: false, blockedReason: 'Contact resolution failed; draft not created' };
+    }
+
+    const toDraft: EmailSendRequest = { ...request };
+    // A draft is sent as written, and an approved replay of it is not scanned again (#2312). A
+    // quote that reaches someone who was not on the quoted message, with personal details in it,
+    // has had no review the principal saw: the draft is saved without it.
+    if (toDraft.htmlQuote && await this.quoteNeedsReview(toDraft)) {
+      this.log.info('outbound-gateway: draft saved without its quoted message — the quote has personal details and reaches someone who was not on it');
+      delete toDraft.htmlQuote;
+      delete toDraft.quoteParticipants;
+    }
+    this.signEmail(toDraft, false);
+    return this.dispatchEmailDraft(toDraft);
+  }
+
+  /**
+   * Whether an email's quote carries personal details to someone who was not on the quoted
+   * message (#2312), as send() would review them. A redactor error counts as yes (fail closed).
+   */
+  private async quoteNeedsReview(request: EmailSendRequest): Promise<boolean> {
+    if (!request.htmlQuote || !this.piiRedactor) return false;
+    const { recipients, principalIsSoleRecipient } = this.buildFilterRecipients(request);
+    if (await this.quoteIsExempt(request, recipients)) return false;
+    try {
+      return this.piiRedactor.detect(request.htmlQuote, 'email', { recipientId: request.to, principalIsSoleRecipient }).length > 0;
+    } catch (err) {
+      this.log.warn({ err }, 'outbound-gateway: PII redactor threw scanning a quote — leaving the quote out');
+      return true;
+    }
+  }
+
+  /**
+   * Signs an email the gateway is about to send or draft: sets its signature and drops
+   * the sign-off the model wrote at the end of the body, so the configured signature is
+   * the only one (#2138). Not on system notifications (alerts and principal notes, which
+   * the assistant does not write as a letter), not from the principal's own mailbox (it
+   * would sign as the assistant in the principal's name), and not twice when the body is
+   * nothing but the signature.
+   */
+  private signEmail(request: EmailSendRequest, isSystemNotification: boolean): void {
+    delete request.signature;
+    if (isSystemNotification) return;
+    if (this.isPrincipalMailbox(request.accountId)) return;
+    const signature = emailSignatureText(this.agentPersona);
+    if (!signature || !this.agentPersona) return;
+    request.body = stripModelSignOff(request.body, this.agentPersona, signature);
+    if (bodyEndsWithSignature(request.body, signature)) return;
+    request.signature = signature;
   }
 
   /**
@@ -1263,73 +3642,99 @@ export class OutboundGateway {
    * CC, BCC recipients) and removing the draft from DRAFTS after delivery.
    *
    * Safety pipeline:
-   *   0. Autonomy gate — skipped when options.humanApproved is true (CEO in the loop)
+   *   0. Autonomy gate — skipped when options.humanApproved is true (principal in the loop)
    *   1. Blocked-contact check on the primary To recipient
-   *   2. Content filter on the draft body
+   *   1.5 PII detection on the body and subject (#2312)
+   *   2. Content filter on the redacted copy of the draft body
+   *   2.5 Band review
    *   3. Nylas drafts.send() dispatch — sends the actual draft, not a reconstructed copy
    *   4. Recipient contact promotion (provisional → confirmed)
    *
-   * Note: PII redaction is not applied here. The draft was created by Curia
-   * (content passed through our pipeline at creation time) or authored directly
-   * by the CEO. Sending the stored draft as-is is intentional.
+   * A stored draft is sent as written: it cannot be redacted in place (#2312). Under band
+   * gating the review rules on each detected detail, and anything but a send holds the draft.
+   * Under tier gating a draft with details the channel does not allow is refused, unless
+   * the send is principal-directed.
    *
    * @param draftId        Nylas draft ID to send
    * @param accountId      Which named account to use. Defaults to the primary account.
    * @param draftMeta      Draft content for safety checks — caller must pre-fetch the draft.
-   * @param options        humanApproved: true skips Step 0 only (CEO in the loop).
+   * @param options        humanApproved: true skips Step 0 only (principal in the loop).
+   *                       principalDirected: true lifts the Stage 2.5 disclosure gate only,
+   *                       as in send() (#1870).
+   *                       principalApproved: true when the principal approved this draft as
+   *                       written: no PII detection, sent intact (#2312).
    */
   async sendEmailDraft(
     draftId: string,
     accountId: string | undefined,
     draftMeta: { recipientEmail: string; body: string; subject: string; allRecipients?: string[] },
-    options?: { humanApproved?: boolean; conversationId?: string; taskEventId?: string; parentEventId?: string },
+    options?: {
+      humanApproved?: boolean;
+      principalDirected?: boolean;
+      /** The principal approved this draft as written (an approval replay): sent intact (#2312). */
+      principalApproved?: boolean;
+      conversationId?: string;
+      taskEventId?: string;
+      parentEventId?: string;
+      /** What to replay on approval if band review holds this draft (#2159). */
+      holdRecipe?: SendRecipe;
+    },
   ): Promise<OutboundSendResult> {
     // ------------------------------------------------------------------
     // Step 0: Autonomy gate
     // ------------------------------------------------------------------
+    // One read per draft send (#2312): this gate, the gating and the band review's score share it.
+    const autonomy = await this.readAutonomy();
     if (this.autonomyService && options?.humanApproved) {
       this.log.info(
         { draftId },
-        'outbound-gateway: autonomy gate skipped — humanApproved flag set (CEO-authorized draft send, see ADR-017)',
+        'outbound-gateway: autonomy gate skipped — humanApproved flag set (principal-authorized draft send, see ADR-017)',
       );
-    } else if (this.autonomyService && this.isPrincipalEmail(draftMeta.recipientEmail)) {
-      // Agent-to-principal: principal-bound draft sends bypass the autonomy gate.
-      // Same rationale as the send() principal bypass — see isPrincipalRecipient() comment.
+    } else if (
+      this.autonomyService
+      && this.buildRecipientSet(
+        draftMeta.allRecipients && draftMeta.allRecipients.length > 0
+          ? draftMeta.allRecipients
+          : [draftMeta.recipientEmail],
+      ).principalIsSoleRecipient
+    ) {
+      // Agent-to-principal: a draft whose only recipient is the principal bypasses
+      // the autonomy gate. Same rationale as the send() principal bypass — see
+      // isPrincipalRecipient() comment.
       this.log.info(
         { draftId, channel: 'email' },
         'outbound-gateway: autonomy gate skipped — draft recipient is principal (agent-to-principal communication)',
       );
     } else if (this.autonomyService) {
-      try {
-        const autonomyConfig = await this.autonomyService.getConfig();
-        const sendThreshold = AutonomyService.minScoreForActionRisk('medium');
-        if (autonomyConfig !== null && autonomyConfig.score < sendThreshold) {
-          this.log.info(
-            { draftId, currentScore: autonomyConfig.score, sendThreshold },
-            `outbound-gateway: draft send blocked by autonomy gate — score < ${sendThreshold}`,
-          );
-          this.bus.publish('dispatch', createAutonomySendBlocked({
-            channel: 'email',
-            currentScore: autonomyConfig.score,
-            requiredScore: sendThreshold,
-          })).catch((err) => {
-            this.log.warn(
-              { err, draftId },
-              'outbound-gateway: failed to publish autonomy.send_blocked event',
-            );
-          });
-          return {
-            success: false,
-            blockedReason:
-              `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
-              `Use createEmailDraft() for drafts, or ask the CEO to raise the score with set-autonomy.`,
-          };
-        }
-      } catch (err) {
+      if (autonomy.failed) {
         this.log.warn(
-          { err, draftId },
+          { err: autonomy.error, draftId },
           'outbound-gateway: autonomy gate failed to read config — proceeding without gate (fail-open)',
         );
+      }
+      const autonomyConfig = autonomy.config;
+      const sendThreshold = AutonomyService.minScoreForActionRisk('medium');
+      if (autonomyConfig !== null && autonomyConfig.score < sendThreshold) {
+        this.log.info(
+          { draftId, currentScore: autonomyConfig.score, sendThreshold },
+          `outbound-gateway: draft send blocked by autonomy gate — score < ${sendThreshold}`,
+        );
+        this.bus.publish('dispatch', createAutonomySendBlocked({
+          channel: 'email',
+          currentScore: autonomyConfig.score,
+          requiredScore: sendThreshold,
+        }, options?.parentEventId)).catch((err) => {
+          this.log.warn(
+            { err, draftId },
+            'outbound-gateway: failed to publish autonomy.send_blocked event',
+          );
+        });
+        return {
+          success: false,
+          blockedReason:
+            `Autonomy score is ${autonomyConfig.score} — direct sends require a score of at least ${sendThreshold}. ` +
+            `Use createEmailDraft() for drafts, or ask the principal to raise the score with set-autonomy.`,
+        };
       }
     }
 
@@ -1339,7 +3744,10 @@ export class OutboundGateway {
     // Step 1: Blocked-contact check
     // ------------------------------------------------------------------
     let recipientTierForDraft: ContactTier = 'unknown';
+    let recipientTierUnresolvedForDraft = false;
     let recipientContactIdForDraft: string | undefined;
+    let recipientVerifiedForDraft = false;
+    let recipientNameForDraft: string | undefined;
     try {
       const contact = await this.contactService.resolveByChannelIdentity('email', recipientEmail);
       if (contact !== null) {
@@ -1353,24 +3761,55 @@ export class OutboundGateway {
         }
         recipientTierForDraft = contact.tier;
         recipientContactIdForDraft = contact.contactId; // hoisted for outbound.delivered audit
+        recipientVerifiedForDraft = contact.verified === true;
+        recipientNameForDraft = contact.displayName;
       }
     } catch (err) {
       // Fail-open on DB errors — log at warn so anomalies are visible, but don't
-      // silently block a CEO-authorized send due to a transient infrastructure error.
+      // silently block a principal-authorized send due to a transient infrastructure error.
+      recipientTierUnresolvedForDraft = true;
       this.log.warn(
         { err, draftId, recipientId: redactId(recipientEmail) },
         'outbound-gateway: contact resolution failed, proceeding without blocked check',
       );
     }
 
-    // ------------------------------------------------------------------
-    // Step 2: Content filter
-    // ------------------------------------------------------------------
-    // Run on the draft body. The draft is sent as-is by Nylas (PII redaction is not
-    // applied — see method doc), but we still run the content filter to catch any
-    // flagged patterns before committing to sending. Fail-closed on filter crash.
-    let filterPassed = false;
-    let filterFindings: Array<{ rule: string; detail: string }> = [];
+    // The rest of the draft's envelope (#2273). Fail-open, as above.
+    const draftOthers = (draftMeta.allRecipients ?? [])
+      .filter((r) => r.toLowerCase() !== recipientEmail.toLowerCase());
+    // Every resolved person recipient's tier, for the band review's ask (#2312).
+    const draftTiers: Record<string, ContactTier> = {};
+    const draftContactIds: Record<string, string> = {};
+    if (recipientContactIdForDraft !== undefined) {
+      draftTiers[normalizeCounterparty(recipientEmail)] = recipientTierForDraft;
+      if (recipientVerifiedForDraft) draftContactIds[normalizeCounterparty(recipientEmail)] = recipientContactIdForDraft;
+    }
+    const blockedOther = await this.findBlockedRecipient('email', draftOthers, { failClosed: false, tiers: draftTiers, contactIds: draftContactIds });
+    if (blockedOther?.kind === 'blocked') {
+      this.log.warn(
+        { draftId, recipientId: redactId(blockedOther.identifier), contactId: blockedOther.contactId },
+        'outbound-gateway: draft send blocked — a recipient is blocked',
+      );
+      return { success: false, blockedReason: 'Recipient is blocked' };
+    }
+
+    // After Step 1, same rule as send() (#1818). A draft that leaves the
+    // mailbox is an external message; humanApproved skips the gate. The rest
+    // of the envelope rides as CC so a principal on To does not skip the gate
+    // for everyone else (#2273).
+    const identityBlock = await this.blockForUnresolvedIdentity({
+      request: {
+        channel: 'email',
+        to: recipientEmail,
+        ...(draftOthers.length > 0 ? { cc: draftOthers } : {}),
+        subject: draftMeta.subject,
+        body,
+      },
+      messageBody: body,
+      recipientId: recipientEmail,
+      options,
+      draftId,
+    });
 
     // Build the audience set from the draft's full envelope (To + CC + BCC) so a draft
     // addressed To: principal with a CC'd/BCC'd third party still runs the judge.
@@ -1378,18 +3817,95 @@ export class OutboundGateway {
     const draftEnvelope = (draftMeta.allRecipients && draftMeta.allRecipients.length > 0)
       ? draftMeta.allRecipients
       : [recipientEmail];
+
+    if (identityBlock) {
+      return this.withUnmatchedRecipientNote(
+        identityBlock,
+        await this.findUnmatchedRecipients('email', draftEnvelope),
+      );
+    }
+
     const { recipients: draftRecipients, principalIncluded: draftPrincipalIncluded, principalIsSoleRecipient: draftPrincipalSole } = this.buildRecipientSet(draftEnvelope);
+    const draftRequest: EmailSendRequest = {
+      channel: 'email',
+      to: recipientEmail,
+      subject: draftMeta.subject,
+      body,
+      ...(draftEnvelope.length > 1 ? { cc: draftEnvelope.filter((r) => r !== recipientEmail) } : {}),
+    };
+
+    // ------------------------------------------------------------------
+    // Step 1.5: PII detection (#2312)
+    // ------------------------------------------------------------------
+    // A stored draft is sent as written: it cannot be redacted in place. So its personal data
+    // is detected here and either authorized by the band review or the draft is not sent.
+    // Skipped for a draft the principal approved (they saw it as written) and for the
+    // principal alone (the redactor's own bypass). Fail-closed if the redactor throws.
+    const detectedItems: BriefDetectedItem[] = [];
+    // What the content filter and the audit events see: never the raw values.
+    let redactedBody = body;
+    let redactedSubject = draftMeta.subject;
+    if (this.piiRedactor && options?.principalApproved === true) {
+      this.log.info({ draftId }, 'outbound-gateway: PII detection skipped — the principal approved this draft as written');
+      // Sent as written, but the content filter and the audit events still get redacted copies.
+      redactedBody = this.redactedCopy(body, 'email', recipientEmail);
+      if (draftMeta.subject) redactedSubject = this.redactedCopy(draftMeta.subject, 'email', recipientEmail);
+    } else if (this.piiRedactor && !draftPrincipalSole) {
+      const redactor = this.piiRedactor;
+      try {
+        const ctx = { recipientId: recipientEmail, principalIsSoleRecipient: draftPrincipalSole };
+        const bodyItems = redactor.detect(body, 'email', ctx);
+        const subjectItems = draftMeta.subject ? redactor.detect(draftMeta.subject, 'email', ctx) : [];
+        for (const [items, field] of [[bodyItems, 'body'], [subjectItems, 'subject']] as const) {
+          for (const item of items) {
+            detectedItems.push({ id: `P${detectedItems.length + 1}`, label: item.label, text: item.matched, field });
+          }
+        }
+        // audit: false — nothing is redacted on the wire, so no outbound.pii_redacted.
+        redactedBody = redactor.apply(body, bodyItems, 'email', ctx, { audit: false }).content;
+        if (draftMeta.subject) redactedSubject = redactor.apply(draftMeta.subject, subjectItems, 'email', ctx, { audit: false }).content;
+      } catch (err) {
+        return this.blockForRedactorError(err, draftRequest, body, recipientEmail, options);
+      }
+    }
+    const gating = this.currentGating(autonomy);
+    const bandReviewRuns = gating === 'band' && this.bandReview !== undefined && !draftPrincipalSole;
+    // Under tier gating a principal-directed draft (a live principal turn, or an approval
+    // replay) is sent as written: the principal is in the loop, as tier has no review to ask.
+    // Band with no review wired still refuses: band means a review decides, and none can.
+    const tierPrincipalDirected = gating === 'tier' && options?.principalDirected === true;
+    if (detectedItems.length > 0 && !bandReviewRuns && !tierPrincipalDirected) {
+      // Tier gating (or band with no review wired) would redact these, and a stored draft
+      // cannot be. Labels only, never the values.
+      const labels = [...new Set(detectedItems.map((d) => d.label))].join(', ');
+      this.log.info({ draftId, labels }, 'outbound-gateway: draft send refused — it contains personal data that cannot be redacted in place');
+      return {
+        success: false,
+        blockedReason: `Not sent: this draft contains ${labels}, which can't be sent to this recipient. Edit the draft to remove them, or ask the principal.`,
+      };
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2: Content filter
+    // ------------------------------------------------------------------
+    // Run on the redacted copy of the draft body: the draft is sent as written, but the filter
+    // never needs the raw values (#2312). Fail-closed on filter crash.
+    let filterPassed = false;
+    let filterFindings: Array<{ rule: string; detail: string }> = [];
 
     try {
       const filterResult = await this.contentFilter.check({
-        content: body,
+        content: redactedBody,
         recipientEmail,
         conversationId: '',
         channelId: 'email',
         recipientTier: recipientTierForDraft,
+        recipientTierUnresolved: recipientTierUnresolvedForDraft,
+        principalDirected: options?.principalDirected === true,
         recipients: draftRecipients,
         principalIncluded: draftPrincipalIncluded,
         principalIsSoleRecipient: draftPrincipalSole,
+        gating,
       });
       filterPassed = filterResult.passed;
       filterFindings = filterResult.findings;
@@ -1410,17 +3926,24 @@ export class OutboundGateway {
       );
 
       const blockId = `block_${randomUUID()}`;
+      // Full reason string (with detail) goes into the bus event for forensics/audit,
+      // NOT into any user-facing or notification surface.
       const fullReason = filterFindings.map((f) => `${f.rule}: ${f.detail}`).join('; ');
+      // Principal-safe reason: surfaces the judge's abstract reason but never a
+      // Stage-1 finding's (potentially sensitive) detail. See buildBlockReasonSummary
+      // for the per-rule policy. Mirrors the send() block path (#1051/#1158).
+      const reasonSummary = buildBlockReasonSummary(filterFindings);
+      const unmatched = await this.findUnmatchedRecipients('email', draftEnvelope);
 
       const blockedEvent = createOutboundBlocked({
         blockId,
-        conversationId: '',
+        conversationId: options?.conversationId ?? '',
         channelId: 'email',
-        content: body,
+        content: redactedBody,
         recipientId: recipientEmail,
         reason: fullReason,
         findings: filterFindings,
-        parentEventId: '',
+        parentEventId: options?.parentEventId ?? '',
       });
       try {
         await this.bus.publish('dispatch', blockedEvent);
@@ -1431,35 +3954,64 @@ export class OutboundGateway {
         );
       }
 
-      const principalEmailForDraftBlock = this.principalIdentities.find((id) => id.channel === 'email')?.channelIdentifier;
-      if (principalEmailForDraftBlock) {
-        await this.sendNotification(
-          {
-            notificationType: 'blocked_content',
-            ceoEmail: principalEmailForDraftBlock,
-            subject: 'Action needed — blocked draft send',
-            body: [
-              'A draft send was blocked by the content filter.',
-              '',
-              `Block ID: ${blockId}`,
-              `Draft ID: ${draftId}`,
-              `Intended recipient: ${recipientEmail}`,
-              '',
-              'Please review the audit log for details.',
-            ].join('\n'),
-            blockId,
-            originalChannel: 'email',
-            originalRecipientId: recipientEmail,
-          },
-          blockedEvent.id,
-        );
-      } else {
-        this.log.error(
-          { blockId, draftId, recipientId: redactId(recipientEmail) },
-          'outbound-gateway: principal notification skipped for blocked draft — no principal email identity configured',
-        );
-      }
-      return { success: false, blockedReason: 'Content blocked by filter' };
+      // Queued for the principal's digest, not emailed (#2159; informational since #1158).
+      await this.queueBlockReport(
+        [
+          'Email draft send blocked by the content filter. The agent was told why and may rewrite it and retry.',
+          `Reason: ${reasonSummary}`,
+          ...unmatchedRecipientNotificationLines(recipientEmail, unmatched),
+          `Draft ${draftId}; block ${blockId}; audit event ${blockedEvent.id}.`,
+        ].join('\n'),
+        options?.conversationId,
+        blockedEvent.id,
+      );
+      // Surface the principal-safe reason summary and rule name(s) to the caller so
+      // the agent's tool loop can address the root cause and retry (#1158). reasonSummary
+      // obeys buildBlockReasonSummary's per-rule contract — only an LLM-judge finding's
+      // abstract detail is included, never a Stage-1 rule's matched fragment; blockedRules
+      // carries rule names only. Mirrors the send() block path (#1051).
+      return this.withUnmatchedRecipientNote(
+        {
+          success: false,
+          blockedReason: reasonSummary,
+          blockedRules: filterFindings.map((f) => f.rule),
+        },
+        unmatched,
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2.5: Band review (#2159) — as in send().
+    // ------------------------------------------------------------------
+    // Keyed on principalDirected, not humanApproved: send-draft sets humanApproved on every
+    // call (its task-origin check is its gate), so it does not mean the principal read this
+    // draft. A live principal turn or an explicit approval did; a woken task did not. This
+    // is also when tier gating skips Stage 2.5.
+    //
+    // A principal-directed draft is still reviewed when it holds personal data (#2312): the
+    // review rules on each item, as it does for send(). Any outcome but send holds it.
+    let bandReport: BandReviewReport | undefined;
+    let bandSignals: BandReviewSignals | undefined;
+    if (bandReviewRuns && options?.principalApproved !== true && (options?.principalDirected !== true || detectedItems.length > 0)) {
+      const outcome = await this.runBandReview({
+        request: draftRequest,
+        autonomy,
+        content: body,
+        auditContent: redactedBody,
+        recipients: draftRecipients.map((r) => r.email),
+        principalRecipients: draftRecipients.filter((r) => r.isPrincipal).map((r) => r.email),
+        detectedItems,
+        recipientTier: recipientTierForDraft,
+        recipientTiers: draftTiers,
+        ...(Object.keys(draftContactIds).length > 0 ? { recipientContactIds: draftContactIds } : {}),
+        ...(recipientNameForDraft ? { requester: { id: recipientEmail, name: recipientNameForDraft } } : {}),
+        subject: draftMeta.subject,
+        options,
+        editable: false,
+      });
+      if (outcome.result) return outcome.result;
+      bandReport = outcome.report;
+      bandSignals = outcome.signals;
     }
 
     // ------------------------------------------------------------------
@@ -1470,6 +4022,16 @@ export class OutboundGateway {
       return {
         success: false,
         blockedReason: `Email client not configured for account: ${accountId ?? 'primary'}`,
+      };
+    }
+
+    // The checks above read the draft as fetched, and the send is by id after a review that can
+    // take seconds. Send only if the draft is still what was checked (#2312): an edit in the
+    // meantime gets checked again on the next send, not sent unchecked.
+    if (await this.draftChangedSinceFetch(nylasClient, draftId, draftMeta)) {
+      return {
+        success: false,
+        blockedReason: 'The draft changed while it was being checked, so it was not sent. Send it again to check the current version.',
       };
     }
 
@@ -1492,6 +4054,9 @@ export class OutboundGateway {
     // ------------------------------------------------------------------
     // Step 4: Contact promotion (same as send())
     // ------------------------------------------------------------------
+    // No toFromOwnMessage check here, on purpose: a draft send is principal-approved,
+    // and that approval is what makes its To `known` (ADR-047). It holds for the
+    // adapter's gated-fallback draft of a reply to Curia's own message too (#2273).
     await this.promoteOrCreateRecipientContact('email', recipientEmail);
 
     // Emit the audit event — sendEmailDraft() is a genuine wire send and must
@@ -1500,14 +4065,60 @@ export class OutboundGateway {
       channel: 'email',
       recipientId: recipientEmail,
       recipientContactId: recipientContactIdForDraft,
-      content: body,
+      // Never the raw values (#2312): the redacted copy, an approved draft's included.
+      content: redactedBody,
       messageId: sentMessage.id,
+      ...(sentMessage.threadId ? { threadId: sentMessage.threadId } : {}),
       conversationId: options?.conversationId,
       taskEventId: options?.taskEventId,
       parentEventId: options?.parentEventId,
+      ...(detectedItems.length > 0 ? { disclosed: detectedItems.map(({ label, field }) => ({ label, field })) } : {}),
     });
+    // Spot-check pool (#2159 Phase 3). Keyed on principalDirected, not humanApproved, for
+    // the reason given at the band review above: send-draft sets humanApproved on every call.
+    if (options?.principalDirected !== true && !draftPrincipalSole) {
+      await this.recordSentAction({
+        channel: 'email',
+        toolName: 'send-draft',
+        recipientLabel: draftEnvelope.join(', '),
+        // The redacted copy, as in send(): the draft itself when nothing was detected (#2312).
+        preview: redactedSubject || redactedBody,
+        // A draft's recipient is always an email address, so always a person.
+        recipient: { person: true, contactId: recipientContactIdForDraft, lookupFailed: recipientTierUnresolvedForDraft },
+        band: { report: bandReport, signals: bandSignals },
+        options,
+      });
+    }
+    if (bandReport) await this.publishBandReport(bandReport, options);
 
-    return { success: true, messageId: sentMessage.id };
+    // The thread, as send() returns it (#2333): one delivery contract for both.
+    return { success: true, messageId: sentMessage.id, ...(sentMessage.threadId ? { threadId: sentMessage.threadId } : {}) };
+  }
+
+  /**
+   * Whether the stored draft differs from what sendEmailDraft checked (#2312): body, subject or
+   * envelope. A draft that is gone, or a lookup that fails, counts as changed (fail closed).
+   */
+  private async draftChangedSinceFetch(
+    nylasClient: NylasClient,
+    draftId: string,
+    draftMeta: { recipientEmail: string; body: string; subject: string; allRecipients?: string[] },
+  ): Promise<boolean> {
+    let current: NylasMessage | null;
+    try {
+      current = await nylasClient.getDraft(draftId);
+    } catch (err) {
+      this.log.warn({ err, draftId }, 'outbound-gateway: draft re-read before send failed — not sending it (fail-closed)');
+      return true;
+    }
+    const envelope = (addrs: readonly string[]) => [...new Set(addrs.map((a) => a.toLowerCase()))].sort().join(',');
+    const checked = draftMeta.allRecipients && draftMeta.allRecipients.length > 0 ? draftMeta.allRecipients : [draftMeta.recipientEmail];
+    const changed = current === null
+      || current.body !== draftMeta.body
+      || current.subject !== draftMeta.subject
+      || envelope([...current.to, ...(current.cc ?? []), ...(current.bcc ?? [])].map((r) => r.email)) !== envelope(checked);
+    if (changed) this.log.warn({ draftId, gone: current === null }, 'outbound-gateway: draft changed between its checks and the send — not sending it');
+    return changed;
   }
 
   /**
@@ -1551,11 +4162,13 @@ export class OutboundGateway {
    *
    * @param messageId  Nylas message ID to archive
    * @param accountId  Named account (e.g. "joseph"). Defaults to the primary account.
+   * @param budget     The tool call's time budget; requests stop when it runs out.
    */
   async archiveEmailMessage(
     messageId: string,
     accountId?: string,
-  ): Promise<{ success: boolean; error?: string }> {
+    budget?: CallBudget,
+  ): Promise<{ success: boolean; error?: string; errorType?: ErrorType }> {
     const client = this.getNylasClient(accountId);
     if (!client) {
       return {
@@ -1565,12 +4178,12 @@ export class OutboundGateway {
     }
 
     try {
-      await client.archiveMessage(messageId);
+      await client.archiveMessage(messageId, budget);
       this.log.info({ messageId, accountId }, 'outbound-gateway: message archived');
       return { success: true };
     } catch (err) {
       this.log.error({ err, messageId, accountId }, 'outbound-gateway: archiveEmailMessage failed');
-      return { success: false, error: 'Archive failed' };
+      return { success: false, ...nylasMessageFailure(err, messageId, 'Archive failed') };
     }
   }
 
@@ -1608,7 +4221,8 @@ export class OutboundGateway {
   async markEmailAsRead(
     messageId: string,
     accountId?: string,
-  ): Promise<{ success: boolean; error?: string }> {
+    budget?: CallBudget,
+  ): Promise<{ success: boolean; error?: string; errorType?: ErrorType }> {
     const client = this.getNylasClient(accountId);
     if (!client) {
       return {
@@ -1618,12 +4232,12 @@ export class OutboundGateway {
     }
 
     try {
-      await client.markAsRead(messageId);
+      await client.markAsRead(messageId, budget);
       this.log.info({ messageId, accountId }, 'outbound-gateway: message marked as read');
       return { success: true };
     } catch (err) {
       this.log.error({ err, messageId, accountId }, 'outbound-gateway: markEmailAsRead failed');
-      return { success: false, error: 'Mark as read failed' };
+      return { success: false, ...nylasMessageFailure(err, messageId, 'Mark as read failed') };
     }
   }
 
@@ -1638,7 +4252,15 @@ export class OutboundGateway {
     messageId: string,
     labels: string[],
     accountId?: string,
-  ): Promise<{ success: boolean; applied: string[]; created: string[]; folders: string[]; error?: string }> {
+    budget?: CallBudget,
+  ): Promise<{
+    success: boolean;
+    applied: string[];
+    created: string[];
+    folders: string[];
+    error?: string;
+    errorType?: ErrorType;
+  }> {
     const client = this.getNylasClient(accountId);
     if (!client) {
       return {
@@ -1657,8 +4279,8 @@ export class OutboundGateway {
     const resolvedIds: string[] = [];
 
     try {
-      // Step 1: List existing folders to build a name → ID lookup
-      const existingFolders = await client.listFolders();
+      // Step 1: List existing folders to build a name → ID lookup (cached per grant)
+      const existingFolders = await client.listFolders(budget);
       const foldersByName = new Map<string, NylasFolder>(
         existingFolders.map((f) => [f.name.toUpperCase(), f]),
       );
@@ -1670,7 +4292,7 @@ export class OutboundGateway {
 
         if (!folder) {
           this.log.info({ label, accountId }, 'outbound-gateway: creating new label');
-          folder = await client.createFolder(label);
+          folder = await client.createFolder(label, budget);
           foldersByName.set(key, folder);
           created.push(label);
         }
@@ -1679,7 +4301,7 @@ export class OutboundGateway {
       }
 
       // Step 3: Read current message folders
-      const msg = await client.getMessage(messageId);
+      const msg = await client.getMessage(messageId, { budget });
       const currentFolders = new Set(msg.folders);
 
       // Step 4: Merge — add new folder IDs without removing existing ones
@@ -1690,7 +4312,7 @@ export class OutboundGateway {
       const mergedFolders = [...currentFolders];
 
       // Step 5: Write back the merged folder set
-      const result = await client.updateMessageFolders(messageId, mergedFolders);
+      const result = await client.updateMessageFolders(messageId, mergedFolders, budget);
       const finalFolders = result.folders.length > 0 ? result.folders : mergedFolders;
 
       this.log.info(
@@ -1701,8 +4323,53 @@ export class OutboundGateway {
       return { success: true, applied: labels, created, folders: finalFolders };
     } catch (err) {
       this.log.error({ err, messageId, labels, accountId, created }, 'outbound-gateway: labelEmailMessage failed');
-      return { success: false, applied: [], created, folders: [], error: 'Label operation failed' };
+      return { success: false, applied: [], created, folders: [], ...nylasMessageFailure(err, messageId, 'Label operation failed') };
     }
+  }
+
+  /**
+   * Delete a Nylas draft created for a held send.
+   * A named account is deleted directly; a 404 there means the draft is already gone.
+   * With no account, the draft is found across every mailbox and deleted from the
+   * one that holds it. Unknown accounts fail rather than deleting somewhere else.
+   */
+  async deleteMailboxDraft(accountId: string | undefined, draftId: string): Promise<void> {
+    await deleteHeldDraft(draftId, accountId, {
+      listAccountIds: () => this.listAccountIds(),
+      getDraft: (account, id) => this.getEmailDraft(id, account),
+      deleteDraft: async (account, id) => {
+        const client = this.getNylasClient(account);
+        if (!client) {
+          const available = [...this.nylasClients.keys()];
+          throw new Error(
+            `No mailbox for account '${account}' (available: ${available.join(', ') || 'none'})`,
+          );
+        }
+        await client.deleteDraft(id);
+      },
+    });
+  }
+
+  /**
+   * Read a held send-draft so the principal can see recipients and body before approving.
+   * Null when every searched mailbox has no such draft.
+   */
+  async readHeldDraft(
+    accountId: string | undefined,
+    draftId: string,
+  ): Promise<{ account: string; to: string; cc: string; subject: string; body: string } | null> {
+    const found = await findHeldDraft(draftId, accountId, {
+      listAccountIds: () => this.listAccountIds(),
+      getDraft: (account, id) => this.getEmailDraft(id, account),
+    });
+    if (!found) return null;
+    return {
+      account: found.account,
+      to: formatDraftAddresses(found.draft.to),
+      cc: formatDraftAddresses(found.draft.cc),
+      subject: found.draft.subject,
+      body: found.draft.body,
+    };
   }
 
   /**
@@ -1779,7 +4446,9 @@ export class OutboundGateway {
     }
 
     // htmlQuote is appended after conversion so it is not re-escaped by markdownToHtml.
-    const htmlBody = markdownToHtml(request.body) + (request.htmlQuote ?? '');
+    const htmlBody = markdownToHtml(request.body, { wrap: true })
+      + emailSignatureHtml(request.signature)
+      + (request.htmlQuote ?? '');
 
     let attachments: AttachmentContent[] | undefined;
     if (request.attachments && request.attachments.length > 0) {
@@ -1793,7 +4462,7 @@ export class OutboundGateway {
 
     try {
       const sendOptions: SendEmailOptions = {
-        to: [{ email: request.to }],
+        to: emailToAddresses(request).map((email) => ({ email })),
         cc: request.cc?.map((email) => ({ email })),
         subject: request.subject ?? '',
         body: htmlBody,
@@ -1808,7 +4477,7 @@ export class OutboundGateway {
         'outbound-gateway: draft created successfully',
       );
 
-      return { success: true, draftId: draft.id };
+      return { success: true, draftId: draft.id, draft: { subject: draft.subject, body: draft.body } };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(
@@ -1826,14 +4495,20 @@ export class OutboundGateway {
   private async dispatchEmail(request: EmailSendRequest): Promise<OutboundSendResult> {
     const nylasClient = this.getNylasClient(request.accountId);
     if (!nylasClient) {
-      return { success: false, blockedReason: 'Email client not configured' };
+      const available = [...this.nylasClients.keys()];
+      const reason = request.accountId
+        ? `unknown account '${request.accountId}'; available: [${available.join(', ')}]`
+        : 'Email client not configured';
+      return { success: false, blockedReason: reason };
     }
 
     // markdownToHtml is a pure function (no I/O, no realistic throw path).
     // Called outside the Nylas try-catch so that any future regression in the
     // converter is not silently misattributed as "Nylas send failed" in logs.
     // htmlQuote is appended after conversion so it is not re-escaped by markdownToHtml.
-    const htmlBody = markdownToHtml(request.body) + (request.htmlQuote ?? '');
+    const htmlBody = markdownToHtml(request.body, { wrap: true })
+      + emailSignatureHtml(request.signature)
+      + (request.htmlQuote ?? '');
 
     let attachments: AttachmentContent[] | undefined;
     if (request.attachments && request.attachments.length > 0) {
@@ -1847,7 +4522,7 @@ export class OutboundGateway {
 
     try {
       const sendOptions: SendEmailOptions = {
-        to: [{ email: request.to }],
+        to: emailToAddresses(request).map((email) => ({ email })),
         cc: request.cc?.map((email) => ({ email })),
         subject: request.subject ?? '',
         body: htmlBody,
@@ -1862,14 +4537,20 @@ export class OutboundGateway {
         'outbound-gateway: message sent successfully',
       );
 
-      return { success: true, messageId: sent.id };
+      return { success: true, messageId: sent.id, ...(sent.threadId ? { threadId: sent.threadId } : {}) };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.error(
         { err, channel: 'email', to: request.to },
         'outbound-gateway: Nylas send failed',
       );
-      return { success: false, blockedReason: `Send failed: ${message}` };
+      // Transient network / 408 / 429 / 5xx → queueable; classify on structured
+      // status/code first, then message text. Auth/grant/validation stay permanent.
+      const authPermanent = /401|403|invalid.?grant|unauthorized|forbidden|invalid.?token/i.test(message);
+      const queueable = !authPermanent
+        && (hasTransientErrorSignal(err)
+          || /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|HTTP 5\d\d|temporarily|socket|ECONNRESET/i.test(message));
+      return { success: false, blockedReason: `Send failed: ${message}`, queueable };
     }
   }
 
@@ -1907,8 +4588,16 @@ export class OutboundGateway {
       return { success: false, blockedReason: 'Signal send must specify exactly one of recipient or groupId, not both' };
     }
 
+    if (typeof this.signalClient.isConnected === 'function' && !this.signalClient.isConnected()) {
+      return {
+        success: false,
+        blockedReason: 'Signal RPC client not connected',
+        queueable: true,
+      };
+    }
+
     try {
-      await this.signalClient.send({
+      const messageId = await this.signalClient.send({
         account: this.signalPhoneNumber,
         // signal-cli takes recipient as an array; single-element for 1:1 sends
         recipient: request.recipient ? [request.recipient] : undefined,
@@ -1922,7 +4611,7 @@ export class OutboundGateway {
         'outbound-gateway: Signal message sent successfully',
       );
 
-      return { success: true };
+      return { success: true, messageId };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Log destination type only — phone numbers and group IDs are PII.
@@ -1930,7 +4619,106 @@ export class OutboundGateway {
         { err, channel: 'signal', destinationType: request.groupId ? 'group' : '1:1' },
         'outbound-gateway: signal-cli send failed',
       );
-      return { success: false, blockedReason: `Send failed: ${message}` };
+      const queueable = hasTransientErrorSignal(err) || /not connected|ECONNREFUSED|EPIPE|socket/i.test(message);
+      return { success: false, blockedReason: `Send failed: ${message}`, queueable };
     }
   }
+
+  /**
+   * Dispatch a send request to Slack via chat.postMessage.
+   * Converts agent markdown → Slack mrkdwn before posting.
+   */
+  private async dispatchSlack(request: SlackOutboundRequest): Promise<OutboundSendResult> {
+    if (!this.slackClient) {
+      return { success: false, blockedReason: 'Slack client not configured' };
+    }
+
+    if (!request.slackChannelId.trim()) {
+      this.log.warn({ channel: 'slack' }, 'outbound-gateway: Slack send missing slackChannelId');
+      return { success: false, blockedReason: 'Slack send requires slackChannelId' };
+    }
+
+    if (typeof this.slackClient.isConnected === 'function' && !this.slackClient.isConnected()) {
+      return {
+        success: false,
+        blockedReason: 'Slack Socket Mode not connected',
+        queueable: true,
+      };
+    }
+
+    const mrkdwn = markdownToMrkdwn(request.message);
+    const result = await this.slackClient.postMessage({
+      channel: request.slackChannelId,
+      text: mrkdwn,
+      threadTs: request.threadTs,
+    });
+
+    if (!result.ok) {
+      this.log.error(
+        { channel: 'slack', error: result.error },
+        'outbound-gateway: Slack chat.postMessage failed',
+      );
+      const err = result.error ?? 'unknown_error';
+      // `err` is Slack's structured error code — recognize its retryable codes
+      // (rate limits, 5xx-class) alongside the network strings (#1380 review).
+      const queueable = /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket|network|temporarily|rate.?limited|too_many_requests|service_unavailable|internal_error|request_timeout/i.test(err);
+      return { success: false, blockedReason: `Send failed: ${err}`, queueable };
+    }
+
+    this.log.info(
+      { channel: 'slack', hasThread: !!request.threadTs },
+      'outbound-gateway: Slack message sent successfully',
+    );
+    return { success: true, messageId: result.ts };
+  }
+
+  /**
+   * Dispatch a send request to Telnyx Messaging for SMS delivery.
+   * Carrier STOP surfaces as Telnyx error 40300 — mapped to a clear blockedReason
+   * so the agent can record a KG fact instead of retrying (no app-level ledger).
+   */
+  private async dispatchSms(request: SmsOutboundRequest): Promise<OutboundSendResult> {
+    if (!this.smsClient) {
+      return { success: false, blockedReason: 'SMS client not configured' };
+    }
+
+    if (!request.recipient.trim()) {
+      this.log.warn({ channel: 'sms' }, 'outbound-gateway: SMS send missing recipient');
+      return { success: false, blockedReason: 'SMS send requires recipient' };
+    }
+
+    try {
+      const { messageId } = await this.smsClient.sendSms({
+        to: request.recipient,
+        text: request.message,
+      });
+      this.log.info({ channel: 'sms', destinationType: '1:1' }, 'outbound-gateway: SMS sent successfully');
+      return { success: true, messageId };
+    } catch (err) {
+      if (err instanceof TelnyxSendError && err.code === TELNYX_ERROR_OPTED_OUT) {
+        // No phoneSuffix — this file's convention (see dispatchSignal) keeps
+        // recipient number fragments out of the log stream.
+        this.log.info(
+          { channel: 'sms' },
+          'outbound-gateway: SMS send blocked — recipient opted out at carrier (STOP)',
+        );
+        return { success: false, blockedReason: 'recipient opted out at carrier (STOP)' };
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error({ err, channel: 'sms' }, 'outbound-gateway: Telnyx SMS send failed');
+      // Opt-out and validation stay non-queueable; network / 408 / 429 / 5xx-class
+      // failures retry — structured status/code first, then message text.
+      const queueable = !(err instanceof TelnyxSendError && err.code === TELNYX_ERROR_OPTED_OUT)
+        && (hasTransientErrorSignal(err)
+          || /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|HTTP 5\d\d|non-JSON|temporarily/i.test(message));
+      return { success: false, blockedReason: `Send failed: ${message}`, queueable };
+    }
+  }
+}
+
+function formatDraftAddresses(people: Array<{ name?: string; email: string }> | undefined): string {
+  if (!people || people.length === 0) return '';
+  return people
+    .map((person) => (person.name ? `${person.name} (${person.email})` : person.email))
+    .join(', ');
 }

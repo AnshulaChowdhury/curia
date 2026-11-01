@@ -1,0 +1,518 @@
+// handler.test.ts — unit tests for approve-action skill.
+
+import { describe, it, expect, vi } from 'vitest';
+import { ApproveActionHandler, UNSHOWN_PERSONAL_DETAILS_ERROR } from './handler.js';
+import { STALE_SEND_APPROVAL_ERROR } from '../../../../src/skills/_shared/recipient-reference.js';
+import type { ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import type { ActionLogRepo } from '../../../../src/autonomy/action-log-repo.js';
+import type { EventBus } from '../../../../src/bus/bus.js';
+import type { ExecutionLayer } from '../../../../src/skills/execution.js';
+import { createSilentLogger } from '../../../../src/logger.js';
+import type { Logger } from '../../../../src/logger.js';
+
+const PENDING_ROW = {
+  id: 10,
+  taskId: 't1',
+  conversationId: 'conv-1',
+  toolName: 'calendar-create-event',
+  actionRisk: 'high',
+  outcome: 'pending_approval' as const,
+  shortRef: 'cal-1',
+  description: 'Create calendar event: Lunch',
+  createdAt: new Date(),
+  expiresAt: new Date(Date.now() + 86_400_000),
+  payload: { title: 'Lunch with Dana' },
+  taskSummary: null,
+  competenceFlag: null,
+  commitmentFlag: null,
+  compatibility: null,
+  scoredBy: null,
+  notificationSentAt: null,
+  resolvedAt: null,
+  resolvedBy: null,
+  parentActionId: null,
+};
+
+function makeCtx(overrides?: Partial<ToolContext>): ToolContext {
+  return {
+    input: { short_ref: 'cal-1' },
+    secret: (name: string) => { throw new Error(`secret '${name}' not configured in test`); },
+    log: createSilentLogger(),
+    taskMetadata: {
+      originator: {
+        contactId: 'ceo-1',
+        systemRole: 'principal' as const,
+        channel: 'email',
+        initiatedAt: new Date().toISOString(),
+      },
+    },
+    taskEventId: 'task-1',
+    caller: { contactId: 'ceo-1', role: 'ceo', channel: 'cli' },
+    ...overrides,
+  } as ToolContext;
+}
+
+function makeMockRepo(overrides?: Partial<ActionLogRepo>): ActionLogRepo {
+  return {
+    resolvePending: vi.fn().mockResolvedValue({ found: true, row: PENDING_ROW }),
+    resolveRow: vi.fn().mockResolvedValue(true),
+    insert: vi.fn().mockResolvedValue(99),
+    ...overrides,
+  } as unknown as ActionLogRepo;
+}
+
+function makeMockBus(): EventBus {
+  return {
+    publish: vi.fn().mockResolvedValue(undefined),
+  } as unknown as EventBus;
+}
+
+function makeMockExecutionLayer(result?: ToolResult): ExecutionLayer {
+  return {
+    invoke: vi.fn().mockResolvedValue(result ?? { success: true, data: { event_id: 'evt-123' } }),
+  } as unknown as ExecutionLayer;
+}
+
+describe('ApproveActionHandler', () => {
+  // #1126: authorization is enforced solely by the execution-layer live-principal gate
+  // (covered in tests/unit/skills/execution.policy.test.ts). The handler no longer re-checks origination,
+  // so the old "rejects non-CEO callers" handler test has been removed.
+
+  it('returns error when executionLayer is missing', async () => {
+    const repo = makeMockRepo();
+    const bus = makeMockBus();
+    const handler = new ApproveActionHandler();
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo, bus, executionLayer: undefined,
+    }));
+    expect(result.success).toBe(false);
+  });
+
+  it('approves, re-executes, writes child row, publishes audit event', async () => {
+    const repo = makeMockRepo();
+    const bus = makeMockBus();
+    const execLayer = makeMockExecutionLayer();
+    const handler = new ApproveActionHandler();
+
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo, bus, executionLayer: execLayer,
+    }));
+
+    // Verify approval transition
+    expect(repo.resolveRow).toHaveBeenCalledWith(10, 'approved', 'coordinator');
+
+    // Verify re-execution
+    expect(execLayer.invoke).toHaveBeenCalledOnce();
+    const invokeArgs = (execLayer.invoke as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(invokeArgs[0]).toBe('calendar-create-event'); // toolName
+    expect(invokeArgs[1]).toEqual({ title: 'Lunch with Dana' }); // payload
+    expect(invokeArgs[3]).toMatchObject({ humanApproved: true }); // options
+
+    // Verify child row
+    expect(repo.insert).toHaveBeenCalledOnce();
+    const childRow = (repo.insert as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(childRow.parentActionId).toBe(10);
+    expect(childRow.outcome).toBe('success');
+
+    // Verify audit event — deciderId and deciderChannel must come from originator, not 'unknown'
+    expect(bus.publish).toHaveBeenCalledOnce();
+    const event = (bus.publish as ReturnType<typeof vi.fn>).mock.calls[0]![1];
+    expect(event.type).toBe('human.decision');
+    expect(event.payload.decision).toBe('approve');
+    expect(event.payload.deciderId).toBe('ceo-1');
+    expect(event.payload.deciderChannel).toBe('email');
+
+    // Verify return
+    expect(result.success).toBe(true);
+    expect((result as { data: unknown }).data).toHaveProperty('reExecutionResult');
+  });
+
+  describe('an undelivered approval carrying personal details (#2312)', () => {
+    const smsRow = {
+      ...PENDING_ROW, toolName: 'sms-send', shortRef: 'sms-1',
+      payload: { recipient: 'contact-1', message: 'Her cell is (415) 555-1234.' },
+    };
+
+    async function approve(row: typeof smsRow | typeof PENDING_ROW) {
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row }) });
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({ actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer }));
+      return { result, repo, execLayer };
+    }
+
+    it('refuses it and leaves the row pending', async () => {
+      const { result, repo, execLayer } = await approve(smsRow);
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(repo.resolveRow).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('approves and replays it once delivered', async () => {
+      const { result, repo, execLayer } = await approve({ ...smsRow, notificationSentAt: new Date() } as unknown as typeof smsRow);
+      expect(result.success).toBe(true);
+      expect(repo.resolveRow).toHaveBeenCalledWith(10, 'approved', 'coordinator');
+      expect(execLayer.invoke).toHaveBeenCalledWith('sms-send', smsRow.payload, expect.anything(), expect.objectContaining({ humanApproved: true }));
+    });
+
+    it('approves an undelivered one with no personal details', async () => {
+      const { result, execLayer } = await approve({ ...smsRow, payload: { recipient: 'contact-1', message: 'See you Thursday.' } });
+      expect(result.success).toBe(true);
+      expect(execLayer.invoke).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('writes failure child row when re-execution fails', async () => {
+    const repo = makeMockRepo();
+    const bus = makeMockBus();
+    const execLayer = makeMockExecutionLayer({ success: false, error: 'Calendar slot taken' });
+    const handler = new ApproveActionHandler();
+
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo, bus, executionLayer: execLayer,
+    }));
+
+    // Child row records the failure
+    const childRow = (repo.insert as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(childRow.outcome).toBe('failure');
+    expect(childRow.taskSummary).toBe('Calendar slot taken');
+
+    // Still returns success — the approval itself succeeded, re-execution failed
+    expect(result.success).toBe(true);
+    const data = (result as { data: unknown }).data as Record<string, unknown>;
+    expect(data.reExecutionSuccess).toBe(false);
+  });
+
+  it('forwards resolvePending ambiguous error with pending list', async () => {
+    const repo = makeMockRepo({
+      resolvePending: vi.fn().mockResolvedValue({
+        found: false, reason: 'ambiguous',
+        error: 'Multiple pending requests — specify a short_ref.',
+        pending: [PENDING_ROW, { ...PENDING_ROW, id: 11, shortRef: 'email-1' }],
+      }),
+    });
+    const bus = makeMockBus();
+    const execLayer = makeMockExecutionLayer();
+    const handler = new ApproveActionHandler();
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo, bus, executionLayer: execLayer,
+    }));
+    expect(result.success).toBe(false);
+    expect(result).toHaveProperty('error', expect.stringContaining('Multiple pending'));
+  });
+
+  it('aborts re-execution when resolveRow returns false (concurrent resolve)', async () => {
+    const repo = makeMockRepo({
+      resolveRow: vi.fn().mockResolvedValue(false),
+    });
+    const bus = makeMockBus();
+    const execLayer = makeMockExecutionLayer();
+    const handler = new ApproveActionHandler();
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo, bus, executionLayer: execLayer,
+    }));
+
+    expect(result.success).toBe(false);
+    expect(result).toHaveProperty('error', expect.stringContaining('already resolved'));
+    // Critical: re-execution must NOT have fired
+    expect(execLayer.invoke).not.toHaveBeenCalled();
+    // No child row or audit event either
+    expect(repo.insert).not.toHaveBeenCalled();
+    expect(bus.publish).not.toHaveBeenCalled();
+  });
+
+  it('skips human.decision and logs error when originator contact/channel is absent', async () => {
+    // Originator passes isPrincipalOriginated but lacks contactId/channel — dispatch-layer bug.
+    // The skill should still succeed (approval happened) but must not publish a counterfeit
+    // audit row with deciderId: 'unknown'. Instead it logs an error and skips the event.
+    const repo = makeMockRepo();
+    const bus = makeMockBus();
+    const execLayer = makeMockExecutionLayer();
+    const mockLog = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const handler = new ApproveActionHandler();
+
+    const result = await handler.execute(makeCtx({
+      log: mockLog as unknown as Logger,
+      taskMetadata: {
+        // systemRole = 'principal' passes isPrincipalOriginated but contactId/channel are absent
+        originator: { systemRole: 'principal' as const, initiatedAt: new Date().toISOString() },
+      },
+      actionLogRepo: repo,
+      bus,
+      executionLayer: execLayer,
+    }));
+
+    expect(result.success).toBe(true);
+    // No audit row published — fake IDs are worse than a missing row
+    expect(bus.publish).not.toHaveBeenCalled();
+    // Error is surfaced so the dispatch-layer bug is visible in alerting
+    expect(mockLog.error).toHaveBeenCalled();
+  });
+
+  it('returns error when row has null payload', async () => {
+    const repo = makeMockRepo({
+      resolvePending: vi.fn().mockResolvedValue({
+        found: true,
+        row: { ...PENDING_ROW, payload: null },
+      }),
+    });
+    const bus = makeMockBus();
+    const execLayer = makeMockExecutionLayer();
+    const handler = new ApproveActionHandler();
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo, bus, executionLayer: execLayer,
+    }));
+    expect(result.success).toBe(false);
+    expect(result).toHaveProperty('error', expect.stringContaining('payload'));
+  });
+
+  it('does not run the skill when the pinned recipient no longer matches', async () => {
+    const pins = [{ ref: 'principal#personal', identityId: 'id-personal', identityName: 'personal' }];
+    const rejectStaleApproval = vi.fn().mockResolvedValue(true);
+    const repo = makeMockRepo({
+      resolvePending: vi.fn().mockResolvedValue({
+        found: true,
+        row: {
+          ...PENDING_ROW,
+          toolName: 'email-send',
+          payload: { to: 'principal#personal', subject: 'x', body: 'y' },
+          sendResolution: pins,
+        },
+      }),
+      rejectStaleApproval,
+    });
+    const invoke = vi.fn();
+    const confirmPinnedSendResolution = vi.fn().mockResolvedValue({ ok: false, error: STALE_SEND_APPROVAL_ERROR });
+    const execLayer = { invoke, confirmPinnedSendResolution } as unknown as ExecutionLayer;
+    const handler = new ApproveActionHandler();
+    const result = await handler.execute(makeCtx({
+      actionLogRepo: repo,
+      bus: makeMockBus(),
+      executionLayer: execLayer,
+    }));
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toBe(STALE_SEND_APPROVAL_ERROR);
+    expect(rejectStaleApproval).toHaveBeenCalledWith(10);
+    expect(repo.resolveRow).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  // #2159 Phase 3: "approve 3" passes the approval number through short_ref; resolvePending
+  // resolves it to the one live row carrying that number, and that row is what re-runs.
+  it('approves and re-executes the row numbered 3 when short_ref is "3"', async () => {
+    const numbered = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3, payload: { title: 'Board sync' } };
+    const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: numbered }) });
+    const execLayer = makeMockExecutionLayer();
+    const handler = new ApproveActionHandler();
+
+    const result = await handler.execute(makeCtx({
+      input: { short_ref: '3' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+    }));
+
+    expect(result.success).toBe(true);
+    expect(repo.resolvePending).toHaveBeenCalledWith('3');
+    expect(repo.resolveRow).toHaveBeenCalledWith(33, 'approved', 'coordinator');
+    const invokeArgs = (execLayer.invoke as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(invokeArgs[1]).toEqual({ title: 'Board sync' });
+  });
+
+  it('forwards a number that matches no live approval as an error, re-running nothing', async () => {
+    const repo = makeMockRepo({
+      resolvePending: vi.fn().mockResolvedValue({ found: false, reason: 'not_found', error: 'No approval request found with number 9' }),
+    });
+    const execLayer = makeMockExecutionLayer();
+    const result = await new ApproveActionHandler().execute(makeCtx({
+      input: { short_ref: '9' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+    }));
+    expect(result).toEqual({ success: false, error: 'No approval request found with number 9' });
+    expect(repo.resolveRow).not.toHaveBeenCalled();
+    expect(execLayer.invoke).not.toHaveBeenCalled();
+  });
+
+  // Review fix F1 (#2159 Phase 3): a model may relay "approve 3" as the JSON number 3. Reading
+  // only strings dropped it to undefined, and resolvePending(undefined) then picked the SOLE
+  // pending approval, which could be a different one. A present short_ref must never fall back.
+  describe('short_ref input handling', () => {
+    const SOLE = { ...PENDING_ROW, id: 50, shortRef: 'b5e1d9a0', approvalNumber: 5 };
+    const NUMBERED = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3 };
+    // resolvePending stand-in: no ref means "the sole pending row", '3' means approval 3.
+    function routingRepo(): ActionLogRepo {
+      return makeMockRepo({
+        resolvePending: vi.fn().mockImplementation(async (ref?: string) => {
+          if (ref === undefined) return { found: true, row: SOLE };
+          if (ref === '3') return { found: true, row: NUMBERED };
+          return { found: false, reason: 'not_found', error: `No approval request found with number ${ref}` };
+        }),
+      });
+    }
+
+    it('resolves a numeric short_ref (3) to approval 3, not the sole pending row', async () => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: 3 }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(repo.resolvePending).toHaveBeenCalledWith('3');
+      expect(repo.resolveRow).toHaveBeenCalledWith(33, 'approved', 'coordinator');
+    });
+
+    it.each([
+      ['an empty string', ''],
+      ['whitespace', '   '],
+      ['an object', {}],
+      ['a boolean', true],
+      ['a negative number', -1],
+      ['a fractional number', 2.5],
+      ['NaN', Number.NaN],
+      ['Infinity', Number.POSITIVE_INFINITY],
+    ])('fails closed on %s, resolving nothing', async (_label, shortRef) => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: shortRef }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/short_ref/);
+      expect(repo.resolvePending).not.toHaveBeenCalled();
+      expect(repo.resolveRow).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    // Q1: a reference under the wrong key must not read as "no reference" and fall back to
+    // the sole pending approval.
+    it('fails closed on a reference passed under another key, resolving nothing', async () => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { number: 3 }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain('short_ref');
+      expect(repo.resolvePending).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('falls back to the sole pending row only when short_ref is null', async () => {
+      const repo = routingRepo();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: null }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(repo.resolvePending).toHaveBeenCalledWith(undefined);
+      expect(repo.resolveRow).toHaveBeenCalledWith(50, 'approved', 'coordinator');
+    });
+  });
+
+  // Review fix F5 (#2159 Phase 3): the confirmation names the approval the way the principal saw
+  // it: "Approval 3" when the row has a number, the short_ref only for rows without one.
+  describe('confirmation label', () => {
+    it('names a numbered approval as "Approval N"', async () => {
+      const numbered = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3 };
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: numbered }) });
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: '3' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: makeMockExecutionLayer(),
+      }));
+      expect(result.success).toBe(true);
+      expect((result as { data: { approved: string } }).data.approved).toBe('Approval 3');
+    });
+
+    it('names an unnumbered approval by its reference', async () => {
+      const repo = makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...PENDING_ROW, approvalNumber: null } }) });
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: repo, bus: makeMockBus(), executionLayer: makeMockExecutionLayer(),
+      }));
+      expect(result.success).toBe(true);
+      expect((result as { data: { approved: string } }).data.approved).toBe('cal-1');
+    });
+
+    it('names a numbered approval as "Approval N" when it was already resolved', async () => {
+      const numbered = { ...PENDING_ROW, id: 33, shortRef: 'a3f7c12b', approvalNumber: 3 };
+      const repo = makeMockRepo({
+        resolvePending: vi.fn().mockResolvedValue({ found: true, row: numbered }),
+        resolveRow: vi.fn().mockResolvedValue(false),
+      });
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        input: { short_ref: '3' }, actionLogRepo: repo, bus: makeMockBus(), executionLayer: makeMockExecutionLayer(),
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain('Approval 3');
+        expect(result.error).not.toContain('a3f7c12b');
+      }
+    });
+  });
+
+  // PR 5 (#2312): approving a personal-data ask records the principal's yes for the thread.
+  describe('a row carrying a personal-data ask', () => {
+    const ASK = { conversationId: 'conv-1', counterparties: ['joel@example.com'], labels: ['phone_us'], requester: 'joel@example.com' };
+    const ASK_ROW = {
+      ...PENDING_ROW, toolName: 'email-send', shortRef: 'ab12cd34', notificationSentAt: new Date(),
+      payload: { recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' },
+      disclosureAsk: ASK,
+    };
+    const recorder = () => ({ recordForApproval: vi.fn().mockResolvedValue(undefined) });
+
+    it('records the yes, then replays the stored payload intact (Review Focus 3)', async () => {
+      const disclosureDecisions = recorder();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions,
+      }));
+      expect(result.success).toBe(true);
+      expect(disclosureDecisions.recordForApproval).toHaveBeenCalledExactlyOnceWith(ASK_ROW, 'yes', 'principal_via_coordinator');
+      const invoke = vi.mocked(execLayer.invoke);
+      // Exactly the input it was held with: the ask is never part of the replayed payload.
+      expect(invoke.mock.calls[0]![1]).toEqual({ recipient_contact_id: 'c-1', subject: 'Booking', body: 'The number is 415-555-0100.' });
+      expect(invoke.mock.calls[0]![3]).toMatchObject({ humanApproved: true });
+      expect(disclosureDecisions.recordForApproval.mock.invocationCallOrder[0]!).toBeLessThan(invoke.mock.invocationCallOrder[0]!);
+    });
+
+    it('records nothing for a row without an ask', async () => {
+      const disclosureDecisions = recorder();
+      await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo(), bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions,
+      }));
+      expect(disclosureDecisions.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('records nothing when the row was resolved concurrently or never shown', async () => {
+      const raced = recorder();
+      await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }), resolveRow: vi.fn().mockResolvedValue(false) }),
+        bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions: raced,
+      }));
+      expect(raced.recordForApproval).not.toHaveBeenCalled();
+      const unshown = recorder();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null } }) }),
+        bus: makeMockBus(), executionLayer: makeMockExecutionLayer(), disclosureDecisions: unshown,
+      }));
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(unshown.recordForApproval).not.toHaveBeenCalled();
+    });
+
+    it('refuses an undelivered ask whose payload has no details yet: a yes would outlive the question', async () => {
+      const recorderNoBody = recorder();
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: { ...ASK_ROW, notificationSentAt: null, payload: { account: 'curia' } } }) }),
+        bus: makeMockBus(), executionLayer: execLayer, disclosureDecisions: recorderNoBody,
+      }));
+      expect(result).toEqual({ success: false, error: UNSHOWN_PERSONAL_DETAILS_ERROR });
+      expect(recorderNoBody.recordForApproval).not.toHaveBeenCalled();
+      expect(execLayer.invoke).not.toHaveBeenCalled();
+    });
+
+    it('still replays the approved send when the recorder is not wired', async () => {
+      const execLayer = makeMockExecutionLayer();
+      const result = await new ApproveActionHandler().execute(makeCtx({
+        actionLogRepo: makeMockRepo({ resolvePending: vi.fn().mockResolvedValue({ found: true, row: ASK_ROW }) }),
+        bus: makeMockBus(), executionLayer: execLayer,
+      }));
+      expect(result.success).toBe(true);
+      expect(execLayer.invoke).toHaveBeenCalledOnce();
+    });
+  });
+});

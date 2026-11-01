@@ -1,0 +1,25 @@
+{
+  "name": "email-download-attachment",
+  "description": "Download an email attachment. Pass filename from email-get (preferred) or the exact attachment_id. Returns EITHER temp_file_url (a file:// URL, when temp storage is available) OR content_base64 — never both. Pass content_base64 with content_type to file-parse; use temp_file_url for binary-safe Drive uploads. Enforces a 10 MB size limit.",
+  "version": "1.1.0",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "message_id": "string (Nylas message ID the attachment belongs to)",
+    "filename": "string? (attachment filename from email-get; preferred, must be unique on the message)",
+    "attachment_id": "string? (exact attachment ID; only needed when filenames repeat)",
+    "account": "string? (named account to read from, as configured under Settings → Channels → Email → Email accounts. Defaults to the primary account.)"
+  },
+  "outputs": {
+    "temp_file_url": "string | undefined (file:// URL of the downloaded bytes on disk — for binary-safe Drive uploads, pass this as create_drive_file's fileUrl param and use the `filename` field as the file_name param to preserve the original attachment name)",
+    "content_base64": "string | undefined (base64-encoded file content — only included when temp_file_url is unavailable, to avoid exceeding the skill output size limit)",
+    "filename": "string (original attachment filename)",
+    "content_type": "string (MIME type, e.g. 'application/pdf')",
+    "size": "number (actual byte count after download)",
+    "resolved_by": "string ('id' | 'filename' | 'sole_attachment')"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": ["outboundGateway", "tempFileStore"]
+}

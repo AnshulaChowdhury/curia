@@ -1,6 +1,6 @@
 # 16 — Smoke Test Framework
 
-**Status:** Implemented — core pipeline complete; several gaps remain (see [What's Not Here Yet](#whats-not-here-yet))
+**Status:** Implemented — a pass/fail release gate since #1956; CI integration and other gaps remain (see [What's Not Here Yet](#whats-not-here-yet))
 
 ---
 
@@ -12,8 +12,10 @@ Unlike unit and integration tests, which assert on code-level contracts, smoke t
 
 The framework boots the real bus, agents, and skills against a real database — the same components
 as production, minus the HTTP and CLI channels. Conversations are replayed against the live
-Coordinator, and an LLM judge (currently GPT-4o) evaluates each response against a set of
-expected behaviors authored by contributors.
+Coordinator, and an LLM judge (GPT-4o, through OpenRouter) evaluates each response against a set of
+expected behaviors authored by contributors. The run exits non-zero when any case fails the
+[gate](#the-gate), and the release pre-flight in `CLAUDE.md` runs it on the production
+standard-tier model.
 
 **Why behavioral tests, not assertion tests?**
 LLM outputs are not deterministic and cannot be asserted with `===`. The judge model evaluates
@@ -27,7 +29,8 @@ regression-test agent behavior at scale.
 1. **Real stack, not mocks** — the harness runs the same code path as production; mocked
    components would miss integration failures and prompt-induced regressions.
 2. **Observable outcomes, not internal state** — behaviors describe what the user sees, not
-   which skills were called or what was written to the DB. The judge has no access to internal state.
+   what was written to the DB. The judge sees the conversation, plus each turn's tool calls when a
+   case sets `judge_tool_calls` (for behaviors that are actions, not replies).
 3. **Contributor-friendly** — adding a test case is writing a YAML file; no code required.
 4. **Regression-first** — the primary use case is catching behavioral regressions; discovery
    of new capabilities is secondary.
@@ -40,57 +43,170 @@ regression-test agent behavior at scale.
 
 ```
 tests/smoke/
-  cli.ts          — entry point: arg parsing, boot, run, judge, report
+  cli.ts          — entry point: arg parsing, copy DB, boot, run, judge, retry, gate, report, exit code
+  clone-db.ts     — the throwaway database copy each run uses
   harness.ts      — headless Curia stack (real bus + components, no HTTP/CLI)
   loader.ts       — YAML test case loader with tag/name filtering
   runner.ts       — plays conversation turns against the live harness
-  evaluator.ts    — sends transcripts to GPT-4o and parses judgment
+  stub-layer.ts   — answers stubbed tool calls for any agent; the rest run for real
+  stub-filters.ts — narrows stubbed list/search results to the call's range or query
+  fixtures.ts     — seeds the fixture office's people; principal placeholders
+  evaluator.ts    — sends transcripts to the GPT-4o judge and parses judgment
+  gate.ts         — the pass/fail rule for a case, known failures, retries
   report.ts       — generates self-contained HTML reports with trend charts
   types.ts        — shared types for all modules above
-  cases/          — 34+ YAML test case files (the living test suite)
+  cases/          — YAML test case files (the living test suite)
+  stubs/office.yaml      — the fixture office's calendar, inbox, tasks and scheduler
+  fixtures/people.yaml   — the fixture office's people
   results/        — JSON run results, one file per run (historical tracking)
   reports/        — HTML reports, one file per run
 ```
+
+Dates relative to the run day, in the principal's timezone, come from
+`tests/shared/date-placeholders.ts`, which the scenario suite also uses.
 
 The pipeline is linear:
 
 ```
 CLI args
-  └─ loader: reads YAML cases, applies tag/name filters
-       └─ harness: boots full Curia stack (bus, agents, skills, DB)
-            └─ runner: replays turns, captures responses
-                 └─ harness.shutdown()
-                      └─ evaluator: sends transcripts to GPT-4o judge
-                           └─ scoring: weighted PASS/PARTIAL/MISS per behavior
-                                └─ report + results: HTML + JSON output
+  └─ loader: reads YAML cases + the fixture office, applies tag/name filters
+       └─ clone-db: copies DATABASE_URL's database to <name>_smoke_<pid>
+            └─ harness: boots full Curia stack on the copy, seeds the office's people
+                 └─ runner: replays turns with stubs, captures replies + tool calls
+                      └─ evaluator: sends transcripts to the GPT-4o judge (the stack's OpenRouter provider)
+                           └─ gate: weighted PASS/PARTIAL/MISS per behavior → pass/fail per case
+                                └─ retry: failing cases run and are judged once more
+                                     └─ report + results: HTML + JSON output
+                                          └─ shutdown, drop the copy, exit 1 if any case still fails
 ```
 
 ### Harness
 
-`createHarness()` boots the same component graph as `src/index.ts`, skipping only the
-channel adapters that poll for external input (HTTP, CLI, Email polling). The headless harness
+`createHarness()` boots the **test-mode stack** (`src/startup/test-mode-stack.ts`) and adds a
+Dispatcher. The stack builds agents through `src/startup/agent-assembly.ts`, the same builder
+`src/index.ts` uses, so the coordinator receives the production system prompt: identity,
+security, specialist roster, autonomy band, date guardrail, contact details, turn budget and
+every pinned SKILL.md body (#1966). There are no channel adapters. The headless harness
 exposes a single `sendMessage()` method that publishes an `inbound.message` event to the bus
-and resolves when the matching `outbound.message` arrives for that `conversationId`.
+and resolves when the coordinator's `agent.response` for that `conversationId` arrives. It reads
+the turn off the bus as the `system` layer (`tests/shared/turn-capture.ts`, shared with the
+scenario suite), so it also records each tool call and its result, and a `NO_REPLY` or a reply
+Gate C holds for a non-principal sender still ends the turn.
 
-**Timeout:** Each `sendMessage()` call has a hard 60-second timeout. A case with multiple turns
-can take several minutes; no overall run timeout exists today (see [What's Not Here Yet](#whats-not-here-yet)).
+**Sender.** A case sends as the principal (the `smoke-test` channel, which the contact resolver
+treats as a local console session) or as an `unknown` sender: `unknown-sender@example.test` by
+email, with no contact record, which the Dispatcher routes in low-trust mode.
 
-**Shared state:** All cases within a run share one harness (and one database). Each case gets
-a unique `smoke-<uuid>` conversation ID to prevent cross-contamination at the conversation level.
-Memory, contacts, and knowledge graph accumulate across the run — this is intentional, as it
-reflects how the system operates in production (with a persistent knowledge base). Test cases
-should not assume an empty database.
+`createHarness({ model })` routes every agent to one model id. The provider follows from the
+model registry, so this selects Anthropic or OpenRouter.
 
-**Email/Calendar:** The NylasClient is initialized if credentials are present in the environment,
-enabling email and calendar skills. Email polling is intentionally skipped during smoke runs —
-the email adapter is not registered — so tests do not trigger on live inbox events.
+**Test mode cannot send.** This is by construction, not by configuration:
+
+- The `OutboundGateway` has no Nylas, Signal, Slack or SMS client and no outbound queue, so
+  every send and draft fails inside the gateway.
+- Skills that call a provider directly with a declared secret (ceo-inbox → Nylas) get a
+  "withheld in test mode" error. Only `TEST_MODE_PASSTHROUGH_SECRETS` (read-only lookups such
+  as web search) resolve.
+- Test mode leaves nothing a real instance sharing the database would act on (smoke itself
+  runs on a copy, but the scenario suite and the prompt render do not). The ExecutionLayer gets no scheduler, task repo, action log,
+  context-bridge, bullpen or working-docs service. Agents get read-only views of the autonomy
+  score and office identity, and runtimes never write bullpen read watermarks. Tools that need a
+  missing service fail with a missing-capability error. (A tool may declare such a service in
+  `optional_capabilities` instead and run without it: `skill-activate` persists a task's active
+  skills when a task repo exists, and still activates skills here, #2024.)
+- No MCP server process is spawned. Each configured server with a tools/list snapshot in
+  `tests/fixtures/mcp/` is registered from it through production's registration, so its tools
+  and projected skill (google-workspace) are production's, but its session answers every call
+  with a canned "nothing to return" result and reaches no account (`src/startup/test-mode-mcp.ts`,
+  #2024). A configured server with no snapshot is absent and listed in the stack's `warnings`.
+
+`tests/unit/startup/test-mode-stack.test.ts` and `tests/integration/test-mode-stack.test.ts`
+assert these guarantees.
+
+**Matching production's configuration:** agents, tools and skills load as production would on
+its next boot against the same database. That means the registry's enabled rows plus any core
+default that has no row yet, from production's own reconcile run without writing. A live run
+needs a principal contact, because production serves no agent before onboarding. The boot
+header prints every difference that remains: the stack's `warnings` (unresolved pins, no vault
+key) and the coordinator tools test mode refuses (`disabledTools`).
+
+**Tool stubs (#1956):** `createTestModeStack({ wrapExecutionLayer })` takes a function that
+wraps the ExecutionLayer before any agent receives it. Return a Proxy (or subclass) whose `invoke` answers stubbed tools and
+delegates every other method to the real layer. `tool.invoke` / `tool.result` bus events and
+the runtime's `<task_error>` formatting are unchanged. `wrapBullpenService` narrows what
+runtimes read from the bullpen, and `stack.llmProviders` lets test code make its own model
+calls without the stack handing out the vault key. `wrapWorkingMemory` lets smoke and the
+scenario suite withhold contact recent history so a case does not inherit other runs' turns.
+
+**Coordinator scenario suite (#1956):** `pnpm scenarios` (`tests/scenarios/`) is the sibling
+of smoke for coordinator *decisions*. It uses the same test-mode stack with a fail-closed stub
+layer, seeds outbound-context entries, bullpen threads and contacts as real rows scoped to
+each run, asserts tool calls in code, judges prose through the stack's OpenRouter provider, and
+exits non-zero when a critical behavior passes fewer than 80% of its runs. See
+`tests/scenarios/README.md`.
+
+**Timeout:** Each `sendMessage()` call waits 180 seconds by default (`SMOKE_TIMEOUT_MS`), as the scenario suite does: with the fixture office, a delegated calendar flow legitimately runs 90–150s. A case whose turns chain several real specialists can set a longer `timeout_seconds`; it only lengthens the wait, so a `SMOKE_TIMEOUT_MS` raised for a slow provider still holds. Six cases set 300, after each ran past 180s on main and on a branch in prompt trim PR 6's smoke A/B. A turn
+that outlives it keeps running, and shutdown waits up to a minute for such turns. A case with
+multiple turns can take several minutes; no overall run timeout exists today (see
+[What's Not Here Yet](#whats-not-here-yet)).
+
+**A throwaway database (`clone-db.ts`).** The CLI copies `DATABASE_URL`'s database
+(`CREATE DATABASE <name>_smoke_<pid> TEMPLATE <name>`) before anything connects, points the
+stack at the copy, and drops it after the run, also on Ctrl-C; copies a crashed run left are
+dropped at the next start. Agents write contacts, knowledge-graph facts and config-store
+settings as they work. One early run on the dev database added 17 contacts and stored a fake
+Zoom link as the principal's, and later runs inherited all of it. On a copy every run starts
+from the same state and nothing reaches the real database. Postgres copies a database only
+while nothing else is connected to it, so the dev instance must be stopped.
+
+**Shared state within a run:** all cases share one harness and one copy, so contacts and facts
+one case writes are visible to later cases (in a fixed order). Each case gets a unique
+`smoke-<uuid>` (or `email:smoke-<uuid>`) conversation ID, and contact recent history is withheld
+from the prompt, so no case sees another's turns.
+
+**The fixture office.** Test mode has no calendar or mail client, scheduler, task store or
+working docs, so their tools fail. Without a substitute the specialists find every system down
+and decline, and a case can only test how Curia says "I couldn't". Every case therefore runs
+in a fixture office:
+
+- `stubs/office.yaml` answers those tools for any agent: a calendar week relative to the run
+  day, the principal's inbox, and working task, scheduler, document and approval stores.
+- `stub-layer.ts` answers a call from the first matching stub (the turn's, then the case's,
+  then the office's), and runs anything unstubbed for real, on the copy.
+- `stub-filters.ts` narrows list and search results to the call's time range, query or
+  attendee, the way the real tool would. It also fills `{{input:<arg>}}`, so writes echo what
+  was asked for.
+- `fixtures/people.yaml` seeds the people cases mention as known contacts, on `.example`
+  addresses only.
+
+Fixture and message dates are placeholders (`{{day:next-wednesday}}`, `{{at:now+60m}}`…)
+resolved against the run day in the principal's timezone; `{{principal:name}}` names the
+principal of the database under test. Unlike the scenario suite's fail-closed layer, unstubbed
+writes are not refused: smoke tests the whole stack, and the copy absorbs them.
+
+Email polling never runs, so tests do not trigger on live inbox events.
 
 ### Runner
 
 `runTestCases()` processes cases sequentially (one at a time). For each case:
-- A unique `conversationId` is allocated.
-- Each turn is sent via `harness.sendMessage()`, optionally preceded by a `delayMs` pause.
-- All responses are captured as `CapturedResponse[]`.
+- A unique `conversationId` is allocated, shaped by the case's sender.
+- Before the case, any earlier turn that outlived its timeout is waited for (it would otherwise
+  call tools against this case's stubs); the stubs and the fallback record are reset.
+- Each turn is sent via `harness.sendMessage()`, optionally preceded by a `delay_ms` pause.
+- Before each turn the stubs are set (turn, case, office) and placeholders resolved, once per
+  turn, so the message and the fixtures agree on "now".
+- All responses are captured as `CapturedResponse[]`, each with the message actually sent,
+  that turn's coordinator tool calls, and `noReplyReason` when the Dispatcher suppressed
+  delivery. Every agent's calls are recorded on the case (`agentCalls`; `--show-calls` prints
+  them). A model fallback by any agent — specialists included — makes the case an error: it
+  ran on a model the results are not labelled with.
+
+**Before a paid run** the CLI checks that every stub names a registered tool and only that
+tool's real inputs (`stub-check.ts`), and the loader rejects any placeholder it cannot resolve.
+Flags are parsed strictly (`args.ts`): an unknown flag or `--model=x` is an error rather than
+silently running on the dev config. The database must have a principal contact, and
+`DATABASE_URL` must be local unless `--allow-remote-db` is passed. The recorded commit gets a
+`-dirty` suffix when tracked files have uncommitted changes.
 
 **Sequential execution is intentional.** Parallel execution would require multiple harness
 instances or careful isolation, since the shared database could produce non-deterministic results.
@@ -98,19 +214,25 @@ See [Future Work](#future-work) for planned concurrency improvements.
 
 ### Evaluator
 
-`evaluateCases()` sends each case's full transcript to GPT-4o for judgment. For each case,
-the judge receives:
-- The full conversation transcript (all user turns and all assistant responses)
-- The list of expected behaviors with their IDs, descriptions, and weights
+`evaluateCases()` sends each case's transcript to `openai/gpt-4o` through the stack's OpenRouter
+provider — the scenario suite's judge, so the key stays in the vault (#911). For each case, the
+judge receives:
+- Who the sender is (the principal, by name, or an unknown external sender)
+- Each turn's message and the assistant's response, interleaved, and whether delivery was
+  suppressed; with `judge_tool_calls`, also the turn's tool calls, arguments and results
+  (failures marked `FAILED`) and every specialist's calls in the case — what it delegated
+- The list of expected behaviors with their IDs, descriptions, and weights, and the failure modes
 - Instructions to rate each behavior as `PASS`, `PARTIAL`, or `MISS` and provide a brief justification
 
-The judge is called sequentially to avoid hammering the OpenAI API. Temperature is set to 0.1
-for near-deterministic scoring.
+Cases that did not complete are not judged. The judge is called sequentially.
 
 **Error handling:**
-- Auth failures (401/403): abort the run immediately — a misconfigured key would corrupt all scores
-- Rate limit (429): abort the run — the operator should wait and retry
-- Per-case failures: fall back to all-MISS for that case, emit a stderr warning, continue
+- Auth, rate-limit, not-found and validation errors abort the run — they would repeat on every
+  case, and an all-MISS run would read as a broken Curia
+- Transient errors (provider error, timeout, a provider that throws) get up to three attempts with backoff
+- A judge that still fails, an unparseable reply, a skipped behavior or an invalid rating becomes
+  the case's **judge error**: its behaviors score `MISS`, and the gate reports it as a judge failure,
+  not a model failure
 
 **Weighted score formula:**
 
@@ -144,11 +266,19 @@ name: Unique Case Name          # required — globally unique across all cases
 description: |                  # required — 1–2 sentences of context for the judge
   What this test verifies and why it matters.
 tags: [tag1, tag2]              # required — used for filtering; see canonical tag list below
+sender: principal               # optional — principal (default) | unknown
+judge_tool_calls: false         # optional — show the judge each turn's tool calls and results
+known_failure: { issue: "#123" } # optional — catches a tracked bug: reported, not gated
+tool_stubs:                     # optional — tool → [{ match, return | error }], tried before the office's
+  calendar-list-events:
+    - match: {}
+      return: { events: [], count: 0 }
 
 turns:                          # required — at least one turn
   - role: user
-    content: "The message text"
-    delayMs: 500                # optional — pause before this turn, simulates real pacing (ms)
+    content: "The message text, placeholders allowed ({{day:next-friday}})"
+    delay_ms: 500               # optional — pause before this turn, simulates real pacing (ms)
+    tool_stubs: {}              # optional — this turn only, tried before the case's
 
 expected_behaviors:             # required — at least one behavior
   - id: behavior_id             # snake_case, unique within the case
@@ -201,12 +331,16 @@ pnpm smoke --case "urgent"
 
 # Filter by tags (comma-separated, OR semantics)
 pnpm smoke --tags email-triage,briefing
+
+# Run every agent on one model (e.g. the production standard tier — the release pre-flight)
+pnpm smoke --model deepseek/deepseek-v4.1-flash
 ```
 
 **Required environment variables:**
-- `DATABASE_URL` — PostgreSQL connection (same DB as local dev is fine)
-- `ANTHROPIC_API_KEY` — for the real Coordinator and skill execution
-- `OPENAI_API_KEY` — for the GPT-4o judge
+- `DATABASE_URL` — PostgreSQL connection (same DB as local dev is fine), with a principal contact
+- `SECRET_ENCRYPTION_KEY` — LLM API keys are read from the vault, as at boot (#911). The
+  selected model's provider key (`anthropic_api_key` / `openrouter_api_key`) must be in it, and
+  `openrouter_api_key` for the judge.
 
 **Output:**
 - `tests/smoke/reports/<timestamp>.html` — human-readable report with per-behavior justifications
@@ -224,39 +358,55 @@ interface TestCase {
   name: string;
   description: string;
   tags: string[];
-  turns: Turn[];
+  sender: 'principal' | 'unknown';
+  judgeToolCalls: boolean;
+  toolStubs: Record<string, ToolStub[]>;  // tried after the turn's, before the office's
+  knownFailure?: { issue: string };
+  turns: Turn[];                          // each may carry its own toolStubs
   expectedBehaviors: ExpectedBehavior[];  // camelCase after YAML load
   failureModes: string[];
 }
 
 // Per-turn response from the harness
 interface CapturedResponse {
+  prompt: string;          // the message sent, placeholders resolved
   content: string;
-  agentId: string;         // always 'coordinator' today — see TODO in runner.ts
+  agentId: string;         // 'coordinator': the capture reads the coordinator's own agent.response
   durationMs: number;
+  toolCalls: ObservedToolCall[];
 }
 
 // After execution, before judging
 interface CaseExecution {
   testCase: TestCase;
   responses: CapturedResponse[];
-  error?: string;          // set if all turns timed out or the harness threw
+  agentCalls: AgentToolCall[];  // every agent's calls, stubbed or real
+  error?: string;          // set if a turn timed out or errored
 }
 
-// After judging
+// After judging and the gate
 interface CaseResult {
   testCase: TestCase;
   responses: CapturedResponse[];
   scores: BehaviorScore[];
   weightedScore: number;   // 0–1
   error?: string;
+  judgeError?: string;
+  agentCalls: AgentToolCall[];
+  passed: boolean;
+  failures: string[];      // why it did not pass
+  firstAttempt?: { weightedScore: number; failures: string[] };  // set when it was retried
 }
 
 // Full run
 interface RunResult {
   timestamp: string;       // ISO 8601
+  model: string | null;
+  commit: string;
+  filtered: boolean;       // --case / --tags narrowed it
   cases: CaseResult[];
   overallScore: number;    // 0–1, unweighted average of case scores
+  passed: boolean;
   durationMs: number;
 }
 ```
@@ -265,48 +415,59 @@ interface RunResult {
 
 ## Scoring Summary
 
-| Score | Label | Meaning |
-|---|---|---|
-| ≥ 80% | `PASS` | Case meets expectations |
-| 40–79% | `PARTIAL` | Case partially meets expectations |
-| < 40% | `FAIL` | Case significantly misses expectations |
+### The gate
 
-These labels appear in the CLI summary output. **No pass threshold is currently enforced** — the
-run exits 0 regardless of score. See [What's Not Here Yet](#whats-not-here-yet).
+`tests/smoke/gate.ts`. A case **passes** when:
+
+- it completed (no timeout, agent error or model fallback);
+- it was judged (no judge error);
+- its weighted score is **≥ 80%** (`CASE_PASS_THRESHOLD`);
+- no `critical` behavior is rated `MISS`.
+
+The weighted score alone is not enough: five critical PASSes and one critical MISS score 83%,
+and a critical behavior is by definition one whose absence is a regression.
+
+**Retry once.** Each case that fails is run and judged once more, and fails the gate only if
+the retry fails too. The same case on the same code has scored 94% and then 38%, and a gate
+that blocks releases at random teaches people to ignore it. A behavior that fails half the time
+still fails both attempts a quarter of the time. A case that passed only on retry is marked
+`PASS*`, and its first attempt is kept in the results (`firstAttempt`).
+
+**Known failures.** A case marked `known_failure: { issue }` catches a tracked bug. It is
+reported (`KNOWN`) but not gated, and not retried. It still fails the gate if it errors or the
+judge fails, since that says nothing about the bug. When it passes, the run warns that the
+marker may be stale.
+
+The **run passes** when every case passes, known failures aside. Otherwise the CLI prints each
+failing case with its reasons and exits `1`. A run narrowed by `--case` / `--tags` is labelled as
+such and is not a release result. Results JSON records the model, the commit the run started on,
+and `passed`.
+
+For behaviors that need several runs and a pass-rate threshold, use the scenario suite.
 
 ---
 
 ## Known Constraints
 
-- **Shared database state** — all cases in a run share one database; test cases cannot assume a clean slate. Cases should be written to work against a populated knowledge base.
+- **Shared database state** — a run starts from a copy of the dev database, and all its cases share that copy; test cases cannot assume a clean slate. Cases should be written to work against a populated knowledge base.
 - **Non-determinism** — LLM outputs vary between runs. A test case with tightly worded behaviors may flip between `PASS` and `PARTIAL` across runs. Prefer behaviors that describe structural outcomes ("includes two options") over wording-dependent ones ("says 'I can help with that'").
-- **Judge model dependency** — the framework requires `OPENAI_API_KEY`. If OpenAI is unavailable, the entire evaluation phase fails.
+- **Judge model dependency** — the judge is `openai/gpt-4o` through OpenRouter. If OpenRouter is unavailable, the evaluation phase fails.
+- **The office is a fixture** — email, calendar, scheduler, task and document tools answer from `stubs/office.yaml` and the case's own stubs, not real systems; human-channel sends always fail (no transport). A stubbed call skips the real ExecutionLayer's trust and autonomy checks, so a stubbed write "succeeds" even where production would gate it. Read-only tools that are not stubbed (web-fetch, web-search) reach the real internet.
+- **Isolation is per run, not per case** — cases share one database copy in a fixed order, so a contact or fact one case writes is visible to later cases and to retries. Each case does start with no leftover turn: before it runs, the runner waits for any earlier turn that outlived its timeout, and fails the case closed ("could not run in isolation") if one is still going.
 - **No case-level parallelism** — cases run sequentially; a 34-case run against the full stack takes several minutes.
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-| Item | Status |
-|---|---|
-| Harness — boots real bus, agents, skills, DB; exposes `sendMessage()` | Done |
-| Loader — YAML test case parsing with tag/name filtering | Done |
-| Runner — sequential turn replay against live harness | Done |
-| Evaluator — GPT-4o judge with weighted PASS/PARTIAL/MISS scoring | Done |
-| Reporter — self-contained HTML reports with trend charts | Done |
-| Test cases — 34+ YAML case files covering core behaviors | Done |
-| CLI entry point (`pnpm smoke`, `--case`, `--tags` flags) | Done |
-| Per-`sendMessage` 60-second timeout | Done |
-| `agentId` captured from bus events (not hardcoded) | Not Done — hardcoded to `'coordinator'` |
-| Anthropic API rate limit retry with backoff inside `AnthropicProvider` | Not Done |
-| OpenAI judge rate limit retry before abort | Not Done |
-| Exit code enforcement (`--pass-threshold` flag, exit 1 on failure) | Not Done |
-| CI integration (exit codes + DB isolation + secrets) | Not Done |
-| Score-trend alerting on regression between runs | Not Done |
-| Configurable judge model (`--judge-model` flag) | Not Done |
-| Per-case run timeout / circuit breaker | Not Done |
-| Selective re-run of failures from prior results file | Not Done |
-| Parallel case execution with schema isolation | Not Done |
+- **Anthropic retry/backoff** — no rate limit retry with backoff inside `AnthropicProvider`.
+- **Judge rate-limit retry** — a judge rate limit aborts the run; transient errors are retried.
+- **CI integration** — no DB isolation + secrets wiring for CI. (#545)
+- **Score-trend alerting** — no alerting on score regression between runs.
+- **Configurable judge model** — no `--judge-model` flag.
+- **Per-case timeout** — no per-case run timeout / circuit breaker.
+- **Selective re-run** — no re-run of failures from a prior results file.
+- **Parallel execution** — no parallel case execution with schema isolation.
 
 ---
 
@@ -330,35 +491,17 @@ Needed:
 Until this is implemented, running the full 34-case suite reliably requires either running at
 off-peak times or breaking the suite into smaller filtered runs.
 
-### Rate Limiting — OpenAI Judge
+### Rate Limiting — Judge
 
-The evaluator already aborts on `429` from the judge model rather than silently scoring zero.
-However, there is no retry logic — a transient rate limit during judging aborts the entire
-evaluation phase and discards all execution results. Needed: retry with backoff before abort.
-
-### Exit Code Enforcement
-
-The run currently exits `0` regardless of overall score. CI pipelines cannot use the smoke suite
-as a gate without a configurable pass threshold.
-
-Needed: `--pass-threshold <0–100>` flag; exit `1` if `overallScore < threshold`.
+Transient judge errors are retried, but a rate limit (`RATE_LIMIT`) aborts the run, discarding
+all execution results. Needed: retry with backoff before abort.
 
 ### CI Integration
 
-Smoke tests are not yet run in CI. Blockers:
-1. Exit code enforcement (above)
-2. Rate limit reliability (above)
-3. A CI-appropriate database fixture (separate DB or schema isolation per run)
-4. Secrets provisioning in the CI environment
-
-### Agent ID Capture
-
-`runner.ts` has a `// TODO: capture actual agent from bus events` comment. The `agentId` field
-in `CapturedResponse` is hardcoded to `'coordinator'`. When multi-agent delegation is exercised
-in a test, the report cannot show which agent produced which turn of the response.
-
-Fix: subscribe to `agent.response` events on the bus and correlate by `conversationId`/`taskId`
-to populate `agentId` correctly.
+Smoke tests are not yet run in CI; the release pre-flight runs them by hand. Blockers:
+1. Rate limit reliability (above)
+2. A CI-appropriate database fixture (separate DB or schema isolation per run)
+3. Secrets provisioning in the CI environment
 
 ### Score-Trend Alerting
 
@@ -370,18 +513,14 @@ exceeds a configurable threshold (e.g., `--regression-threshold 10` to fail on a
 
 ### Configurable Judge Model
 
-`JUDGE_MODEL = 'gpt-4o'` is hardcoded in `evaluator.ts`. There are two gaps here:
-
-1. **No override** — cannot use a cheaper model (e.g., `gpt-4o-mini`) for fast iteration runs
-2. **OpenAI dependency** — contributors who want to avoid OpenAI have no alternative
-
-Future: a `--judge-model <model-id>` flag and, eventually, support for Claude as the judge
-(which would eliminate the `OPENAI_API_KEY` requirement).
+`JUDGE_MODEL = 'openai/gpt-4o'` is hardcoded in `tests/scenarios/judge.ts` (shared with the
+scenario suite, so scores stay comparable). There is no override for a cheaper model during fast
+iteration. Future: a `--judge-model <model-id>` flag.
 
 ### Per-Case Run Timeout
 
 There is no overall run timeout. A single hanging turn (e.g., a skill that never responds) will
-stall the entire suite indefinitely after the per-`sendMessage` 60-second timeout fires for each
+stall the entire suite indefinitely after the per-`sendMessage` 180-second timeout fires for each
 turn in that case. Needed: a per-case wall-clock timeout and a run-level circuit breaker.
 
 ### Selective Re-run of Failures
@@ -438,8 +577,8 @@ The inter-case delay for the runner (separate from provider-level retry) can be 
 
 ### Judge Rate Limit Retry
 
-Same pattern as above but in `evaluateCases()`. The evaluator already distinguishes `429` from
-other errors (it aborts); the change is to retry up to N times with backoff before aborting.
+Same pattern as above but in `evaluateCases()`. The evaluator already retries transient errors;
+the change is to treat `RATE_LIMIT` as retryable with a longer backoff before aborting.
 
 ### Schema Isolation for CI
 

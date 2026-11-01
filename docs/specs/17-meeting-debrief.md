@@ -158,7 +158,10 @@ When the meeting-debrief agent sends a prompt via Signal, the CEO's response arr
 **Inbound flow (delegation via context bridge):**
 1. CEO responds on Signal (or any channel)
 2. Dispatcher routes to coordinator (always — no routing bypass)
-3. Coordinator sees `[ACTIVE OUTBOUND CONTEXT]` block injected by dispatcher
+3. Coordinator sees the `[ACTIVE OUTBOUND CONTEXT]` block injected by the dispatcher.
+   The debrief prompt is CEO-facing: every active entry appears only on a principal
+   inbound (#1848). A non-principal sender's block holds only entries sent to that
+   sender (#2261), and debrief prompts are sent to the principal, so no one else sees one.
 4. Coordinator judges relevance — if reply relates to an active entry, delegates to the hinted specialist via the existing `delegate` skill
 5. Specialist processes and returns result; coordinator relays in its own voice
 
@@ -167,8 +170,8 @@ When the meeting-debrief agent sends a prompt via Signal, the CEO's response arr
 **Lifecycle:**
 - **Created** atomically with the outbound send (via `context_bridge` param on send skills)
 - **Expires** after configurable TTL (default 48 hours)
-- **Released** explicitly by the coordinator (via `context-bridge-release` skill) when conversation completes
-- **Read** by the dispatcher on every inbound — all active entries injected into coordinator's task
+- **Released** when the conversation completes: by the platform when the coordinator routes the reply with `delegate` `outbound_entry_id` and meeting-debrief returns (unless it calls `context-bridge-keep-open`), or explicitly by its owner via `context-bridge-release` (#1972)
+- **Read** by the dispatcher on every **dispatcher-routed principal** inbound (`liveTurn`) — active entries injected into the coordinator's task (voice uses `VoiceRuntime`'s parallel path)
 
 **Security properties preserved:**
 - Coordinator sees and approves all outbound before it's sent
@@ -182,19 +185,15 @@ When the meeting-debrief agent sends a prompt via Signal, the CEO's response arr
 
 ## 5. Prompt Delivery
 
-When a meeting passes both detection stages, the agent sends a conversational prompt via the CEO's configured channel.
+When a meeting passes both detection stages, the agent sends a prompt via the CEO's configured channel.
 
 **Channel-agnostic design:** The agent targets `debrief.channel` from config (e.g., `signal`). It uses the OutboundGateway with the appropriate channel ID. Changing the config value to `email` or a future channel like `slack` requires zero code changes.
 
-**Message style — conversational, brief, efficient:**
-
-> "You just wrapped up with Sarah Chen and David Park from Meridian. Any takeaways or follow-ups?"
-
-The prompt is:
-- Conversational, not formal — brief and efficient since the CEO is likely running to the next task
-- Names the attendees (enriched from contacts/KG)
-- Open-ended — doesn't assume what kind of follow-up is needed
-- Short — one or two sentences max
+**What the prompt says.** It names the attendees (enriched from contacts/KG) and asks for
+takeaways or follow-ups, open-ended, without assuming what kind of follow-up is needed. How
+it sounds and how long it runs come from the office identity block, which meeting-debrief
+gets in writes-as mode ([spec 13](13-office-identity.md)). The agent prompt names no tone
+and quotes no sample message, because the model copies a sample word for word.
 
 After sending, the agent:
 1. Writes the `prompted:<eventId>` guard to `config-store` (namespace `"debrief"`) with the Bullpen thread_id and timestamp
@@ -308,7 +307,7 @@ These are out of scope for this feature but identified during design:
 
 ### Manual testing
 - Run with real calendar data and Signal channel
-- Verify the prompt message is conversational, brief, and correctly names attendees
+- Verify the prompt message names the attendees and asks for takeaways or follow-ups
 - Verify draft emails appear in email drafts
 - Verify calendar events are created in the right time slots
 - Verify KG facts are stored correctly for commitments and preferences
@@ -329,40 +328,18 @@ These are out of scope for this feature but identified during design:
 |---|---|
 | `src/db/migrations/042_create_outbound_context.sql` | Dedicated table for context bridge entries |
 | `src/dispatch/outbound-context.ts` | `OutboundContextService` + `ScopedOutboundContext`: register, query active, release, cleanup |
-| `skills/context-bridge-release/` | Coordinator-only skill to mark entries as released |
+| `skills/context-bridge/tools/context-bridge-release/` | Skill to mark entries as released (coordinator-only until #1972; now any agent, for unhinted or owned entries) |
 | `src/dispatch/context-bridge-parse.ts` | Shared helper module to normalize `context_bridge` JSON inputs |
-| Updates to `skills/signal-send/`, `skills/email-send/`, `skills/email-reply/` | Unconditional registration on success; honor optional `context_bridge` param |
+| Updates to `skills/signal-send/`, `skills/email/tools/email-send/`, `skills/email/tools/email-reply/` | Unconditional registration on success; honor optional `context_bridge` param |
 | Update to `src/dispatch/dispatcher.ts` | Read path queries `outbound_context` for `[ACTIVE OUTBOUND CONTEXT]` injection |
 | Update to `agents/coordinator.yaml` | Delegation-hint guidance for outbound context entries |
 
 ---
 
-## Implementation Status
+## Known Deficiencies
 
-> **Note:** Sections 1–10 were updated to reflect the current implementation
-> (tasks migration, #839). Superseded content has been moved to the Historical
-> appendix at the bottom of this document. The implementation (agent YAML,
-> config, tests) is authoritative; this spec tracks its normative contract.
-
-| Number | Item | Status |
-|---|---|---|
-| 0 | Proactive outbound Signal from scheduled jobs (#374) — prerequisite | Done |
-| 1 | Context bridging v2 (#615) — prerequisite infrastructure | Done |
-| 2 | `debrief:` config block in `config/default.yaml` + startup validation | Done |
-| 3 | `meeting-debrief` agent YAML config (prompt, skills, schedule) | Done |
-| 4 | Detection pipeline — calendar scan, prompt-driven classification via LLM judgment | Done |
-| 5 | LLM judgment — binary YES/NO in agent system prompt (DEFER removed) | Done |
-| 6 | Prompt delivery — Bullpen request to coordinator, context bridge registered | Done |
-| 7 | Reminder check — single reminder via wake_at re-schedule on debrief task | Done |
-| 8 | Response processing — coordinator delegates reply, agent executes follow-ups | Done |
-| 9 | Cross-specialist work via Bullpen — research delegation pattern | Done |
-| 10 | State persistence — platform tasks + config-store phase guards (replaces scheduler-report maps) | Done |
-| 11 | Status queries — coordinator delegates to meeting-debrief (no separate skill) | Done |
-| 12 | Preference learning — store CEO feedback as KG facts, wire into judgment | Done |
-| 13 | Audit events — state transitions, expired entry pruning | Done |
-| 14 | Unit tests — config validation | Done |
-| 15 | Integration tests — end-to-end Bullpen→coordinator→send→reply→delegate flows | Not Done |
-| 16 | Smoke tests — LLM judge scenarios for debrief detection and actions | Not Done |
+- **Integration tests** — end-to-end Bullpen→coordinator→send→reply→delegate flows; not yet implemented.
+- **Smoke tests** — LLM judge scenarios for debrief detection and actions; not yet implemented.
 
 **Design notes (2026-05-25):**
 - Items 4–13 are implemented as prompt-driven logic in the agent's system prompt, not custom handler code — consistent with the ceo-inbox pattern.

@@ -17,13 +17,23 @@ import type { ContactService } from '../../contacts/contact-service.js';
 import { meetsMinimumTier } from '../../contacts/types.js';
 import type { OutboundGateway } from '../../skills/outbound-gateway.js';
 import type { OutboundMessageEvent } from '../../bus/events.js';
+import { relaySendOptions } from '../../dispatch/relay-gate-c.js';
 import type { SignalEnvelope } from './types.js';
 import { SignalRpcClient } from './signal-rpc-client.js';
-import { convertSignalEnvelope } from './message-converter.js';
+import { convertSignalEnvelope, convertSignalReaction } from './message-converter.js';
 import { checkGroupMemberTrust } from './group-trust.js';
-import { createInboundMessage } from '../../bus/events.js';
+import { createInboundMessage, createInboundReaction, createChannelDisconnected, createChannelReconnect } from '../../bus/events.js';
 import { sanitizeOutput } from '../../skills/sanitize.js';
 import type { Channel } from '../channel.js';
+import type { SpeechMediaService } from '../../speech/index.js';
+import {
+  countAudioAttachments,
+  findFirstAudioAttachment,
+  isVoiceNoteOversize,
+  resolveVoiceNoteInbound,
+  voiceNoteDownloadFailure,
+  voiceNoteTooLarge,
+} from '../inbound-voice-note.js';
 
 export interface SignalAdapterConfig {
   bus: EventBus;
@@ -44,16 +54,25 @@ export interface SignalAdapterConfig {
   contactService: ContactService;
   /** Curia's E.164 phone number — the Signal account that receives messages */
   phoneNumber: string;
+  /**
+   * Batch STT for inbound voice notes (#1600). Undefined when Deepgram/Cartesia
+   * creds are absent — voice notes then degrade to existing text handling.
+   */
+  speechMediaService?: SpeechMediaService;
 }
 
 export class SignalAdapter implements Channel {
   readonly name = 'signal';
   readonly isToggleable = true;
+  /** Signal-cli Unix socket can drop; queue outbound until reconnect (#1380). */
+  readonly supportsOutboundQueue = true;
   private readonly config: SignalAdapterConfig;
   private readonly log: Logger;
   // Bound handler so we can remove it in stop() without losing the reference.
   // Arrow function captures `this` correctly even after .off() removes it.
   private readonly boundHandleInbound: (envelope: SignalEnvelope) => void;
+  /** subscribeOutbound() ran: the bus has no unsubscribe, so a second call would double every send. */
+  private outboundSubscribed = false;
 
   constructor(config: SignalAdapterConfig) {
     this.config = config;
@@ -70,14 +89,24 @@ export class SignalAdapter implements Channel {
     };
   }
 
-  async start(): Promise<void> {
-    const { bus, rpcClient } = this.config;
+  isOutboundReady(): boolean {
+    return this.config.rpcClient.isConnected();
+  }
 
-    // Subscribe to outbound messages for the Signal channel.
+  /**
+   * Subscribe the outbound side: replies the dispatcher relays (outbound.message) go back to
+   * the sender through the OutboundGateway. start() calls it before connecting. The test-mode
+   * recording stack (#2312) calls it alone, against a recording client, so a scenario's
+   * relayed reply takes this exact path with no socket. Safe to call twice: the second call
+   * is a no-op, so a reply is never sent twice.
+   */
+  subscribeOutbound(): void {
+    if (this.outboundSubscribed) return;
+    this.outboundSubscribed = true;
     // When the coordinator responds to a Signal-triggered conversation, the
     // dispatcher creates an outbound.message with channelId 'signal'. The adapter
     // routes this back to the sender via the OutboundGateway.
-    bus.subscribe('outbound.message', 'channel', async (event) => {
+    this.config.bus.subscribe('outbound.message', 'channel', async (event) => {
       const outbound = event as OutboundMessageEvent;
       if (outbound.payload.channelId !== 'signal') return;
 
@@ -88,10 +117,31 @@ export class SignalAdapter implements Channel {
           'Failed to send Signal response');
       }
     });
+  }
+
+  async start(): Promise<void> {
+    const { bus, rpcClient } = this.config;
+
+    this.subscribeOutbound();
 
     // Register inbound message handler before connecting so no messages are
     // missed during the connect window.
     rpcClient.on('message', this.boundHandleInbound);
+
+    // Publish channel lifecycle for outbound-queue flush (#1380).
+    rpcClient.on('connected', () => {
+      void bus.publish('channel', createChannelReconnect({ channel: 'signal' })).catch((err) => {
+        this.log.error({ err }, 'Failed to publish channel.reconnect');
+      });
+    });
+    rpcClient.on('disconnected', () => {
+      void bus.publish(
+        'channel',
+        createChannelDisconnected({ channel: 'signal', reason: 'signal-cli socket closed' }),
+      ).catch((err) => {
+        this.log.error({ err }, 'Failed to publish channel.disconnected');
+      });
+    });
 
     // connect() is synchronous — it starts the connection attempt in the background
     // and returns immediately. If signal-cli is not yet available (Docker startup race),
@@ -112,9 +162,16 @@ export class SignalAdapter implements Channel {
   // ---------------------------------------------------------------------------
 
   private async handleInbound(envelope: SignalEnvelope): Promise<void> {
+    // Reactions normalize to inbound.reaction (emoji→intent is dispatch-side, #1479).
+    const reaction = convertSignalReaction(envelope);
+    if (reaction) {
+      await this.handleReaction(reaction);
+      return;
+    }
+
     const converted = convertSignalEnvelope(envelope);
     if (!converted) {
-      // Reaction, sync, view-once, empty content, group management — silently ignored.
+      // Sync, view-once, empty content, group management — silently ignored.
       // Logged at debug so operators can verify the filter is working without log spam.
       this.log.debug(
         { source: envelope.sourceNumber, hasData: !!envelope.dataMessage },
@@ -123,7 +180,7 @@ export class SignalAdapter implements Channel {
       return;
     }
 
-    const { conversationId, senderId, content, metadata } = converted;
+    const { conversationId, senderId, metadata } = converted;
 
     // ------------------------------------------------------------------
     // Step 0: Group trust check
@@ -145,32 +202,24 @@ export class SignalAdapter implements Channel {
     // so the dispatcher's contact resolver can find the record immediately.
     let isKnownSender = false;
     try {
-      const existing = await this.config.contactService.resolveByChannelIdentity('signal', senderId);
-
-      if (existing) {
-        // Known sender: tier >= 'known' counts as "known" for read-receipt purposes.
-        // The dispatcher enforces hold/block policy. Uses a positive allowlist via
-        // meetsMinimumTier() (issue #945) so an unexpected tier value fails safe to
-        // "not known" rather than the prior denylist (!== 'unknown' && !== 'blocked'),
-        // which would have treated any unrecognized value as known.
-        isKnownSender = meetsMinimumTier(existing.tier, 'known');
-      } else {
-        // New sender — auto-create a contact at tier='unknown'.
-        // signal_participant is auto-verified (per contact-service.ts) so the phone
-        // number identity gets verified:true at creation time, matching email_participant.
-        // Display name comes from Signal's profile; phone number is the E.164 fallback.
-        const contact = await this.config.contactService.createContact({
-          displayName: metadata.sourceName || senderId,
-          fallbackDisplayName: senderId,
-          source: 'signal_participant',
-          tier: 'unknown',
-        });
-        await this.config.contactService.linkIdentity({
-          contactId: contact.id,
-          channel: 'signal',
-          channelIdentifier: senderId,
-          source: 'signal_participant',
-        });
+      // Resolve-or-create via ContactService so the create→link→orphan-cleanup dance
+      // is shared with Slack (and future Voice/SMS). signal_participant is auto-verified
+      // inside linkIdentity. Display name stays resolved here (Signal profile / E.164).
+      const { tier, created } = await this.config.contactService.ensureChannelContact({
+        channel: 'signal',
+        channelIdentifier: senderId,
+        source: 'signal_participant',
+        displayName: metadata.sourceName || senderId,
+        fallbackDisplayName: senderId,
+        tier: 'unknown',
+      });
+      // Known sender: tier >= 'known' counts as "known" for read-receipt purposes.
+      // The dispatcher enforces hold/block policy. Uses a positive allowlist via
+      // meetsMinimumTier() (issue #945) so an unexpected tier value fails safe to
+      // "not known" rather than the prior denylist (!== 'unknown' && !== 'blocked'),
+      // which would have treated any unrecognized value as known.
+      isKnownSender = meetsMinimumTier(tier, 'known');
+      if (created) {
         this.log.info({ senderId, sourceName: metadata.sourceName }, 'Auto-created contact from Signal sender');
       }
     } catch (err) {
@@ -203,12 +252,31 @@ export class SignalAdapter implements Channel {
     }
 
     // ------------------------------------------------------------------
-    // Step 3: Sanitize and publish
+    // Step 3: Voice-note transcription (#1600)
+    // ------------------------------------------------------------------
+    // Audio attachments are downloaded and transcribed into ordinary inbound
+    // content. STT unavailable → existing text path (audio-only messages drop).
+    const { content: inboundContent, metadata: inboundMetadata } =
+      await this.resolveInboundContent(converted, {
+        // 1:1: only known senders trigger download + paid STT. Groups already
+        // passed Step 0 trust; unknown 1:1 senders degrade like STT-disabled.
+        allowStt: metadata.isGroup || isKnownSender,
+      });
+    if (inboundContent === null) {
+      this.log.debug(
+        { senderId, hasAttachments: !!metadata.attachments?.length },
+        'Signal adapter: skipping empty inbound after voice-note handling',
+      );
+      return;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 4: Sanitize and publish
     // ------------------------------------------------------------------
     // Sanitize content to mitigate prompt injection from external senders.
     // Signal messages are shorter than emails but carry the same injection risk —
     // a malicious sender could craft a message that looks like system instructions.
-    const sanitizedContent = sanitizeOutput(content, {
+    const sanitizedContent = sanitizeOutput(inboundContent, {
       maxLength: 10_000,
     });
 
@@ -217,7 +285,7 @@ export class SignalAdapter implements Channel {
       channelId: 'signal',
       senderId,
       content: sanitizedContent,
-      metadata: metadata as unknown as Record<string, unknown>,
+      metadata: inboundMetadata as unknown as Record<string, unknown>,
     });
 
     await this.config.bus.publish('channel', event);
@@ -225,6 +293,49 @@ export class SignalAdapter implements Channel {
     this.log.info(
       { senderId, sourceName: metadata.sourceName, isGroup: metadata.isGroup, conversationId },
       'Signal message received and published to bus',
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private: reactions
+  // ---------------------------------------------------------------------------
+
+  private async handleReaction(
+    converted: NonNullable<ReturnType<typeof convertSignalReaction>>,
+  ): Promise<void> {
+    // Best-effort contact resolve/create so dispatch trust can resolve the reactor.
+    try {
+      await this.config.contactService.ensureChannelContact({
+        channel: 'signal',
+        channelIdentifier: converted.senderId,
+        source: 'signal_participant',
+        displayName: converted.metadata.sourceName || converted.senderId,
+        fallbackDisplayName: converted.senderId,
+        tier: 'unknown',
+      });
+    } catch (err) {
+      this.log.warn({ err, senderId: converted.senderId }, 'Failed to resolve/auto-create Signal contact for reaction');
+    }
+
+    const inbound = createInboundReaction({
+      conversationId: converted.conversationId,
+      channelId: 'signal',
+      senderId: converted.senderId,
+      emoji: converted.emoji,
+      targetMessageId: converted.targetMessageId,
+      metadata: converted.metadata as unknown as Record<string, unknown>,
+    });
+
+    await this.config.bus.publish('channel', inbound);
+
+    this.log.info(
+      {
+        senderId: converted.senderId,
+        emoji: converted.emoji,
+        targetMessageId: converted.targetMessageId,
+        isRemove: converted.metadata.isRemove,
+      },
+      'Signal reaction received and published to bus',
     );
   }
 
@@ -241,7 +352,7 @@ export class SignalAdapter implements Channel {
       // outboundGateway is available (see index.ts wiring). If this fires, it
       // indicates a wiring bug: the adapter was constructed without a gateway.
       // Logged at error (not warn) because the coordinator's response is silently
-      // lost — the CEO sent a message and got no reply.
+      // lost — the principal sent a message and got no reply.
       // TODO: once the gateway always has a Signal client when this adapter is
       // active, convert this to an explicit assertion.
       this.log.error({ conversationId }, 'Signal adapter: outbound gateway not available — reply dropped. Check index.ts wiring.');
@@ -277,6 +388,8 @@ export class SignalAdapter implements Channel {
       taskEventId: outbound.payload.taskEventId,
       conversationId: outbound.payload.conversationId,
       parentEventId: outbound.id,   // link the outbound.delivered row back to the outbound.message event
+      // A relayed reply: postTurn, the dispatcher-relay hold recipe, and approval (#2159).
+      ...relaySendOptions(outbound, outbound.payload.recipientId ?? conversationTarget),
     });
 
     if (result.success) {
@@ -340,46 +453,18 @@ export class SignalAdapter implements Channel {
       // ledger stays complete. The group message routes to the coordinator in low-trust mode
       // rather than being held — the coordinator applies read-only constraints.
       for (const phone of trust.unknownMembers) {
-        let contact: { id: string } | null = null;
         try {
-          contact = await this.config.contactService.createContact({
-            displayName: phone,
-            fallbackDisplayName: phone,
-            source: 'signal_participant',
-            tier: 'unknown',
-          });
-        } catch (err) {
-          this.log.warn({ err, phone }, 'Signal adapter: failed to create contact for unknown group member');
-          continue;
-        }
-        try {
-          await this.config.contactService.linkIdentity({
-            contactId: contact.id,
+          await this.config.contactService.ensureChannelContact({
             channel: 'signal',
             channelIdentifier: phone,
             source: 'signal_participant',
+            displayName: phone,
+            fallbackDisplayName: phone,
+            tier: 'unknown',
           });
-        } catch (linkErr) {
-          const isDuplicate = (linkErr as { code?: string }).code === '23505';
-          // Always clean up the newly created contact — linkIdentity failed regardless of reason.
-          // 23505: identity already belongs to an existing contact (prior 1:1 message from this
-          // phone). Non-23505: unexpected DB failure. In both cases the new contact row is
-          // orphaned with no identity and must be deleted.
-          try {
-            await this.config.contactService.deleteContact(contact.id);
-          } catch (cleanupErr) {
-            this.log.warn(
-              { cleanupErr, orphanId: contact.id, phone },
-              'Signal adapter: failed to clean up orphan contact after linkIdentity failure',
-            );
-          }
-          if (isDuplicate) {
-            // Expected: phone already has a signal identity from a prior 1:1 message.
-            // The existing contact will be resolved normally by the dispatcher.
-            this.log.debug({ phone }, 'Signal adapter: skipping group member create — signal identity already exists for this phone');
-          } else {
-            this.log.warn({ err: linkErr, phone }, 'Signal adapter: linkIdentity failed for unknown group member — orphan cleaned up');
-          }
+        } catch (err) {
+          // Best-effort: a failed ensure must not block the group inbound publish.
+          this.log.warn({ err, phone }, 'Signal adapter: failed to ensure contact for unknown group member');
         }
       }
 
@@ -392,6 +477,92 @@ export class SignalAdapter implements Channel {
     }
 
     return true; // all members verified — proceed
+  }
+
+  /**
+   * Transcribe a Signal audio attachment when SpeechMediaService is configured.
+   * Returns null content when there is nothing to publish (audio-only + STT off
+   * / untrusted 1:1 sender).
+   */
+  private async resolveInboundContent(
+    converted: NonNullable<ReturnType<typeof convertSignalEnvelope>>,
+    opts: { allowStt: boolean },
+  ): Promise<{
+    content: string | null;
+    metadata: typeof converted.metadata & Record<string, unknown>;
+  }> {
+    const audio = findFirstAudioAttachment(converted.metadata.attachments);
+    const speech = this.config.speechMediaService;
+    const metadata: typeof converted.metadata & Record<string, unknown> = {
+      ...converted.metadata,
+    };
+    const skippedAudioCount = Math.max(0, countAudioAttachments(converted.metadata.attachments) - 1);
+
+    if (!audio || !speech || !opts.allowStt) {
+      if (!converted.content) {
+        return { content: null, metadata };
+      }
+      return { content: converted.content, metadata };
+    }
+
+    if (skippedAudioCount > 0) {
+      this.log.info(
+        { attachmentId: audio.id, skippedAudioCount, senderId: converted.senderId },
+        'Signal voice note: extra audio attachments not transcribed',
+      );
+    }
+
+    let resolved;
+    if (isVoiceNoteOversize(audio.size)) {
+      this.log.warn(
+        { attachmentId: audio.id, size: audio.size, senderId: converted.senderId },
+        'Signal voice note exceeds size cap — skipping download',
+      );
+      resolved = voiceNoteTooLarge(converted.content, audio.size, skippedAudioCount);
+    } else {
+      try {
+        const recipient = converted.metadata.isGroup
+          ? undefined
+          : (converted.senderId || converted.metadata.sourceUuid);
+        const bytes = await this.config.rpcClient.getAttachment({
+          id: audio.id,
+          recipient,
+          groupId: converted.metadata.groupId,
+        });
+        const result = await speech.transcribe({
+          audio: bytes,
+          contentType: audio.contentType,
+        });
+        if (!result.ok) {
+          this.log.error(
+            {
+              errorType: result.error.type,
+              retryable: result.error.retryable,
+              status: result.error.context.status,
+              senderId: converted.senderId,
+            },
+            'Signal voice note transcription failed',
+          );
+        }
+        resolved = resolveVoiceNoteInbound({
+          originalText: converted.content,
+          result,
+          skippedAudioCount,
+        });
+      } catch (err) {
+        this.log.warn(
+          { err, attachmentId: audio.id, senderId: converted.senderId },
+          'Signal voice note download failed',
+        );
+        resolved = voiceNoteDownloadFailure(converted.content, err, skippedAudioCount);
+      }
+    }
+
+    metadata.transcribedFromAudio = true;
+    if (resolved.transcriptionError) {
+      metadata.transcriptionError = resolved.transcriptionError;
+    }
+    return { content: resolved.content, metadata };
   }
 
 }

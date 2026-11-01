@@ -1,0 +1,20 @@
+{
+  "name": "email-archive",
+  "description": "Archive an email by removing it from the inbox. Use for emails that need no action — receipts, newsletters, automated notifications. Silently moves the message out of INBOX.",
+  "version": "1.0.2",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "message_id": "string (Nylas message ID of the email to archive)",
+    "account": "string? (named account to archive from, as configured under Settings → Channels → Email → Email accounts. Defaults to the primary account if omitted.)"
+  },
+  "outputs": {
+    "archived": "boolean — true when the message was successfully archived"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000,
+  "capabilities": [
+    "outboundGateway"
+  ]
+}

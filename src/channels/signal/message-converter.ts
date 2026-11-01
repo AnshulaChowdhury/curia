@@ -5,22 +5,24 @@
 //
 // Many envelope types arrive that we don't want to process as messages:
 //   - syncMessage: the agent sent this from another device — not inbound
-//   - reaction: emoji reaction to a prior message — ignored per spec (MVP)
+//   - reaction: handled separately via convertSignalReaction → inbound.reaction
 //   - viewOnce: self-destructing message — skip (we don't want LLM context on ephemeral content)
 //   - null/empty message: attachment-only or other non-text envelope
+//     (audio attachments are an exception — the adapter transcribes them, #1600)
 //   - group management events (UPDATE/QUIT): not displayable content
 // All ignored cases return null so the adapter can skip them cleanly.
 
 import type { SignalEnvelope, SignalAttachment } from './types.js';
+import { findFirstAudioAttachment } from '../inbound-voice-note.js';
 
 // ---------------------------------------------------------------------------
-// Output type
+// Output types
 // ---------------------------------------------------------------------------
 
 export interface ConvertedSignalMessage {
   conversationId: string;
   channelId: 'signal';
-  /** E.164 sender phone number — used as the bus senderId */
+  /** E.164 number, or ACI UUID when `sourceNumber` is empty. */
   senderId: string;
   content: string;
   metadata: {
@@ -36,8 +38,48 @@ export interface ConvertedSignalMessage {
     groupId?: string;
     /** True when the message arrived in a group chat */
     isGroup: boolean;
+    /**
+     * Sender ACI (Signal UUID). Used as `getAttachment` recipient fallback when
+     * `sourceNumber` is empty (username / ACI-only senders).
+     */
+    sourceUuid?: string;
     attachments?: SignalAttachment[];
   };
+}
+
+/**
+ * Channel-agnostic reaction shape. Emoji→intent mapping lives in dispatch/approval.
+ * `isRemove` is carried in metadata so the mapper can no-op un-reacts (#1479).
+ */
+export interface ConvertedSignalReaction {
+  conversationId: string;
+  channelId: 'signal';
+  senderId: string;
+  emoji: string;
+  /** Stringified Signal targetTimestamp — correlates to outbound.delivered.messageId. */
+  targetMessageId: string;
+  metadata: {
+    sourceName: string;
+    targetAuthor: string;
+    isRemove: boolean;
+    signalTimestamp: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/**
+ * Prefer E.164 `sourceNumber`; fall back to ACI `sourceUuid` for username /
+ * ACI-only senders. Returns undefined when neither is usable.
+ */
+export function signalSenderIdentity(envelope: SignalEnvelope): string | undefined {
+  const number = envelope.sourceNumber?.trim() ?? '';
+  if (number.length > 0) return number;
+  const uuid = envelope.sourceUuid?.trim() ?? '';
+  if (uuid.length > 0) return uuid;
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,7 +94,7 @@ export interface ConvertedSignalMessage {
  *   - reaction (emoji reaction — no text content)
  *   - viewOnce (ephemeral content)
  *   - no dataMessage
- *   - null or empty message text
+ *   - null or empty message text with no audio attachment
  *   - group management events (type !== 'DELIVER')
  */
 export function convertSignalEnvelope(
@@ -70,9 +112,7 @@ export function convertSignalEnvelope(
   // than storing their content in working memory or the audit log.
   if (data.viewOnce) return null;
 
-  // Reactions don't carry actionable text content — ignored for MVP per spec.
-  // A future version could acknowledge reactions or use them as signals (e.g.,
-  // thumbs-up = approve pending action), but that's out of scope for the first pass.
+  // Reactions are normalized separately via convertSignalReaction → inbound.reaction.
   if (data.reaction) return null;
 
   // Skip group management events (someone added/left the group, group name changed, etc.)
@@ -80,13 +120,16 @@ export function convertSignalEnvelope(
   const groupInfo = data.groupInfo;
   if (groupInfo && groupInfo.type !== 'DELIVER') return null;
 
-  // Empty or whitespace-only messages have no content worth routing to the LLM.
+  // Empty or whitespace-only messages have no content worth routing to the LLM
+  // unless they carry audio (voice note) — the adapter transcribes those (#1600).
   const rawContent = data.message?.trim() ?? '';
-  if (!rawContent) return null;
+  const hasAudio = !!findFirstAudioAttachment(data.attachments);
+  if (!rawContent && !hasAudio) return null;
 
   // Build conversation ID.
   // Group: signal:group=<base64GroupId>  — stable across all members
-  // 1:1:   signal:<E.164 number>         — the sender's phone number
+  // 1:1:   signal:<sender identity>      — E.164, or ACI UUID when the number
+  //                                        is empty (username / ACI-only senders)
   // The `group=` prefix prevents collisions between a group ID that happens to
   // look like a phone number and an actual 1:1 conversation.
   //
@@ -95,22 +138,65 @@ export function convertSignalEnvelope(
   // (signal-cli always sets groupId for group messages), but be defensive.
   if (groupInfo && !groupInfo.groupId) return null;
 
+  const senderId = signalSenderIdentity(envelope);
+  if (!senderId) return null;
+
   const isGroup = !!groupInfo;
   const conversationId = isGroup
     ? `signal:group=${groupInfo.groupId}`
-    : `signal:${envelope.sourceNumber}`;
+    : `signal:${senderId}`;
 
   return {
     conversationId,
     channelId: 'signal',
-    senderId: envelope.sourceNumber,
+    senderId,
     content: rawContent,
     metadata: {
       sourceName: envelope.sourceName,
       signalTimestamp: envelope.timestamp,
       groupId: groupInfo?.groupId,
       isGroup,
+      sourceUuid: envelope.sourceUuid || undefined,
       attachments: data.attachments?.length ? data.attachments : undefined,
+    },
+  };
+}
+
+/**
+ * Normalize a Signal reaction envelope into a channel-agnostic reaction shape.
+ * Returns null for non-reaction envelopes or reactions missing required fields.
+ * Does not map emoji→intent — that belongs in dispatch/approval (#1479).
+ */
+export function convertSignalReaction(
+  envelope: SignalEnvelope,
+): ConvertedSignalReaction | null {
+  if (envelope.syncMessage) return null;
+
+  const data = envelope.dataMessage;
+  const reaction = data?.reaction;
+  if (!reaction) return null;
+
+  const emoji = reaction.emoji?.trim();
+  if (!emoji) return null;
+  if (typeof reaction.targetTimestamp !== 'number' || !Number.isFinite(reaction.targetTimestamp)) {
+    return null;
+  }
+  const senderId = signalSenderIdentity(envelope);
+  if (!senderId) return null;
+
+  // Best-effort conversation key (1:1 with the reactor). Approval correlation
+  // keys on targetMessageId ↔ outbound.delivered.messageId, not conversationId.
+  return {
+    conversationId: `signal:${senderId}`,
+    channelId: 'signal',
+    senderId,
+    emoji,
+    targetMessageId: String(reaction.targetTimestamp),
+    metadata: {
+      sourceName: envelope.sourceName,
+      targetAuthor: reaction.targetAuthor,
+      isRemove: Boolean(reaction.isRemove),
+      signalTimestamp: envelope.timestamp,
     },
   };
 }

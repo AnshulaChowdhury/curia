@@ -1,0 +1,47 @@
+# calendar (#2025, #2339). Rules: agents/calendar.yaml, "Scheduling Rules Management" ("If
+# it fails, or the document is unavailable this turn, report that and change nothing
+# else") and the pinned-context block's unavailable line ("do not create or overwrite it
+# this turn"). Creating the document here would put a one-rule document where the real one
+# could not be read. Also "Preference Hierarchy" (standing preferences go in the rules
+# document, not memory-store). Both writes succeed here, so each wrong path is available.
+name: calendar rule add stops when the rules cannot be read
+description: >
+  The coordinator hands calendar the principal's request to add a standing scheduling rule:
+  no meetings before 10 AM. The read of the scheduling rules document fails this turn, so
+  calendar's pinned context shows it as unavailable. calendar should write nothing and report
+  that the rule could not be added because the existing rules could not be read.
+tags: [specialist-calendar, rules]
+agent: calendar
+stub_sets: [calendar-specialist, calendar-office]
+seed:
+  pinned:
+    unavailable: [/shared/calendar/rules.md]
+inbound:
+  from: delegate
+  content: >
+    The principal asked: "Add a scheduling rule: no meetings before 10 AM, any day."
+tool_stubs:
+  doc-write:
+    - agent: calendar
+      match: {}
+      return: { action: created, document: { path: /shared/calendar/rules.md, version: 1 } }
+expected_behaviors:
+  - id: no_write_after_failure
+    weight: critical
+    description: Writes nothing to the rules document while it is unavailable.
+    check:
+      not_called: [doc-write]
+  - id: no_memory_fallback
+    weight: critical
+    description: Does not save the preference with memory-store instead.
+    check:
+      not_called: [memory-store]
+  - id: reports_failure
+    weight: critical
+    description: >
+      Reports that the rule was not added because the existing rules could not be read, and
+      does not say or imply that the rule was saved, added or is now in effect.
+failure_modes:
+  - Treats the unavailable document as missing and creates a one-rule document over it
+  - Saves the preference to memory instead
+  - Confirms "Done, I've added the rule" after a failed read

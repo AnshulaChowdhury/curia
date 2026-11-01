@@ -4,7 +4,7 @@ import type { Layer, EventType } from './events.js';
 // Phase 6: agent layer can publish memory.store and memory.query for the KG audit trail;
 //          system layer gets full access so audit logger and monitoring can observe these events.
 // #280 (decay warning): system layer publishes memory.decay_warning when DreamEngine
-//          flags an important node for CEO re-confirmation before archival.
+//          flags an important node for principal re-confirmation before archival.
 // Contacts Phase A: dispatch layer publishes contact.resolved and contact.unknown after resolution;
 //                   system layer gets full access for audit logging.
 // Error Recovery: agent layer can publish agent.error; dispatch layer subscribes to notify users;
@@ -21,7 +21,7 @@ import type { Layer, EventType } from './events.js';
 //          system layer gets full access to both for audit logging and monitoring.
 // Spec 06 (secrets isolation): execution layer publishes secret.accessed for every ctx.secret() call;
 //          system layer gets full access for audit logging and monitoring.
-// PII redaction (#249): dispatch layer publishes outbound.pii-redacted when PII is scrubbed
+// PII redaction (#249): dispatch layer publishes outbound.pii_redacted when PII is scrubbed
 //          from an outbound message; system layer gets full access for future audit subscribers.
 // contact-register skill (#485): execution layer publishes contact.resolved when an agent registers
 //          a contact interaction outside the dispatcher pipeline (e.g. ceo-inbox reading Nylas directly).
@@ -32,28 +32,83 @@ import type { Layer, EventType } from './events.js';
 //          channel.stalled (watchdog alert); system layer subscribes for audit logging.
 // #847 (dispatcher reply-lock): dispatch layer publishes outbound.suppressed_duplicate when
 //          a human-facing reply skill already fired during the same task; dispatch layer
-//          subscribes to skill.result to detect the reply and set the reply-lock flag.
+//          subscribes to tool.result to detect the reply and set the reply-lock flag.
+// #1732 (dispatcher no-reply): dispatch layer publishes outbound.no_reply when an
+//          agent.response is the NO_REPLY sentinel — silence is auditable, not a drop.
+// #1733 (dispatcher relay Gate C): dispatch layer publishes authorization.decision for
+//          Gate C allow/escalate on the auto-reply relay; subscribes to authorization.decision
+//          (and tool.result failures) so a reply-skill Gate C escalate suppresses the relay.
 // #972 (secret-capture resume): system layer publishes secret.captured when a one-time capture
 //          link is redeemed (carries name/routing only, never the value); the resume subscriber
 //          and audit logger subscribe via the system layer.
+// #813 (model fallback): agent layer publishes model.fallback when the primary tier model is
+//          unavailable and execution falls through to the fallback tier's model.
+//          system layer subscribes for audit logging and monitoring.
+// #434 (health observability): agent layer publishes llm.error on failed LLM calls;
+//          system layer publishes embedding.error on failed embedding calls (infrastructure path,
+//          same as embedding.call); system layer subscribes for HealthService outcome tracking.
+// #1379 (authorization audit): dispatch layer publishes authorization.decision after
+//          AuthorizationService.evaluate (Gate-1 + three-layer); execution layer publishes
+//          the same type for Gate C allow/escalate; system layer subscribes for audit logging.
+// #1414 (voice scaffold): channel layer publishes voice.session.started/ended lifecycle
+//          events; system layer gets full access for audit logging and observability.
+// #1380 (outbound queue): channel layer publishes channel.disconnected / channel.reconnect;
+//          system layer subscribes so OutboundGateway can flush the durable queue.
+// #1799 (late delegation): agent layer publishes delegation.timed_out when a delegate wait
+//          times out with the specialist possibly still running (the runtime owns that decision
+//          and stays DB-free); system layer publishes delegation.late_resolved when the handle is
+//          resolved, and subscribes to both so LateDelegationSubscriber can persist and act.
+// #1859 (delegated requester evidence): agent layer publishes delegation.requester_context
+//          when a specialist task renders or drops the harness identity block. System layer
+//          can publish and subscribe; the audit row itself is the write-ahead hook.
+// #1990 (principal note): agent layer publishes delegation.principal_note when a reply
+//          written for an outside sender carried a note for the principal. Only the system
+//          layer subscribes: the note is cut out of that reply and must never reach a sender.
+// #2159 (report queue): dispatch and system publish principal.report — items for the
+//          principal's digest. Only system subscribes (the audit logger): channels and agents
+//          never see it, so a report about what Curia did can't reach a sender.
+//          execution publishes it too, for actions Gate C let through under band gating.
+// #1320 (relay budget): dispatch (the outbound gateway) publishes autonomy.relay_deferred when
+//          a relay to the principal goes to the digest. Only system subscribes (the audit logger).
+// #1911 (outbound judge audit): dispatch layer publishes outbound.judge for every Stage-2
+//          decision (pass/block/skip/failed_open) so fail-open delivery is visible in audit_log.
+// #2233 (KG node merge): NodeMergeService (src/kg-merge/service.ts) publishes kg.nodes_merged
+//          through the system layer after COMMIT, as system.ts does for system.restart; only
+//          system subscribes (audit logger).
+// #2251 (activity feed): ActivitySummarizer publishes activity.summary through the system
+//          layer when a conversational job ends; only system subscribes (audit logger). The
+//          console feed reads the audit row back instead of calling a model at read time.
+// #2322 (meeting minutes): the meetings pipeline publishes minutes.ready and
+//          minutes.pipeline_failed through the system layer. Only system subscribes
+//          (audit logger, and the structuring task on minutes.ready).
+// #2018 (mid-turn injection): the agent runtime publishes agent.task.input_injected when a
+//          same-contact follow-up is drained into the live turn. System publishes and
+//          subscribes (audit). The payload has no message body. Dispatch, channels, and
+//          execution neither publish nor subscribe — a channel must not be able to declare
+//          that its text was injected into someone else's turn.
 const publishAllowlist: Record<Layer, Set<EventType>> = {
-  channel: new Set(['inbound.message', 'channel.poll', 'channel.stalled']),
-  dispatch: new Set(['agent.task', 'outbound.message', 'outbound.blocked', 'outbound.delivered', 'outbound.pii-redacted', 'outbound.suppressed_duplicate', 'outbound.notification', 'contact.resolved', 'contact.unknown', 'message.rejected', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'conversation.checkpoint', 'human.decision', 'autonomy.send_blocked']),
-  agent: new Set(['agent.response', 'agent.error', 'skill.invoke', 'skill.result', 'memory.store', 'memory.query', 'agent.discuss', 'llm.call', 'context.budget']),
-  execution: new Set(['skill.result', 'secret.accessed', 'autonomy.skill_blocked', 'contact.resolved']),
-  system: new Set(['inbound.message', 'agent.task', 'agent.response', 'agent.error', 'outbound.message', 'outbound.blocked', 'outbound.delivered', 'outbound.pii-redacted', 'outbound.suppressed_duplicate', 'outbound.notification', 'skill.invoke', 'skill.result', 'memory.store', 'memory.query', 'memory.decay_warning', 'contact.resolved', 'contact.unknown', 'message.rejected', 'schedule.created', 'schedule.fired', 'schedule.suspended', 'schedule.recovered', 'schedule.drift_paused', 'config.change', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'agent.discuss', 'conversation.checkpoint', 'llm.call', 'context.budget', 'human.decision', 'secret.accessed', 'secret.captured', 'autonomy.skill_blocked', 'autonomy.send_blocked', 'embedding.call']),
+  channel: new Set(['inbound.message', 'inbound.reaction', 'channel.poll', 'channel.stalled', 'channel.disconnected', 'channel.reconnect', 'voice.session.started', 'voice.session.ended']),
+  dispatch: new Set(['agent.task', 'outbound.message', 'outbound.blocked', 'outbound.judge', 'outbound.delivered', 'outbound.pii_redacted', 'outbound.suppressed_duplicate', 'outbound.no_reply', 'outbound.notification', 'contact.resolved', 'contact.unknown', 'message.rejected', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'conversation.checkpoint', 'human.decision', 'authorization.decision', 'autonomy.send_blocked', 'autonomy.relay_deferred', 'principal.report']),
+  agent: new Set(['agent.response', 'agent.error', 'agent.task.input_injected', 'tool.invoke', 'tool.result', 'memory.store', 'memory.query', 'agent.discuss', 'llm.call', 'llm.error', 'context.budget', 'model.fallback', 'delegation.timed_out', 'delegation.requester_context', 'delegation.principal_note']),
+  execution: new Set(['tool.result', 'secret.accessed', 'autonomy.tool_blocked', 'authorization.decision', 'contact.resolved', 'task.created', 'task.updated', 'task.completed', 'export.delivered', 'principal.report']),
+  system: new Set(['inbound.message', 'inbound.reaction', 'agent.task', 'agent.task.input_injected', 'agent.response', 'agent.error', 'outbound.message', 'outbound.blocked', 'outbound.judge', 'outbound.delivered', 'export.delivered', 'outbound.pii_redacted', 'outbound.suppressed_duplicate', 'outbound.no_reply', 'outbound.notification', 'tool.invoke', 'tool.result', 'memory.store', 'memory.query', 'memory.decay_warning', 'contact.resolved', 'contact.unknown', 'message.rejected', 'schedule.created', 'schedule.fired', 'schedule.suspended', 'schedule.recovered', 'schedule.drift_paused', 'config.change', 'system.restart', 'document.console_action', 'kg.nodes_merged', 'activity.summary', 'minutes.ready', 'minutes.pipeline_failed', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'agent.discuss', 'conversation.checkpoint', 'checkpoint.extraction_skipped', 'llm.call', 'llm.error', 'embedding.call', 'embedding.error', 'context.budget', 'model.fallback', 'human.decision', 'authorization.decision', 'secret.accessed', 'secret.captured', 'autonomy.tool_blocked', 'autonomy.send_blocked', 'autonomy.relay_deferred', 'task.resumable_throughput', 'voice.session.started', 'voice.session.ended', 'channel.poll', 'channel.stalled', 'channel.disconnected', 'channel.reconnect', 'delegation.timed_out', 'delegation.late_resolved', 'delegation.requester_context', 'delegation.principal_note', 'principal.report']),
 };
 
 // agent.discuss subscribe for 'dispatch': used by BullpenDispatcher (wired in index.ts after agent registration).
-// skill.result subscribe for 'dispatch': used by Dispatcher reply-lock (#847) to detect successful
+// tool.result subscribe for 'dispatch': used by Dispatcher reply-lock (#847) to detect successful
 //          email-reply / email-send calls and set humanReplySent on the routing entry before
 //          handleAgentResponse fires.
+// authorization.decision subscribe for 'dispatch': used by Dispatcher (#1733) to mark
+//          replySkillGateCBlocked when Gate C escalates a reply skill on a routed task.
+// #1355 (content-block relay retry): dispatch layer subscribes to outbound.blocked and
+//          outbound.delivered to retry or salvage dispatcher-relayed replies blocked by
+//          the content filter after the agent turn has ended.
 const subscribeAllowlist: Record<Layer, Set<EventType>> = {
   channel: new Set(['outbound.message', 'outbound.blocked', 'outbound.notification', 'message.rejected']),
-  dispatch: new Set(['inbound.message', 'agent.response', 'agent.error', 'agent.discuss', 'skill.result']),
-  agent: new Set(['agent.task', 'skill.result']),
-  execution: new Set(['skill.invoke']),
-  system: new Set(['inbound.message', 'agent.task', 'agent.response', 'agent.error', 'outbound.message', 'outbound.blocked', 'outbound.delivered', 'outbound.pii-redacted', 'outbound.suppressed_duplicate', 'outbound.notification', 'skill.invoke', 'skill.result', 'memory.store', 'memory.query', 'memory.decay_warning', 'contact.resolved', 'contact.unknown', 'message.rejected', 'schedule.created', 'schedule.fired', 'schedule.suspended', 'schedule.recovered', 'schedule.drift_paused', 'config.change', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'agent.discuss', 'conversation.checkpoint', 'llm.call', 'context.budget', 'human.decision', 'secret.accessed', 'secret.captured', 'autonomy.skill_blocked', 'autonomy.send_blocked', 'embedding.call', 'channel.poll', 'channel.stalled']),
+  dispatch: new Set(['inbound.message', 'inbound.reaction', 'agent.response', 'agent.error', 'agent.discuss', 'tool.result', 'authorization.decision', 'outbound.blocked', 'outbound.delivered', 'autonomy.send_blocked']),
+  agent: new Set(['agent.task', 'tool.result']),
+  execution: new Set(['tool.invoke']),
+  system: new Set(['inbound.message', 'inbound.reaction', 'agent.task', 'agent.task.input_injected', 'agent.response', 'agent.error', 'outbound.message', 'outbound.blocked', 'outbound.judge', 'outbound.delivered', 'export.delivered', 'outbound.pii_redacted', 'outbound.suppressed_duplicate', 'outbound.no_reply', 'outbound.notification', 'tool.invoke', 'tool.result', 'memory.store', 'memory.query', 'memory.decay_warning', 'contact.resolved', 'contact.unknown', 'message.rejected', 'schedule.created', 'schedule.fired', 'schedule.suspended', 'schedule.recovered', 'schedule.drift_paused', 'config.change', 'system.restart', 'document.console_action', 'kg.nodes_merged', 'activity.summary', 'minutes.ready', 'minutes.pipeline_failed', 'contact.duplicate_detected', 'contact.merged', 'contact.elevated', 'agent.discuss', 'conversation.checkpoint', 'checkpoint.extraction_skipped', 'llm.call', 'llm.error', 'embedding.call', 'embedding.error', 'context.budget', 'model.fallback', 'human.decision', 'authorization.decision', 'secret.accessed', 'secret.captured', 'autonomy.tool_blocked', 'autonomy.send_blocked', 'autonomy.relay_deferred', 'channel.poll', 'channel.stalled', 'channel.disconnected', 'channel.reconnect', 'task.created', 'task.updated', 'task.completed', 'task.resumable_throughput', 'voice.session.started', 'voice.session.ended', 'delegation.timed_out', 'delegation.late_resolved', 'delegation.requester_context', 'delegation.principal_note', 'principal.report']),
 };
 
 export function canPublish(layer: Layer, eventType: EventType): boolean {

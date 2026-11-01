@@ -1,6 +1,6 @@
 import { Readable } from 'node:stream';
 import { google } from 'googleapis';
-import type { SkillHandler, SkillContext, SkillResult } from '../../src/skills/types.js';
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
 import { MAX_TEMP_FILE_BYTES } from '../../src/skills/temp-file-store.js';
 import { getDriveClient } from '../../src/google/drive-auth.js';
 
@@ -78,8 +78,8 @@ async function streamToBuffer(stream: Readable, maxBytes: number): Promise<Buffe
   });
 }
 
-export class DriveDownloadFileHandler implements SkillHandler {
-  async execute(ctx: SkillContext): Promise<SkillResult> {
+export class DriveDownloadFileHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
     if (!ctx.writeTempFile) {
       return { success: false, error: 'drive-download-file requires tempFileStore capability' };
     }
@@ -102,10 +102,20 @@ export class DriveDownloadFileHandler implements SkillHandler {
     const filenameHint =
       typeof rawFilename === 'string' && rawFilename.trim() ? rawFilename.trim() : undefined;
 
-    // Auth
+    // Auth — resolve the three OAuth secrets through ctx.secret() so the read is
+    // audited (secret.accessed) and prefers the encrypted vault (#913). ctx.secret()
+    // is vault-first with a process.env fallback only while a secret has not yet
+    // been seeded (the #911 migration model) — once the vars are out of .env the
+    // vault is the sole source. getDriveClient still accepts options, so the values
+    // flow in explicitly instead of being re-read from the env there. ctx.secret()
+    // throws if a declared secret is unset everywhere; catch it and surface a clean
+    // skill error rather than letting it propagate (skills never throw).
     let auth: Awaited<ReturnType<typeof getDriveClient>>;
     try {
-      auth = await getDriveClient();
+      const clientId = ctx.secret('google_oauth_client_id');
+      const clientSecret = ctx.secret('google_oauth_client_secret');
+      const email = ctx.secret('curia_google_email');
+      auth = await getDriveClient({ clientId, clientSecret, email });
     } catch (err) {
       ctx.log.error({ err }, 'drive-download-file: getDriveClient failed');
       return { success: false, error: err instanceof Error ? err.message : String(err) };

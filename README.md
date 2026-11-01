@@ -7,8 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.36.0-blueviolet" alt="Version: 0.36.0" /></a>
-  <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Status: Pre-Alpha" />
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.44.0-blueviolet" alt="Version: 0.44.0" /></a>
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D24-brightgreen" alt="Node >= 24" />
   <img src="https://img.shields.io/badge/typescript-ESM-blue" alt="TypeScript ESM" />
@@ -67,7 +66,7 @@ name: expense-tracker
 description: Tracks and categorizes expenses from receipts and emails
 
 system_prompt: |
-  You are an expense tracking assistant for a CEO.
+  You are an expense tracking assistant for the principal.
   Extract amounts, vendors, categories, and dates from receipts.
 
 pinned_skills:
@@ -86,7 +85,7 @@ error_budget:
   max_cost_usd: 1.00
 ```
 
-Need custom logic? Add a TypeScript handler — same config, plus hooks for `onTask`, `onSkillResult`, and `beforeRespond`.
+Need custom logic? Add a TypeScript handler — same config, plus hooks for `onTask`, `onToolResult`, and `beforeRespond`.
 
 Skills come in two flavours (local handlers and MCP servers) behind a single interface. Agents discover new skills automatically; sensitive skills require your approval on first use.
 
@@ -96,7 +95,50 @@ Skills come in two flavours (local handlers and MCP servers) behind a single int
 
 ## Quickstart
 
-**Prerequisites:** [Docker](https://docs.docker.com/get-docker/), Node >= 24, pnpm, and an [Anthropic API key](https://console.anthropic.com).
+### Operator install (image)
+
+**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) (with the Compose plugin), `curl`, and an [Anthropic API key](https://console.anthropic.com). No Node or pnpm required.
+
+```bash
+mkdir curia && cd curia
+curl -fsSL https://github.com/josephfung/curia/releases/latest/download/install.sh -o install.sh
+# Review the script, then:
+bash install.sh
+```
+
+The installer pulls the published image, generates secrets, runs migrations inside the container, and prints your bootstrap secret. Curia will be running at `http://localhost:3000`.
+
+By default it installs the **latest release** — both the config files and the image come from it. To pin a specific version, prefix the run with `CURIA_VERSION` (this pins the config *and* the image together):
+
+```bash
+CURIA_VERSION=v0.40.1 bash install.sh
+```
+
+Save the bootstrap secret to a password manager and use it on the login page to create your account.
+
+**To update:** Back up your database first, then pull and restart. Migrations apply
+automatically on boot; re-running when already up to date is a safe no-op.
+
+```bash
+# 1. Back up the database (custom-format dump, restorable with pg_restore)
+docker compose exec -T postgres pg_dump -U curia -Fc curia > curia-backup-$(date +%Y%m%d).dump
+
+# 2. Pull new images and restart — the app migrates the schema on startup
+docker compose pull && docker compose up -d
+```
+
+If an update misbehaves, restore the backup: stop the app, restore in place
+(`--clean --if-exists` drops and recreates objects), then bring the stack back up.
+
+```bash
+docker compose stop curia
+docker compose exec -T postgres pg_restore -U curia -d curia --clean --if-exists < curia-backup-YYYYMMDD.dump
+docker compose up -d
+```
+
+### Developer install (source)
+
+For contributing or hacking on the code. Requires Node >= 24, pnpm, and [Docker](https://docs.docker.com/get-docker/) (with the Compose plugin) for the Postgres container.
 
 ```bash
 git clone https://github.com/josephfung/curia.git
@@ -104,10 +146,32 @@ cd curia
 pnpm run setup
 ```
 
-Curia will be running at `http://localhost:3000`. The setup script prints your bootstrap secret — save it to a password manager and use it on the login page to create your account.
-
 **[→ Full installation guide](https://docs.meetcuria.com/get-started/installation)**  
 (channels, production deploy, configuration reference)
+
+### Verifying release artifacts
+
+Every published release is signed with [cosign](https://github.com/sigstore/cosign) (keyless, via GitHub OIDC — no long-lived signing key). The SBOM, source tarball, and the install bundle's `SHA256SUMS` manifest each ship with a `.sigstore` bundle, verifiable against GitHub's OIDC issuer:
+
+```bash
+gh release download vX.Y.Z --dir verify && cd verify
+
+cosign verify-blob --bundle sbom.spdx.json.sigstore \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/josephfung/curia/.github/workflows/release.yml@' \
+  sbom.spdx.json
+```
+
+The install bundle (`install.sh`, `docker-compose*.yml`, `env.example`, `Caddyfile`, `setup-common.sh`) is covered by one signed manifest — verify it, then check the files against it:
+
+```bash
+cosign verify-blob --bundle SHA256SUMS.sigstore \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/josephfung/curia/.github/workflows/release.yml@' \
+  SHA256SUMS && sha256sum -c SHA256SUMS
+```
+
+`cosign verify-blob` prints `Verified OK` on success and exits non-zero on failure — the `&&` above ensures a failed signature check stops before `sha256sum -c` (which only checks hashes, not authenticity) can print a misleading pass. If either command fails, do not trust the downloaded assets.
 
 ---
 
@@ -117,6 +181,7 @@ Curia is in early development and welcomes contributions — including AI-assist
 
 - Read the **[Contributing Guide](CONTRIBUTING.md)** for dev setup, code standards, and how to add channels, skills, and agents
 - Read **[CLAUDE.md](CLAUDE.md)** for repo-level conventions (if you're using Claude Code, these load automatically)
+- See **[GOVERNANCE.md](GOVERNANCE.md)** for project roles, maintainers, and how decisions are made
 - Check **[open issues](https://github.com/josephfung/curia/issues)** — look for `good first issue` labels
 - Report security vulnerabilities via **[SECURITY.md](SECURITY.md)** — not public issues
 

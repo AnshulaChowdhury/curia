@@ -1,5 +1,6 @@
 // Curia — Lucide icon set, inlined. ISC-licensed; lucide.dev.
-import type { SVGProps, ReactNode } from 'react';
+import { useId } from 'react';
+import type { SVGProps, ReactNode, HTMLAttributes } from 'react';
 
 interface IconProps extends SVGProps<SVGSVGElement> {
   size?: number;
@@ -21,6 +22,14 @@ function Icon({ children, size = 16, viewBox = '0 0 24 24', strokeWidth = 2, ...
     >
       {children}
     </svg>
+  );
+}
+
+export function IconHome({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z" />
+    </Icon>
   );
 }
 
@@ -54,6 +63,17 @@ export function IconGraph({ size }: IconProps) {
       <line x1="18.6" y1="5.4" x2="13.4" y2="10.6" />
       <line x1="10.6" y1="13.4" x2="5.4" y2="18.6" />
       <line x1="18.6" y1="18.6" x2="13.4" y2="13.4" />
+    </Icon>
+  );
+}
+
+export function IconDocument({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+      <polyline points="14 3 14 8 19 8" />
+      <line x1="9" y1="13" x2="15" y2="13" />
+      <line x1="9" y1="17" x2="13" y2="17" />
     </Icon>
   );
 }
@@ -102,11 +122,26 @@ export function IconWand({ size }: IconProps) {
   );
 }
 
-export function IconLink({ size }: IconProps) {
+// Lucide radio: channels (Tools has the wand; the collapsed sidebar needs them distinct).
+export function IconChannels({ size }: IconProps) {
   return (
     <Icon size={size}>
-      <path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5" />
-      <path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5" />
+      <path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9" />
+      <path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5" />
+      <circle cx="12" cy="12" r="2" />
+      <path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5" />
+      <path d="M19.1 4.9C23 8.8 23 15.1 19.1 19" />
+    </Icon>
+  );
+}
+
+// Lucide panel-left-close / panel-left-open: collapses or expands the sidebar.
+export function IconPanelLeft({ size, open }: IconProps & { open: boolean }) {
+  return (
+    <Icon size={size}>
+      <rect width="18" height="18" x="3" y="3" rx="2" />
+      <path d="M9 3v18" />
+      {open ? <path d="m16 15-3-3 3-3" /> : <path d="m14 9 3 3-3 3" />}
     </Icon>
   );
 }
@@ -147,11 +182,52 @@ export function IconPlus({ size }: IconProps) {
   );
 }
 
-export function IconSend({ size }: IconProps) {
+export function IconSend({ size, ...rest }: IconProps) {
   return (
-    <Icon size={size}>
+    <Icon size={size} {...rest}>
       <line x1="22" y1="2" x2="11" y2="13" />
       <polygon points="22 2 15 22 11 13 2 9" />
+    </Icon>
+  );
+}
+
+export function IconPhone({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
+    </Icon>
+  );
+}
+
+export function IconPhoneOff({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7a2 2 0 0 1 1.72 2v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.42 19.42 0 0 1-3.33-2.67" />
+      <path d="M5.53 9.65a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91" />
+      <line x1="23" y1="1" x2="1" y2="23" />
+    </Icon>
+  );
+}
+
+export function IconMic({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
+    </Icon>
+  );
+}
+
+export function IconMicOff({ size, ...rest }: IconProps) {
+  return (
+    <Icon size={size} {...rest}>
+      <line x1="2" y1="2" x2="22" y2="22" />
+      <path d="M8.89 9.11A3 3 0 0 0 9 10v2a3 3 0 0 0 5.19 2.06" />
+      <path d="M12 2a3 3 0 0 1 3 3v3.34" />
+      <path d="M19 10v2a7 7 0 0 1-9.96 6.27" />
+      <path d="M5 10v2a7 7 0 0 0 .78 3.2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
     </Icon>
   );
 }
@@ -167,16 +243,77 @@ export function IconAutonomy({ size }: IconProps) {
   );
 }
 
-// Inline Curia wordmark SVG — uses currentColor for theme tracking
-export function CuriaWordmark(props: SVGProps<SVGSVGElement>) {
+export function IconPlug({ size }: IconProps) {
   return (
-    <svg viewBox="0 0 3024 690" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {...props}>
-      <path fill="currentColor" fillRule="nonzero" d="M353.581 10.0006C163.722 10.0004 9.81112 163.911 9.81112 353.77C9.81106 498.564 99.4541 622.21 226.165 672.864L239.837 659.126L309.763 589.2C309.784 589.204 309.807 589.197 309.828 589.2L353.581 545.383L397.398 589.2L461.074 652.876L480.997 672.864C607.707 622.211 697.351 498.564 697.351 353.77C697.351 163.912 543.44 10.0007 353.581 10.0006ZM353.581 114.173C485.907 114.173 593.178 221.445 593.178 353.77C593.178 431.275 556.255 499.947 499.162 543.69L427.218 471.746L454.042 444.921L453.782 444.661C475.604 420.619 489.005 388.796 489.005 353.77C489.005 278.977 428.374 218.346 353.581 218.346C278.788 218.346 218.156 278.977 218.156 353.77C218.156 390.521 232.805 423.842 256.57 448.242L256.505 448.307L279.944 471.746L208 543.625C150.925 499.881 113.984 431.261 113.984 353.77C113.984 221.445 221.255 114.173 353.581 114.173ZM353.581 322.519C370.841 322.519 384.833 336.511 384.833 353.77C384.833 362.451 381.237 370.244 375.522 375.907L375.652 376.037L353.581 398.109L331.509 376.037L331.639 375.907C325.925 370.244 322.329 362.451 322.329 353.77C322.329 336.51 336.321 322.519 353.581 322.519Z" />
-      <path fill="currentColor" fillRule="nonzero" d="M1670.51 594.763C1627.62 594.763 1591.42 586.709 1561.89 570.602C1532.37 554.494 1509.92 531.731 1494.54 502.312C1479.15 472.893 1471.46 438.191 1471.46 398.207L1471.46 128.932L1573.39 128.932L1573.39 401.936C1573.39 421.617 1577.17 438.839 1584.74 453.6C1592.3 468.361 1603.28 479.73 1617.68 487.706C1632.07 495.682 1649.68 499.67 1670.51 499.67C1691.33 499.67 1708.91 495.708 1723.26 487.784C1737.6 479.859 1748.48 468.594 1755.89 453.988C1763.29 439.383 1767 422.032 1767 401.936L1767 128.932L1868.93 128.932L1868.93 398.207C1868.93 438.191 1861.34 472.893 1846.16 502.312C1830.99 531.731 1808.66 554.494 1779.19 570.602C1749.72 586.709 1713.49 594.763 1670.51 594.763Z" />
-      <path fill="currentColor" fillRule="nonzero" d="M1951.74 582.644L1951.74 125.514L2053.67 125.514L2053.67 582.644L1951.74 582.644ZM2226.92 582.644L2093.76 387.641L2205.79 387.641L2345.16 582.644L2226.92 582.644ZM2026.01 437.207L2026.01 357.031L2138.04 357.031C2153.06 357.031 2166.01 354.027 2176.88 348.019C2187.76 342.011 2196.23 333.542 2202.29 322.614C2208.35 311.686 2211.38 299.022 2211.38 284.623C2211.38 269.914 2208.35 257.095 2202.29 246.167C2196.23 235.238 2187.76 226.744 2176.88 220.684C2166.01 214.624 2153.06 211.594 2138.04 211.594L2026.01 211.594L2026.01 125.514L2130.11 125.514C2167.92 125.514 2200.66 131.185 2228.32 142.528C2255.97 153.871 2277.26 170.755 2292.18 193.182C2307.09 215.608 2314.55 243.655 2314.55 277.321L2314.55 287.265C2314.55 320.931 2306.99 348.822 2291.87 370.937C2276.74 393.053 2255.46 409.627 2228 420.659C2200.55 431.691 2167.92 437.207 2130.11 437.207L2026.01 437.207Z" />
-      <path fill="currentColor" fillRule="nonzero" d="M2396.28 582.644L2396.28 128.932L2500.45 128.932L2500.45 582.644L2396.28 582.644Z" />
-      <path fill="currentColor" fillRule="nonzero" d="M2548.08 582.644L2698.02 128.932L2862.72 128.932L3017.64 582.644L2912.44 582.644L2786.74 199.475L2818.9 212.527L2739.04 212.527L2772.13 199.475L2650.01 582.644L2548.08 582.644ZM2661.5 469.993L2692.73 385.465L2870.8 385.465L2902.03 469.993L2661.5 469.993Z" />
-      <path fill="currentColor" fillRule="nonzero" d="M973.772 355.789C973.772 488.115 1081.04 595.386 1213.37 595.386C1291.91 595.386 1361.35 557.422 1405.05 499.026L1330.11 424.087C1306.6 464.19 1263.21 491.214 1213.37 491.213C1138.58 491.213 1077.95 430.582 1077.95 355.789C1077.95 280.996 1138.58 220.364 1213.37 220.365C1262.78 220.365 1305.8 246.93 1329.46 286.449L1404.33 211.575C1360.59 153.731 1291.48 116.192 1213.37 116.192C1081.04 116.192 973.772 223.463 973.772 355.789Z" />
+    <Icon size={size}>
+      <path d="M12 22v-5" />
+      <path d="M9 8V2" />
+      <path d="M15 8V2" />
+      <path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" />
+    </Icon>
+  );
+}
+
+export function IconServer({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <rect width="20" height="8" x="2" y="2" rx="2" ry="2" />
+      <rect width="20" height="8" x="2" y="14" rx="2" ry="2" />
+      <line x1="6" x2="6.01" y1="6" y2="6" />
+      <line x1="6" x2="6.01" y1="18" y2="18" />
+    </Icon>
+  );
+}
+
+export function IconBrain({ size }: IconProps) {
+  return (
+    <Icon size={size}>
+      <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
+      <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
+      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+      <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+      <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+      <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+      <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+      <path d="M6 18a4 4 0 0 1-1.967-.516" />
+      <path d="M19.967 17.484A4 4 0 0 1 18 18" />
+    </Icon>
+  );
+}
+
+// Brand wordmark — Moonray Ventures lockup with a "powered by Curia" byline.
+// The lockup PNG is used as a CSS mask filled with currentColor so it follows
+// the light/dark theme (the source art is navy on transparent).
+export function BrandWordmark(props: HTMLAttributes<HTMLSpanElement>) {
+  return (
+    <span className="brand-wordmark" {...props}>
+      <span className="brand-lockup" role="img" aria-label="Moonray Ventures" />
+      <span className="brand-wordmark-sub">powered by Curia</span>
+    </span>
+  );
+}
+
+// Animated Moonray gibbous-moon mark, ported from the brand loader
+// (MVMarketing/business_analysis/Moonray Ventures Loader.html). A faint contour,
+// a breathing terminator line and an orbiting ray. Animations are defined in
+// app.css (.mr-*); colour follows currentColor.
+export function AnimatedMoonrayMark({ size = 32, ...rest }: { size?: number } & SVGProps<SVGSVGElement>) {
+  const clipId = useId();
+  const sw = 8;
+  return (
+    <svg width={size} height={size} viewBox="0 0 200 200" role="img" aria-label="Moonray Ventures" {...rest}>
+      <defs>
+        <clipPath id={clipId}><circle cx="100" cy="100" r="80" /></clipPath>
+      </defs>
+      <path className="mr-glow" d="M100 20 A80 80 0 0 1 100 180 A40 80 0 0 1 100 20 Z" fill="currentColor" />
+      <circle cx="100" cy="100" r="80" fill="none" stroke="currentColor" strokeWidth={sw} opacity=".22" />
+      <g clipPath={`url(#${clipId})`}>
+        <path className="mr-phase" d="M100 20 A80 80 0 0 0 100 180" fill="none" stroke="currentColor"
+              strokeWidth={sw} strokeLinecap="round" vectorEffect="non-scaling-stroke"
+              style={{ strokeWidth: (sw * size) / 200 }} />
+      </g>
+      <circle className="mr-orbit" cx="100" cy="100" r="80" fill="none" stroke="currentColor"
+              strokeWidth={sw} strokeLinecap="round" strokeDasharray="150 353" />
     </svg>
   );
 }

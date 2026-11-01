@@ -1,0 +1,688 @@
+# Adding a Tool
+
+Tools are how agents interact with the outside world. Every capability — sending email, fetching a web page, writing to a calendar, running a search — is a **tool** (the invocation + authorization atom). The execution layer sandboxes tool invocations: tools receive typed inputs and return typed outputs; they cannot publish bus events or access the database directly.
+
+> **Vocabulary (ADR-031):** atoms are *tools*; a *skill* is a bundle/collection of tools + optional instructions (`skills/<skill>/SKILL.md` + `tools/<tool>/`). Agent YAML `pinned_skills` pins **skill bundles** (expanded to member tools at bootstrap).
+
+See [Adding an Agent](adding-an-agent.md) if you want to create a new agent rather than extend an existing one.
+
+To **import an unmodified Anthropic Agent Skill** (`SKILL.md` + `references/`, no Curia manifest), see [Importing a Skill](importing-a-skill.md).
+
+---
+
+## Quick Start
+
+1. Create a directory under `skills/<name>/`
+2. Write `skills/<name>/tool.json` — the manifest (schema, metadata, risk declaration)
+3. Write `skills/<name>/handler.ts` — the implementation
+4. Write `skills/<name>/handler.test.ts` — tests
+5. Pin the tool in any agent that should use it (`pinned_skills` in the agent YAML), or make it discoverable via `allow_discovery: true`
+6. Restart Curia — skills are loaded from the `skills/` directory at startup
+
+> **The tool starts disabled in the registry — unless it is a member of an enabled bundle.** Listing a tool in an enabled bundle's SKILL.md `tools:` enrolls it (enabled) on the next boot; a member gated by `install.requires_secrets` enrolls on the first boot after its keys exist, and a member can't be uninstalled while its bundle is enabled (disable it instead). `config/registry-defaults.yaml` `tools:` lists standalone tools only (#1974, [ADR-022](../adr/022-skill-agent-registry.md) amendment). Any other newly added tool is registered at startup but is **not enabled** by default. Enable it (via the registry HTTP API or admin UI) before any agent can call it. Enable state is **restart-based** — toggling enabled/disabled takes effect on the next restart, when only enabled tools are loaded and registered. See [Manifest → `install.requires_secrets`](#installrequires_secrets-optional) for the secret-gating that the registry enforces at install/enable time, and [Tools & Execution Spec — Registry lifecycle](../specs/03-tools-and-execution.md) for the full design.
+
+---
+
+## Directory Layout
+
+Preferred (skill bundle — Phase 2):
+
+```
+skills/
+  calendar/                 # skill (bundle)
+    SKILL.md                # name, description, optional instructions
+    tools/
+      create-event/         # or calendar-create-event/
+        tool.json
+        handler.ts
+        handler.test.ts
+```
+
+Legacy flat layout (still loaded; auto-wrapped as a singleton skill):
+
+```
+skills/
+  web-search/
+    tool.json
+    handler.ts
+    handler.test.ts
+```
+
+Tools are self-contained. Keep external imports minimal and declare any required secrets in the manifest. Prefer pinning the **skill** name in agent YAML (`pinned_skills: [calendar]`). When an agent must have only one member tool, pin that tool name directly (polymorphic pins, ADR-032) — it will not receive siblings.
+
+---
+
+## The Manifest (`tool.json`)
+
+The manifest is the source of truth for what a tool does, what it needs, and how risky it is. The execution layer reads this before invoking the handler.
+
+```json
+{
+  "name": "web-search",
+  "description": "Search the web using the Brave Search API. Returns a ranked list of results with titles, URLs, and snippets. Use this for research tasks where you need current information.",
+  "version": "1.0.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "query": "string",
+    "count": "number?"
+  },
+  "outputs": {
+    "results": "object[]",
+    "total": "number"
+  },
+  "permissions": [],
+  "secrets": ["brave_api_key"],
+  "timeout": 15000
+}
+```
+
+### Field Reference
+
+#### `name` (required)
+
+Unique identifier for the skill. Must match the directory name exactly. Used as the tool name presented to the LLM, so use lowercase kebab-case (`web-search`, not `WebSearch` or `web_search`).
+
+#### `description` (required)
+
+Plain-language description shown to the LLM when it decides which tool to use. Write this from the LLM's perspective — it is literally the text that helps the model decide to call this skill. Be specific about what inputs are needed and what the skill does:
+
+```json
+// Too vague:
+"description": "Search the web"
+
+// Better:
+"description": "Search the web using the Brave Search API. Returns a ranked list of results with titles, URLs, and snippets. Use this for research tasks where you need current information."
+```
+
+#### `version` (required)
+
+Semantic version string (`major.minor.patch`). Increment the major version for breaking input/output schema changes.
+
+#### `sensitivity` (required)
+
+Controls the elevated-skill gate in the execution layer:
+
+| Value | Meaning |
+|---|---|
+| `"normal"` | No elevated gate. Governed by the autonomy engine via `action_risk` (and `allowed_callers` where set). |
+| `"elevated"` | Requires a **live principal turn** — the current turn must have originated from a fresh principal inbound. System, agent, scheduled, and woken/inherited principal *lineage* contexts are all rejected. |
+
+`"elevated"` is the **principal-authority primitive** gate (redefined in #1126). The signal is a distinct `liveTurn` field on the `agent.task` payload — *not* a metadata-bag key, so it can never be swept onto a persisted/wakeable row. The dispatcher stamps it only on principal inbounds, and the `delegate` skill forwards it across a **synchronous** delegation, so "the principal is live" spans the whole synchronous call tree (a specialist acting inside the principal's turn qualifies) but a wake or scheduler fire never does. Enforcement lives solely at the execution-layer gate (`isLivePrincipalTurn`); elevated handlers carry no duplicate origination re-check.
+
+`description` (and parameter descriptions) ship in `tool_definitions` on every model call. Write them with **the principal**, not a job title. The same rule covers overlay tools. See [Principal vocabulary](adding-an-agent.md#principal-vocabulary).
+
+Reserve `"elevated"` for skills that exercise principal authority itself: the approval queue and autonomy controls (`approve`/`deny`/`dismiss-action`, `set-autonomy`), the grant-recommendation decisions, the authorization-altering contact skills (`contact-set-tier`/`contact-set-role`/`contact-grant-permission`/`contact-revoke-permission`), and `system-secret-capture-request`. **Do not** use `"elevated"` for consequential *mutations* that aren't authority primitives — sending email, calendar writes, and the like are `"normal"` + an appropriate `action_risk`, governed by the autonomy engine and the ADR-018 surface-and-confirm flow. See [03-tools-and-execution.md](../specs/03-tools-and-execution.md) and ADR-017.
+
+#### `action_risk` (required)
+
+Declares the risk level of this skill's primary action. Used by the **autonomy engine** in Phase 2 to gate skill execution against the global autonomy score. All skills must declare this field — manifests without it are rejected at startup. The execution layer enforces this against the live autonomy score: if the score is below the skill's action_risk threshold, the invocation returns an advisory failure.
+
+| Value | Min autonomy score | Capability class |
+|---|---|---|
+| `"none"` | 0 | Reads, retrieval, summarization — no external effect |
+| `"low"` | 60 | Internal state writes: memory, contacts |
+| `"medium"` | 70 | Outbound communications: email, messaging |
+| `"high"` | 80 | Calendar writes, commitments on behalf of the principal |
+| `"critical"` | 90 | Financial, destructive, or irreversible actions |
+
+A raw integer (0–100) may be used for precision when the named levels are too coarse. Values outside `[0, 100]` produce a validation error at skill load time.
+
+**Status:** `action_risk` is validated at load time and enforced at runtime. Skills whose action_risk exceeds the current autonomy score are blocked with an advisory failure.
+
+**How gating works:** When an agent calls a skill, the execution layer compares the skill's minimum required autonomy score against the live global score from `autonomy_config`. If the score is too low, the invocation returns an advisory failure (no throw, same `{ success: false, error }` shape as any other failure) and an `autonomy.tool_blocked` audit event is emitted. Two things skip this check: a task the principal started, and a send whose recipients are all the verified principal (`email-send`, `email-reply`, `signal-send`, `sms-send`, `slack-send`; #2337). A new send skill gets the second only when its channel registers a Gate C carve-out for it. The autonomy score is principal-controlled via the `set-autonomy` skill. See `docs/specs/14-autonomy-engine.md` for the full spec.
+
+#### Woken and derived tasks: the bypass ladder
+
+A skill can be invoked not only from a live turn but from a **woken** task (a scheduled job, a `wake_at` self-deferral, a heartbeat) or a **derived** child task. These carry a persisted `TaskOriginator` *lineage* — who or what ultimately caused them — but lineage is not the same as live presence:
+
+- The **elevated gate** ignores lineage entirely: only a live principal turn passes it (above). A woken task with principal lineage can never invoke an elevated skill.
+- For `"normal"` + `action_risk` skills, autonomy's **principal-bypass** uses lineage, but only through a score-keyed *bypass ladder* that can downgrade inherited standing, never grant it. A woken/derived task's effective standing is floored to `agent` (propose-only) unless its live autonomy score clears the configured threshold (`autonomy.bypass_ladder`). A task whose score is momentarily unreadable fails **closed** on non-read actions.
+
+Don't design a skill assuming a woken task inherits the principal's authority. If a skill must act on the principal's behalf without a live turn, it goes through the normal autonomy + approval path. See [14-autonomy-engine.md](../specs/14-autonomy-engine.md#effective-standing--the-bypass-ladder-wokenderived-tasks).
+
+#### `allowed_callers` (optional)
+
+Restricts which agents may invoke this skill. When set, only the named agents (and system-layer callers via `"system"`) can invoke the skill — all others are rejected with a structured failure. The caller gate runs after the elevated-skill gate but before score-based autonomy gates, so structurally forbidden callers are rejected without creating pointless approval requests.
+
+```json
+"allowed_callers": ["coordinator"]
+```
+
+- Agent names are validated against the loaded agent registry at startup — unknown names cause a hard startup failure.
+- Principal-approved re-executions (`humanApproved: true`) bypass the caller gate.
+- Omit `allowed_callers` entirely (or set to `[]`) to allow any agent to invoke the skill — this is the default behavior.
+- The `toolSearch` closure also respects `allowed_callers`: skills whose caller list excludes the searching agent are filtered from discovery results (defense-in-depth).
+
+**When to use `allowed_callers`:**
+
+The right choice depends on whether the skill lives in the core repo or a deployment repo:
+
+- **Core skills** (`skills/` in curia): use `allowed_callers` only for **structural invariants** — restrictions that must hold across every deployment regardless of what custom agents exist. Examples: `["system"]` for infrastructure-only skills (extract-facts, extract-relationships), `["coordinator"]` for governance primitives (set-autonomy, approve-action, delegate). **Never reference deployment-specific agent names** in core skill manifests — the startup validator hard-fails on unknown names, and coupling core to a specific deployment's agents breaks other deployments.
+- **Custom/deploy skills** (`custom/skills/` in a deploy repo): **default to restricting** to the intended agent(s) unless the skill is designed for general use. Since the skill and its agents live in the same repo, referencing each other is safe. Restricting reduces discovery noise in the skill registry and documents the skill's intended consumer.
+
+For deployment-level access control of core skills, rely on the existing mechanisms instead: `pinned_skills` (agents only see skills they pin), `allow_discovery: false` (specialists can't discover unpinned skills), autonomy score gates, and sensitivity levels.
+
+#### `capabilities` (optional)
+
+Declares which privileged `ToolContext` services this skill needs. The loader validates declared names against a fixed allowlist at startup and rejects unknown names. The manifest is frozen after loading — capabilities cannot be changed at runtime.
+
+```json
+"capabilities": ["outboundGateway"]
+```
+
+Valid capability names and what they grant:
+
+| Capability | Service | Use for |
+|---|---|---|
+| `bus` | `EventBus` | Publishing bus events directly (delegate, bullpen-post, bullpen-reply) |
+| `agentRegistry` | `AgentRegistry` | Looking up registered agents (delegate) |
+| `outboundGateway` | `OutboundGateway` | Sending email and Signal messages |
+| `schedulerService` | `SchedulerService` | Creating and managing scheduled jobs |
+| `entityMemory` | `EntityMemory` | Reading and writing the knowledge graph |
+| `nylasCalendarClient` | `NylasCalendarClient` | Calendar CRUD operations |
+| `autonomyService` | `AutonomyService` | Reading or setting the autonomy score |
+| `executiveProfileService` | `ExecutiveProfileService` | Managing the principal's writing voice profile |
+| `browserService` | `BrowserService` | Controlling a real web browser (Playwright) |
+| `bullpenService` | `BullpenService` | Managing agent conversation threads |
+| `toolSearch` | `toolSearch` closure | Searching the skill registry by keyword |
+| `actionLogRepo` | `ActionLogRepo` | Read/write access to `autonomy_action_log` for approval lifecycle (approve, deny, dismiss, list pending) |
+| `executionLayer` | `ExecutionLayer` | Re-invoking skills with `humanApproved` bypass. Only `approve-action` should declare this — it is `sensitivity: "elevated"` (principal-only). |
+| `confidencePipeline` | `ConfidencePipeline` | Contact confidence scoring. Skills that modify trust-related data (trust level, identity pairings) should declare this and fire scoring signals through it. |
+| `tempFileStore` | `TempFileStore` | Writing binary buffers to a secure tmpfs mount; returns `file://` URLs for MCP tools that accept file paths. Used by email download skills for binary-correct attachment handoff. |
+| `infraLlm` | `InfraLlm` | Constrained LLM access — `classify()` and `extract()` only, no raw `chat()`. Routed through `ModelRouter` with full telemetry. For infrastructure skills that need LLM reasoning without unbounded access. |
+| `outboundContext` | `ScopedOutboundContext` | Register/release outbound-context entries (delegation-aware reply correlation). Used by send skills and any agent that wants to claim a reply thread. See [spec 11 §Outbound Context Bridge](../specs/11-entity-context-enrichment.md#outbound-context-bridge). |
+| `secretCapture` | `SecretCaptureMinter` (`ctx.secretCapture`) | Mint a one-time vault capture link so a user can add a new secret mid-conversation. The skill never sees the submitted value. Declaring this capability is also what unlocks the `skip_secret_redaction` manifest field (see below). |
+| `secretResolver` | `ctx.resolveSecretRef(ref)` | Resolve a `user.*` secret by reference at runtime (the value is returned to the handler for immediate use, never placed in LLM-facing output). Additionally hard-allowlisted in the execution layer to `web-browser` only — declaring it elsewhere has no effect. |
+| `userSecretIndex` | `ctx.listUserSecretNames()` | List `user.*` vault key names only (never values, never system/channel keys). Hard-allowlisted to `list-user-secrets`. |
+
+Services NOT in this list (`contactService`, `entityContextAssembler`, `agentPersona`) are **universal** — available to every skill without declaration. Omit `capabilities` entirely if your skill only uses universal services.
+
+#### `optional_capabilities` (optional)
+
+The same names, for a service the skill uses when the deployment has it and can do without. A required capability that is not configured refuses the call; an optional one is simply not injected, so the handler must check for it (`if (ctx.taskRepo) …`). The allowlist rules above still apply. A name may not appear in both lists. `skill-activate` declares `taskRepo` here: it persists a task's active skills when a task store exists, and still activates skills where none does (the test-mode stack). The console Registry page shows these beside the tool's required capabilities, labelled optional. A missing optional service does not block enrolment.
+
+```json
+"optional_capabilities": ["taskRepo"]
+```
+
+#### `inputs` (required)
+
+Declares the input parameters the handler will receive. The execution layer validates inputs against this schema before calling the handler — invalid inputs return an error without reaching the handler.
+
+Type syntax:
+- `"string"` — required string
+- `"string?"` — optional string (may be missing or `null`)
+- `"number"` — required number
+- `"number?"` — optional number
+- `"boolean"` — required boolean
+- `"object"` — required object (any shape)
+- `"object?"` — optional object
+- `"string[]"` — required array of strings
+- `"object[]?"` — optional array of objects
+- `"timestamp"` — ISO 8601 datetime string (validated as parseable date)
+
+Example with a mix of required and optional:
+```json
+"inputs": {
+  "calendarId": "string",
+  "title": "string",
+  "start": "timestamp",
+  "end": "timestamp",
+  "description": "string?",
+  "attendees": "object[]?",
+  "location": "string?"
+}
+```
+
+#### `outputs` (required)
+
+Documents the shape of a successful result. This is informational for the LLM — it helps the model understand what it will get back and how to use it. The runtime does not validate outputs against this schema.
+
+```json
+"outputs": {
+  "results": "object[]",
+  "total": "number"
+}
+```
+
+#### `export_items` (optional — data-export skills)
+
+If your skill sends **bulk data out of the building** — email attachments, or Google Workspace
+MCP exports (`create_drive_file`, `create_sheet`, `append_table_rows`) — accept an optional
+`export_items` input so the bulk-export gates (spec 15 §Bulk Export Gates, #201) can resolve each
+item's sensitivity. Each entry carries a `node_id` (resolved against `kg_nodes` for its sensitivity
+tier) alongside the item it describes:
+
+```json
+"inputs": {
+  "to": "string",
+  "attachments": "object[]?",
+  "export_items": "object[]?"
+}
+```
+
+The `OutboundGateway` uses these to apply the item-count threshold, non-contact destination
+allowlist (confidential+ only), and `restricted` sensitivity ceiling. An agent-supplied
+`sensitivity` on an item can only **ratchet up** the resolved value, never downgrade it. See
+`skills/email/tools/email-send/tool.json` for a live example and [spec 06 — Sensitivity resolution](../specs/06-audit-and-security.md#sensitivity-resolution).
+
+#### `permissions` (optional, default: `[]`)
+
+Declared capabilities required by this skill, validated at load time. Currently unused for enforcement but reserved for future sandboxing. Example future values: `"network:https"`, `"filesystem:read"`.
+
+#### `secrets` (optional, default: `[]`)
+
+Names of secrets this skill will access via `ctx.secret("name")`. The execution layer validates that any secret requested at runtime was declared here — undeclared secret requests are rejected with an error.
+
+Secret names are **vault secret keys** resolved via `ctx.secret()` (vault-first, with an env-var fallback applied at bootstrap). See [Secrets Access](#secrets-access) below.
+
+```json
+"secrets": ["brave_api_key"]
+```
+
+Note: Infrastructure skills (email, calendar) access Nylas clients via `ctx.outboundGateway` and `ctx.nylasCalendarClient`, which are bootstrapped at startup. These are not secrets — do not declare them in `secrets`.
+
+#### `install.requires_secrets` (optional)
+
+A **separate** optional block from the runtime `secrets` allowlist above. While `secrets` declares which vault keys the handler may read *at invocation time*, `install.requires_secrets` declares the vault secret keys that must already be configured *before the skill can be installed or enabled* in the registry.
+
+```json
+"install": { "requires_secrets": ["tavily_api_key"] }
+```
+
+The registry (`RegistryService`) enforces this: an install or enable request is **rejected** until every key listed here exists in the vault. This makes "a skill cannot be turned on without its credentials" a structural guarantee rather than a runtime surprise. `web-search` is the first consumer — it declares `"install": { "requires_secrets": ["tavily_api_key"] }`, so it cannot be enabled until `tavily_api_key` is seeded.
+
+Use `install.requires_secrets` for the credential that *gates the skill's existence* (the API key without which the skill is useless). Use `secrets` for the full set of vault keys the handler reads — the two often overlap but serve different purposes (gate vs. runtime-read allowlist).
+
+#### `timeout` (optional, default: `30000`)
+
+Per-invocation timeout in milliseconds. A call that exceeds this limit returns a failure result. The task continues — the agent receives the failure and can retry or give up.
+
+The handler itself is not stopped: the execution layer stops waiting for it, and its code runs on. At the timeout the layer aborts `ctx.signal`; `ctx.deadline` holds the timeout as epoch milliseconds. Pass the signal to every network request (`fetch(url, { signal: ctx.signal })`) and check it before a write. A read-modify-write that finishes late can otherwise undo a newer call's write (#2083). `src/util/call-budget.ts` has helpers, and `ctx` itself satisfies its `CallBudget` type.
+
+Set higher for skills that call slow external APIs. Set lower for skills that should be fast and likely have a bug if they aren't.
+
+```json
+"timeout": 120000,   // 2 minutes for a research/browse skill
+"timeout": 10000     // 10 seconds for a fast lookup
+```
+
+#### `skip_secret_redaction` (optional, default: `false`)
+
+Opts this skill's output out of **only** the broad generic-long-hex secret scrub in output sanitization. The structured credential patterns (API keys, JWT/Bearer, AWS) still apply, as do tag-stripping and truncation. This exists for skills whose output legitimately carries a high-entropy capability token that must reach the LLM intact — for example, a one-time secret-capture link. It is gated at startup to skills that declare the `secretCapture` capability; setting it on any other skill is rejected.
+
+```json
+"skip_secret_redaction": true
+```
+
+#### `provenance_source` (optional, default: `false`)
+
+Marks this skill's successful output as **source text for identifier provenance** (#2061, ADR-047). An email address or phone number an agent enters with `contact-create`, `contact-link-identity` or `contact-register` is verified only when it occurs in a message a person sent in the conversation, or in the result of a skill that sets this field (or when the principal approved the write). Set it only on a skill whose output is data it read: a web page, a document, a mail listing. Never set it on a skill whose output a model wrote (`delegate`, the bullpen tools, a summarizer): a typo in that text would then verify itself. `tests/unit/skills/provenance-source-manifests.test.ts` pins the list, so adding a skill there is a deliberate change.
+
+```json
+"provenance_source": true
+```
+
+---
+
+## The Handler (`handler.ts`)
+
+All handlers export a class implementing the `ToolHandler` interface. The execution layer instantiates the class at load time and calls `execute()` per invocation.
+
+```typescript
+// skills/my-search/handler.ts — illustrative; the shipped web-search lives at
+// skills/web/tools/web-search/handler.ts
+import type { ToolHandler, ToolContext, ToolResult } from '../../src/skills/types.js';
+
+export class WebSearchHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    const { query, count = 10 } = ctx.input as { query: string; count?: number };
+
+    // ctx.secret() is synchronous — no await needed
+    const apiKey = ctx.secret('brave_api_key');
+
+    try {
+      const response = await fetch(
+        `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`,
+        { headers: { 'Accept': 'application/json', 'X-Subscription-Token': apiKey } },
+      );
+
+      if (!response.ok) {
+        return { success: false, error: `Brave Search API error: ${response.status} ${response.statusText}` };
+      }
+
+      const json = await response.json() as { web?: { results?: unknown[] }; query?: { total_count?: number } };
+      const results = json.web?.results ?? [];
+
+      return { success: true, data: { results, total: json.query?.total_count ?? results.length } };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Include query in the log so failures are traceable without reading the full task
+      ctx.log.error({ err, query }, 'web-search failed');
+      return { success: false, error: `web-search failed: ${message}` };
+    }
+  }
+}
+```
+
+### `ToolContext` (key fields)
+
+```typescript
+interface ToolContext {
+  /** Validated input matching the manifest's inputs declaration */
+  input: Record<string, unknown>;
+
+  /** Synchronous secret access — only secrets declared in manifest.secrets are accessible.
+   *  Resolves a vault secret key (vault-first, env fallback applied at bootstrap).
+   *  Throws if the name is not declared in the manifest. */
+  secret(name: string): string;
+
+  /** Scoped pino child logger (includes skill name and task ID in every line) */
+  log: Logger;
+
+  // --- Capability-gated fields (only populated when the skill declares the capability) ---
+
+  /** Outbound gateway — declare "outboundGateway" in capabilities.
+   *  Never access email credentials directly; go through the gateway. */
+  outboundGateway?: OutboundGateway;
+
+  /** Nylas calendar client — declare "nylasCalendarClient" in capabilities */
+  nylasCalendarClient?: NylasCalendarClient;
+
+  /** Bus access — declare "bus" in capabilities */
+  bus?: EventBus;
+
+  /** Scheduler service — declare "schedulerService" in capabilities */
+  schedulerService?: SchedulerService;
+
+  /** Entity memory (knowledge graph) — declare "entityMemory" in capabilities */
+  entityMemory?: EntityMemory;
+
+  /** Browser service — declare "browserService" in capabilities */
+  browserService?: BrowserService;
+
+  /** Executive profile service — declare "executiveProfileService" in capabilities */
+  executiveProfileService?: ExecutiveProfileService;
+
+  /** Action log repo — declare "actionLogRepo" in capabilities.
+   *  Approval lifecycle management (approve, deny, dismiss, list pending). */
+  actionLogRepo?: ActionLogRepo;
+
+  /** Execution layer — declare "executionLayer" in capabilities.
+   *  Re-invoke skills with humanApproved bypass. Principal-only (approve-action). */
+  executionLayer?: ExecutionLayer;
+
+  /** Confidence pipeline — declare "confidencePipeline" in capabilities.
+   *  Fire scoring signals when modifying trust-related contact data. */
+  confidencePipeline?: ConfidencePipeline;
+
+  /** Temp file store — declare "tempFileStore" in capabilities.
+   *  Write binary buffers to tmpfs; returns file:// URLs for MCP tools. */
+  writeTempFile?(buffer: Buffer, filename: string): Promise<string>;
+
+  /** Constrained LLM access — declare "infraLlm" in capabilities.
+   *  Provides classify() and extract() only — no raw chat(). */
+  infraLlm?: InfraLlm;
+
+  /** Outbound context registry — declare "outboundContext" in capabilities.
+   *  Pre-scoped to the current conversation. Methods: register, release.
+   *  Use to claim reply threads for delegation-aware reply routing. */
+  outboundContext?: ScopedOutboundContext;
+
+  /** Secret-capture minter — declare "secretCapture" in capabilities.
+   *  Mints one-time vault capture links; the skill never sees the submitted value. */
+  secretCapture?: SecretCaptureMinter;
+
+  /** Resolve a `user.*` secret by reference — declare "secretResolver" in capabilities
+   *  (additionally hard-allowlisted to web-browser). The value is for immediate runtime
+   *  use only and must never be placed into LLM-facing output. */
+  resolveSecretRef?(ref: string): Promise<string>;
+
+  /** List `user.*` vault key names — declare "userSecretIndex" in capabilities
+   *  (hard-allowlisted to list-user-secrets). Names only; never values. */
+  listUserSecretNames?: () => Promise<string[]>;
+
+  // --- Universal fields (available to all skills) ---
+
+  /** Caller identity (role, channel) for audit/context — NOT the elevated-gate
+   *  signal (that is the dispatcher-computed `liveTurn` flag; see `sensitivity`). */
+  caller?: CallerContext;
+
+  /** Agent persona (display name, title, email signature) from coordinator config */
+  agentPersona?: AgentPersona;
+
+  /** Public app origin, used to build capture-link URLs (falls back to
+   *  http://localhost:{httpPort} when unset). From config.appOrigin. */
+  appOrigin?: string;
+
+  /** Local HTTP port the SPA is served on — dev fallback origin for capture links.
+   *  From config.httpPort. */
+  httpPort?: number;
+
+  /** Aborted when the call hits its manifest timeout; pass it to network requests
+   *  (#2083). Set on every invocation. */
+  signal?: AbortSignal;
+
+  /** Epoch ms at which this call times out (#2083). With `signal`, satisfies CallBudget. */
+  deadline?: number;
+
+  /** Resolve a contact reference (UUID or `principal`, optional `#label`) to a verified
+   *  address, for tools that address a draft without outboundGateway (#2053). Fails closed. */
+  resolveRecipientReference?: (channel: string, value: string, fields: RecipientReferenceFields) =>
+    Promise<RecipientResolution>;
+
+  /** Every mailbox Curia owns — email-reply excludes them from reply-all CC (#1815). */
+  selfEmails?: readonly string[];
+}
+```
+
+See `src/skills/types.ts` for the full interface with all optional fields.
+
+### `ToolResult`
+
+```typescript
+type ToolResult =
+  | { success: true; data: unknown }
+  | { success: false; error: string };
+```
+
+**Never throw from a handler.** Skills must return errors as `{ success: false, error: string }`. An uncaught exception is caught by the execution layer and converted to a failure result, but throwing loses the structured error context you'd get from a deliberate return — and makes it harder to write tests that verify error paths.
+
+### Secrets Access
+
+```typescript
+// Declare in manifest: "secrets": ["stripe_api_key"]
+const apiKey = ctx.secret('stripe_api_key');  // synchronous — no await
+```
+
+- `ctx.secret()` is **synchronous** — it resolves a **vault secret key** at call time (vault-first; an env-var fallback is applied at bootstrap, see `applyVaultSecrets()`)
+- The execution layer throws if the name is not declared in `manifest.secrets`
+- Secret values are never logged — the audit log records which secret was accessed, not its value
+- Agents/LLMs never see secret values — only the handler has access within its execution scope
+
+### Addressing a recipient
+
+A tool that sends or addresses a message takes a **contact reference** — a contact UUID or `principal`, with an optional `#label` hint — never a raw address ([ADR-047](../adr/047-send-skills-address-recipients-by-reference.md), #2033, #2053). Resolve it with `ctx.outboundGateway.resolveRecipientReference(channel, value, { field })`; a tool that addresses a draft without the `outboundGateway` capability (the `ceo-inbox` draft tools) uses `ctx.resolveRecipientReference` instead. Both fail closed: return their error rather than falling back to the input as an address. See `skills/email/tools/email-send/handler.ts`.
+
+---
+
+## Tests (`handler.test.ts`)
+
+```typescript
+// skills/my-search/handler.test.ts — illustrative; for a live one see
+// skills/web/tools/web-fetch/handler.test.ts
+import { describe, it, expect, vi } from 'vitest';
+import pino from 'pino';
+import { WebSearchHandler } from './handler.js';
+import type { ToolContext } from '../../src/skills/types.js';
+
+// Use a real silent pino logger so the type is correct and log calls don't
+// produce output during tests. Spy on it directly if you need to assert logging.
+const logger = pino({ level: 'silent' });
+
+function makeCtx(input: Record<string, unknown>): ToolContext {
+  return {
+    input,
+    // Synchronous — return a fixed test value for declared secrets
+    secret: () => 'test-api-key',
+    log: logger,
+  };
+}
+
+describe('WebSearchHandler', () => {
+  const handler = new WebSearchHandler();
+
+  it('returns results on success', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ web: { results: [{ title: 'A', url: 'https://a.com' }] }, query: { total_count: 1 } }),
+    }));
+
+    const result = await handler.execute(makeCtx({ query: 'test query' }));
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { results: unknown[] }).results).toHaveLength(1);
+    }
+
+    vi.unstubAllGlobals();
+  });
+
+  it('returns failure result when fetch throws', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network error')));
+
+    const result = await handler.execute(makeCtx({ query: 'test query' }));
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('network error');
+    }
+    // Verify the error was logged — silent failures are not allowed
+    // (if you need to assert this, spy on logger.error before the call)
+
+    vi.unstubAllGlobals();
+  });
+
+  it('returns failure when API responds with non-200', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 429, statusText: 'Too Many Requests' }));
+
+    const result = await handler.execute(makeCtx({ query: 'test query' }));
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('429');
+    }
+
+    vi.unstubAllGlobals();
+  });
+});
+```
+
+Run tests with:
+```bash
+pnpm test skills/web/tools/web-fetch/handler.test.ts
+```
+
+Integration tests that call real external APIs should be tagged with `.integration.test.ts` and require the relevant env vars to be set. Unit tests stub `fetch` or mock infrastructure clients.
+
+---
+
+## Output Sanitization
+
+The execution layer automatically sanitizes skill results before feeding them to the LLM:
+- Strips XML/HTML tags that could be interpreted as system instructions
+- Truncates outputs longer than 200,000 characters (configurable via `skillOutput.maxLength` in `config/default.yaml`) with a `[truncated]` marker
+- Redacts patterns matching known secret formats (API keys, tokens)
+- Wraps error strings in `<tool_error>` tags to prevent injection
+
+You do not need to sanitize in the handler — but be aware that very large outputs will be truncated. If your skill returns structured data, return only what the LLM needs.
+
+---
+
+## MCP Skills (Alternative)
+
+For capabilities that already exist as MCP servers (GitHub, filesystem, Brave Search, etc.), connect them as MCP skills in `config/skills.yaml` rather than writing a local handler:
+
+```yaml
+# config/skills.yaml
+servers:
+  - name: github
+    transport: sse
+    url: https://mcp-github.example.com/sse
+    action_risk: low          # required — none | low | medium | high | critical
+    sensitivity: normal        # optional — "normal" (default) or "elevated" (principal-only)
+```
+
+At startup, Curia connects to each MCP server, discovers its tools via `tools/list`, and registers them in the skill registry alongside local skills. Agents don't know or care whether a tool is local or MCP.
+
+An MCP server's tool descriptions come from upstream, so they can't be edited here. To give
+its tools how-to notes, put them in `skills/<server-name>/references/` (no `SKILL.md`: that
+would make the directory a native bundle and skip the projection). The files attach to the
+projected skill, an agent pinning it sees them listed, and it loads one with
+`skill-activate({ skill: "<server-name>", reference: "<file>" })`.
+`skills/google-workspace/references/drive-files.md` is the example (#1960).
+
+See [Tools & Execution Spec](../specs/03-tools-and-execution.md#mcp-skills-external-servers) for recommended MCP servers.
+
+---
+
+## Picking the Right `action_risk`
+
+When in doubt:
+
+| The skill… | Use |
+|---|---|
+| Reads data, returns it | `"none"` |
+| Writes to internal Curia state (memory, contacts) | `"low"` |
+| Sends a message or email to someone external | `"medium"` |
+| Creates a calendar event or books something | `"high"` |
+| Moves money, deletes data, or can't be undone | `"critical"` |
+
+When the risk is between two levels, use the higher one. It's easier to lower autonomy requirements after trust is established than to raise them after an incident.
+
+---
+
+## Use `config-store` for persistent agent config
+
+If your agent needs to store values that persist across runs (URLs, account numbers,
+preferences), use the `config-store` skill — not a bespoke KG skill.
+
+`config-store` is a generic namespaced key-value store: each agent picks a stable
+namespace string and stores arbitrary string values under user-defined keys. Data
+survives restarts and does not decay.
+
+See [Adding an Agent — Using config-store](adding-an-agent.md#using-config-store-for-persistent-agent-config) for the usage pattern.
+
+For **freeform working state that grows** — running notes, a draft, or a research dossier an agent builds up across a long task — reach for the document workspace instead (the `doc-*` skills; see [spec 20 — Agent Document Workspace](../specs/20-agent-document-workspace.md)). `config-store` remains the right home for small, bounded key/value settings.
+
+---
+
+## Checklist Before Opening a PR
+
+- [ ] `action_risk` is declared in `tool.json`
+- [ ] `sensitivity` is `"elevated"` *only* if the skill is a principal-authority primitive (requires a live principal turn); consequential mutations use `"normal"` + `action_risk` instead
+- [ ] `capabilities` declares only the privileged services actually used — omit if using only universal services
+- [ ] `allowed_callers` is set appropriately: for core skills, only for structural invariants (coordinator-only governance, system-only infrastructure); for custom/deploy skills, default to restricting to the intended agent(s)
+- [ ] All optional inputs are suffixed with `?` in the manifest
+- [ ] Handler exports a **class** implementing `ToolHandler`, not a bare function
+- [ ] Handler never throws — all errors returned as `{ success: false, error }`
+- [ ] Error message in the failure return is prefixed with the skill name (e.g. `"web-search failed: ..."`)
+- [ ] `timeout` is set appropriately for the expected latency
+- [ ] Tests cover the success path and at least one failure path
+- [ ] Any required secrets are declared in `"secrets"` array
+- [ ] If the skill is useless without a specific credential, it declares that vault key in `install.requires_secrets` so the registry blocks install/enable until it is configured
+- [ ] If the skill sends bulk data externally (attachments, Workspace exports), it accepts `export_items` so the bulk-export gates can resolve sensitivity
+- [ ] If the skill adds a configurable capability a new user would set up (new channel, third-party integration, credential-requiring bundle), a matching entry exists in `skills/setup/tools/setup-status/catalog.yaml` with a `docs_url`
+- [ ] Skill is pinned in at least one agent YAML (or documented as discoverable)
+- [ ] Remember the skill starts **disabled** in the registry — enabling it is a restart-based registry action, not just adding the directory
+
+---
+
+## Related Docs
+
+- [Architecture Overview](../specs/00-overview.md) — five-layer bus model
+- [Tools & Execution Spec](../specs/03-tools-and-execution.md) — full execution layer design
+- [Adding an Agent](adding-an-agent.md) — wire your new skill into an agent
+- [Audit & Security](../specs/06-audit-and-security.md) — what gets logged
+- [Autonomy Engine](../specs/14-autonomy-engine.md) — how `action_risk` gates execution (hard gates, Phase 3 auto-adjustment)

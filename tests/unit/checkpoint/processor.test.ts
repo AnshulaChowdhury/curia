@@ -12,6 +12,7 @@ function makeStubs() {
     subscribe: vi.fn((eventType: string, _layer: string, handler: (e: unknown) => Promise<void>) => {
       subscribeHandlers.set(eventType, handler);
     }),
+    publish: vi.fn().mockResolvedValue(undefined),
   } as unknown as EventBus;
 
   const executionLayer = {
@@ -64,6 +65,95 @@ describe('ConversationCheckpointProcessor', () => {
     expect(stubs.bus.subscribe).toHaveBeenCalledWith(
       'conversation.checkpoint', 'system', expect.any(Function),
     );
+  });
+
+  // #1694 / ADR-040 — the hint has to actually be supplied. An optional input no
+  // caller passes is dead code, which is how the entity_enrichment warn in #1701 ended
+  // up on a path no manifest reaches.
+  describe('subject_contact_id wiring', () => {
+    // The audit row the trust gate already reads also carries the originator contact id.
+    const externalOriginator = {
+      rows: [{ tier: 'known', contact_id: 'contact-seth-2' }],
+    };
+
+    it('passes the external originator contact id to extract-facts', async () => {
+      stubs.queryMock.mockResolvedValueOnce(externalOriginator);
+      const processor = new ConversationCheckpointProcessor(
+        stubs.bus, stubs.executionLayer, stubs.pool, stubs.logger,
+        { cli: { trust: 'high' } } as never,
+      );
+      processor.register();
+
+      await fireCheckpoint(stubs.subscribeHandlers, {
+        conversationId: 'conv-1', agentId: 'coordinator', channelId: 'cli',
+        since: '2026-01-01T00:00:00Z',
+        turns: [{ role: 'user', content: 'Seth lives in Toronto' }],
+      });
+
+      const factsCall = vi.mocked(stubs.executionLayer.invoke).mock.calls
+        .find(call => call[0] === 'extract-facts');
+      expect(factsCall).toBeDefined();
+      expect(factsCall![1]).toMatchObject({ subject_contact_id: 'contact-seth-2' });
+    });
+
+    it('does not pass the hint to extract-relationships', async () => {
+      // It has no single subject to disambiguate; sending the field would imply otherwise.
+      stubs.queryMock.mockResolvedValueOnce(externalOriginator);
+      const processor = new ConversationCheckpointProcessor(
+        stubs.bus, stubs.executionLayer, stubs.pool, stubs.logger,
+        { cli: { trust: 'high' } } as never,
+      );
+      processor.register();
+
+      await fireCheckpoint(stubs.subscribeHandlers, {
+        conversationId: 'conv-1', agentId: 'coordinator', channelId: 'cli',
+        since: '2026-01-01T00:00:00Z',
+        turns: [{ role: 'user', content: 'Seth lives in Toronto' }],
+      });
+
+      const relCall = vi.mocked(stubs.executionLayer.invoke).mock.calls
+        .find(call => call[0] === 'extract-relationships');
+      expect(relCall![1]).not.toHaveProperty('subject_contact_id');
+    });
+
+    it('omits the hint when the conversation has no external originator', async () => {
+      // principal/system/agent-originated: no counterpart to disambiguate against.
+      stubs.queryMock.mockResolvedValueOnce({ rows: [] });
+      const processor = new ConversationCheckpointProcessor(
+        stubs.bus, stubs.executionLayer, stubs.pool, stubs.logger,
+        { cli: { trust: 'high' } } as never,
+      );
+      processor.register();
+
+      await fireCheckpoint(stubs.subscribeHandlers, {
+        conversationId: 'conv-1', agentId: 'coordinator', channelId: 'cli',
+        since: '2026-01-01T00:00:00Z',
+        turns: [{ role: 'user', content: 'hello' }],
+      });
+
+      const factsCall = vi.mocked(stubs.executionLayer.invoke).mock.calls
+        .find(call => call[0] === 'extract-facts');
+      expect(factsCall![1]).not.toHaveProperty('subject_contact_id');
+    });
+
+    it('omits the hint when the audit row predates the contactId field', async () => {
+      stubs.queryMock.mockResolvedValueOnce({ rows: [{ tier: 'known', contact_id: null }] });
+      const processor = new ConversationCheckpointProcessor(
+        stubs.bus, stubs.executionLayer, stubs.pool, stubs.logger,
+        { cli: { trust: 'high' } } as never,
+      );
+      processor.register();
+
+      await fireCheckpoint(stubs.subscribeHandlers, {
+        conversationId: 'conv-1', agentId: 'coordinator', channelId: 'cli',
+        since: '2026-01-01T00:00:00Z',
+        turns: [{ role: 'user', content: 'hello' }],
+      });
+
+      const factsCall = vi.mocked(stubs.executionLayer.invoke).mock.calls
+        .find(call => call[0] === 'extract-facts');
+      expect(factsCall![1]).not.toHaveProperty('subject_contact_id');
+    });
   });
 
   it('calls extract-relationships with concatenated transcript', async () => {
@@ -151,5 +241,78 @@ describe('ConversationCheckpointProcessor', () => {
 
     expect(stubs.executionLayer.invoke).not.toHaveBeenCalled();
     expect(stubs.queryMock).not.toHaveBeenCalled();
+  });
+
+  it('skips KG extraction for unknown senders on low-trust channels and emits audit event', async () => {
+    stubs.queryMock.mockImplementation(async (sql: string) => {
+      if (sql.includes('audit_log')) {
+        return { rows: [{ tier: 'unknown' }] };
+      }
+      return { rows: [] };
+    });
+
+    const processor = new ConversationCheckpointProcessor(
+      stubs.bus,
+      stubs.executionLayer,
+      stubs.pool,
+      stubs.logger,
+      { email: { trust: 'low', unknownSender: 'allow', threaded: true } },
+    );
+    processor.register();
+
+    await fireCheckpoint(stubs.subscribeHandlers, {
+      conversationId: 'email:thread-untrusted',
+      agentId: 'coordinator',
+      channelId: 'email',
+      since: '',
+      turns: [{ role: 'user', content: 'poisoned fact' }],
+    });
+
+    expect(stubs.executionLayer.invoke).not.toHaveBeenCalled();
+    expect(stubs.bus.publish).toHaveBeenCalledWith(
+      'system',
+      expect.objectContaining({
+        type: 'checkpoint.extraction_skipped',
+        payload: expect.objectContaining({
+          conversationId: 'email:thread-untrusted',
+          channelId: 'email',
+          reason: 'untrusted_sender',
+          firstExternalTier: 'unknown',
+        }),
+      }),
+    );
+    expect(stubs.queryMock).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO conversation_checkpoints'),
+      ['email:thread-untrusted', 'coordinator', '2026-01-01T00:00:00Z'],
+    );
+  });
+
+  it('still extracts for known senders on low-trust channels', async () => {
+    stubs.queryMock.mockImplementation(async (sql: string) => {
+      if (sql.includes('audit_log')) {
+        return { rows: [{ tier: 'known' }] };
+      }
+      return { rows: [] };
+    });
+
+    const processor = new ConversationCheckpointProcessor(
+      stubs.bus,
+      stubs.executionLayer,
+      stubs.pool,
+      stubs.logger,
+      { email: { trust: 'low', unknownSender: 'allow', threaded: true } },
+    );
+    processor.register();
+
+    await fireCheckpoint(stubs.subscribeHandlers, {
+      conversationId: 'email:thread-known',
+      agentId: 'coordinator',
+      channelId: 'email',
+      since: '',
+      turns: [{ role: 'user', content: 'Alice is my colleague' }],
+    });
+
+    expect(stubs.executionLayer.invoke).toHaveBeenCalled();
+    expect(stubs.bus.publish).not.toHaveBeenCalled();
   });
 });

@@ -1,0 +1,1184 @@
+// handler.test.ts — memory-store skill unit tests.
+//
+// Uses real EntityMemory (backed by in-memory KG store) for entity resolution
+// and the full created/conflict pipeline. Uses a mock entityMemory stub for
+// the updated, rate_limited, and entity_not_found outcomes, which require state that is hard to
+// construct reliably with the in-memory backend.
+
+import { describe, it, expect, vi } from 'vitest';
+import pino from 'pino';
+import { KnowledgeGraphStore } from '../../../../src/memory/knowledge-graph.js';
+import { EmbeddingService } from '../../../../src/memory/embedding.js';
+import { EntityMemory } from '../../../../src/memory/entity-memory.js';
+import { MemoryValidator } from '../../../../src/memory/validation.js';
+import { createSilentLogger } from '../../../../src/logger.js';
+import { MemoryStoreHandler } from './handler.js';
+import type { ToolContext } from '../../../../src/skills/types.js';
+
+function makeEntityMemory() {
+  const embeddingService = EmbeddingService.createForTesting();
+  const store = KnowledgeGraphStore.createInMemory(embeddingService);
+  const validator = new MemoryValidator(store, embeddingService);
+  return { mem: new EntityMemory(store, validator, embeddingService, createSilentLogger()), store };
+}
+
+function makeCtx(entityMemory: EntityMemory | undefined, input: Record<string, unknown>): ToolContext {
+  return {
+    input,
+    secret: () => 'test-key',
+    log: pino({ level: 'silent' }),
+    entityMemory,
+  } as unknown as ToolContext;
+}
+
+// Factory for mock entity memory objects used in the updated/rate_limited/entity_not_found tests.
+// The resolveOrCreate mock always resolves to a known entity; storeFact behaviour is injected.
+function makeMockEntityMemory(storeFactResult: Record<string, unknown>) {
+  return {
+    resolveOrCreate: vi.fn().mockResolvedValue({
+      kind: 'found',
+      node: { id: 'entity-1', label: 'Jane Doe', type: 'person' },
+    }),
+    storeFact: vi.fn().mockResolvedValue(storeFactResult),
+  };
+}
+
+const VALID_INPUT = {
+  entity: 'Jane Doe',
+  field: 'preferred_airline',
+  value: 'Air Canada',
+  source: 'agent:coordinator/task:test123',
+};
+
+describe('MemoryStoreHandler', () => {
+  const handler = new MemoryStoreHandler();
+
+  // ── Input validation ──────────────────────────────────────────────────────
+
+  describe('input validation', () => {
+    it('rejects missing entity', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { field: 'role', value: 'CEO', source: 's' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/entity/i);
+    });
+
+    it('rejects missing field', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { entity: 'Jane', value: 'CEO', source: 's' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/field/i);
+    });
+
+    it('rejects missing value', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { entity: 'Jane', field: 'role', source: 's' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/value/i);
+    });
+
+    it('rejects missing source', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { entity: 'Jane', field: 'role', value: 'CEO' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/source/i);
+    });
+
+    it('rejects confidence out of range', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { ...VALID_INPUT, confidence: 1.5 }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/confidence/i);
+    });
+
+    it('rejects an unknown decay_class', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { ...VALID_INPUT, decay_class: 'eternal' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/decay_class/i);
+    });
+
+    it('rejects an unknown sensitivity value', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { ...VALID_INPUT, sensitivity: 'top_secret' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/sensitivity/i);
+    });
+
+    it('rejects when entityMemory is not available', async () => {
+      const result = await handler.execute(makeCtx(undefined, VALID_INPUT));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/entity memory not available/i);
+    });
+  });
+
+  // ── Entity resolution ─────────────────────────────────────────────────────
+
+  describe('entity resolution', () => {
+    it('auto-creates entity when label is not found and stores the fact', async () => {
+      // resolveOrCreate creates the entity automatically — no pre-existing node needed
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, VALID_INPUT));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+    });
+
+    it('uses entity_type when auto-creating a new entity', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, {
+        ...VALID_INPUT,
+        entity: 'Q3 Budget',
+        entity_type: 'project',
+      }));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+
+      // Verify the auto-created node has the specified type
+      const nodes = await mem.findEntities('Q3 Budget');
+      expect(nodes[0]?.type).toBe('project');
+    });
+
+    it('resolves entity by direct UUID when passed a node ID', async () => {
+      const { mem } = makeEntityMemory();
+      const { entity } = await mem.createEntity({
+        type: 'person', label: 'Jane Doe', properties: {}, source: 'test',
+      });
+
+      // Pass the UUID directly — bypasses label lookup, goes through getEntity()
+      const result = await handler.execute(makeCtx(mem, { ...VALID_INPUT, entity: entity.id }));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+    });
+
+    it('returns entity_not_found when a UUID entity no longer exists', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, {
+        ...VALID_INPUT,
+        entity: '00000000-0000-0000-0000-000000000000',
+      }));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(false);
+      expect(data.action).toBe('entity_not_found');
+    });
+
+    it('returns ambiguous when multiple nodes share the same label with no type match', async () => {
+      const { mem, store } = makeEntityMemory();
+      // Insert two nodes with the same label via the store to bypass upsert
+      await store.createNode({ type: 'person', label: 'Jane Doe', properties: {}, source: 'test' });
+      await store.createNode({ type: 'organization', label: 'Jane Doe', properties: {}, source: 'test' });
+
+      // No type hint provided — falls back to 'concept', which doesn't match either
+      const result = await handler.execute(makeCtx(mem, VALID_INPUT));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: { ambiguous: boolean; candidates: unknown[] } }).data;
+      expect(data.ambiguous).toBe(true);
+      expect(data.candidates).toHaveLength(2);
+    });
+
+    it('rejects unknown entity_type', async () => {
+      const { mem } = makeEntityMemory();
+      const result = await handler.execute(makeCtx(mem, { ...VALID_INPUT, entity_type: 'spaceship' }));
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/entity_type/i);
+    });
+  });
+
+  // ── Successful fact storage ───────────────────────────────────────────────
+
+  describe('action: created', () => {
+    it('stores a new fact and returns created with node_id and sensitivity', async () => {
+      const { mem } = makeEntityMemory();
+      await mem.createEntity({ type: 'person', label: 'Jane Doe', properties: {}, source: 'test' });
+
+      const result = await handler.execute(makeCtx(mem, VALID_INPUT));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+      expect(typeof data.node_id).toBe('string');
+      // Sensitivity defaults to 'internal' without a classifier configured
+      expect(data.sensitivity).toBe('internal');
+    });
+
+    it('accepts all optional inputs and passes them through', async () => {
+      const { mem } = makeEntityMemory();
+      await mem.createEntity({ type: 'person', label: 'Jane Doe', properties: {}, source: 'test' });
+
+      const result = await handler.execute(makeCtx(mem, {
+        ...VALID_INPUT,
+        confidence: 0.95,
+        decay_class: 'permanent',
+        sensitivity: 'confidential',
+        sensitivity_category: 'financial',
+      }));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+      // Explicit sensitivity should be honoured
+      expect(data.sensitivity).toBe('confidential');
+    });
+  });
+
+  describe('action: conflict', () => {
+    it('returns conflict with reason and existing_node_id when facts contradict', async () => {
+      const { mem } = makeEntityMemory();
+      await mem.createEntity({ type: 'person', label: 'Jane Doe', properties: {}, source: 'test' });
+
+      // Store initial fact
+      await handler.execute(makeCtx(mem, {
+        ...VALID_INPUT,
+        field: 'home_city',
+        value: 'Toronto',
+      }));
+
+      // Store contradicting fact for same attribute
+      const result = await handler.execute(makeCtx(mem, {
+        ...VALID_INPUT,
+        field: 'home_city',
+        value: 'Montreal',
+      }));
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(false);
+      expect(data.action).toBe('conflict');
+      expect(typeof data.reason).toBe('string');
+      // existing_node_id lets the caller surface the contradicting node to the CEO
+      expect(typeof data.existing_node_id).toBe('string');
+    });
+  });
+
+  // ── Mocked entityMemory for updated / rate_limited / entity_not_found outcomes ───
+
+  describe('action: updated', () => {
+    it('returns updated with node_id and sensitivity when storeFact detects a near-duplicate', async () => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: makeMockEntityMemory({ stored: true, action: 'updated', nodeId: 'fact-existing-42', sensitivity: 'internal' }),
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('updated');
+      expect(data.node_id).toBe('fact-existing-42');
+      expect(data.sensitivity).toBe('internal');
+    });
+  });
+
+  describe('memoryWriteSource', () => {
+    it('uses memoryWriteSource as the storeFact source when available on context', async () => {
+      const mockMem = makeMockEntityMemory({ stored: true, action: 'created', nodeId: 'fact-1' });
+      const memoryWriteSource = 'agent:ceo-inbox/task:task-abc/channel:internal';
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: mockMem,
+        memoryWriteSource,
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      // storeFact should have been called with the context-aware source, not the LLM-provided one
+      expect(mockMem.storeFact).toHaveBeenCalledTimes(1);
+      expect(mockMem.storeFact.mock.calls[0]![0].source).toBe(memoryWriteSource);
+    });
+
+    it('falls back to LLM-provided source when memoryWriteSource is not set', async () => {
+      const mockMem = makeMockEntityMemory({ stored: true, action: 'created', nodeId: 'fact-1' });
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: mockMem,
+        // No memoryWriteSource — simulates test / CLI invocations
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      // Should fall back to the LLM-provided source from VALID_INPUT
+      expect(mockMem.storeFact.mock.calls[0]![0].source).toBe(VALID_INPUT.source);
+    });
+  });
+
+  describe('action: rate_limited', () => {
+    it('returns rate_limited with reason when storeFact hits the write limit', async () => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: makeMockEntityMemory({ stored: false, action: 'rate_limited', reason: 'Memory write rate limit exceeded (50 per agent per task)' }),
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(false);
+      expect(data.action).toBe('rate_limited');
+      expect(String(data.reason)).toMatch(/rate limit/i);
+    });
+  });
+
+  describe('action: entity_not_found (validator race)', () => {
+    it('returns entity_not_found when storeFact reports entity gone at write time', async () => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: makeMockEntityMemory({ stored: false, action: 'entity_not_found', reason: 'Entity node not found: entity-1' }),
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(false);
+      expect(data.action).toBe('entity_not_found');
+      expect(String(data.reason)).toMatch(/entity node not found/i);
+    });
+  });
+
+  // #472 regression: the handler must source the agent-visible reason from
+  // StoreFactResult.reason for operational rejections. Before the split these two
+  // outcomes carried their reason on `conflict`; reading the wrong field would
+  // silently return `reason: undefined` to the agent.
+  describe('operational rejections read StoreFactResult.reason (#472)', () => {
+    it.each([
+      ['rate_limited', 'Memory write rate limit exceeded (50 per agent per task)'],
+      ['entity_not_found', 'Entity node not found: entity-1'],
+    ])('surfaces the %s reason and ignores a stray conflict value', async (action, reason) => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        // `conflict` is deliberately set to a decoy: if the handler still read it,
+        // the decoy would leak into the agent-visible result instead of `reason`.
+        entityMemory: makeMockEntityMemory({
+          stored: false,
+          action,
+          reason,
+          conflict: 'DECOY — contradiction carrier must not be read for this action',
+        }),
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.action).toBe(action);
+      expect(data.reason).toBe(reason);
+    });
+  });
+
+  describe('action: auto_rejected', () => {
+    it('returns auto_rejected with reason and existing_node_id when incoming fact has lower confidence', async () => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: makeMockEntityMemory({
+          stored: false,
+          action: 'auto_rejected',
+          conflict: 'Existing fact "location: Kitchener" (confidence: 0.9) has higher confidence than incoming "location: Toronto" (confidence: 0.7) — write rejected',
+          existingNodeId: 'existing-node-123',
+        }),
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(false);
+      expect(data.action).toBe('auto_rejected');
+      expect(String(data.reason)).toMatch(/Kitchener/);
+      expect(data.existing_node_id).toBe('existing-node-123');
+    });
+  });
+
+  describe('action: auto_resolved', () => {
+    it('returns auto_resolved with node_id and sensitivity when incoming fact has higher confidence and replaces the existing one', async () => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: makeMockEntityMemory({
+          stored: true,
+          action: 'auto_resolved',
+          nodeId: 'existing-node-123',
+          sensitivity: 'internal',
+        }),
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('auto_resolved');
+      expect(data.node_id).toBe('existing-node-123');
+      expect(data.sensitivity).toBe('internal');
+    });
+  });
+
+  // ── Canonical contact attribute redirect ─────────────────────────────────
+
+  describe('action: redirected_to_contact', () => {
+    function makeCtxWithContact(
+      entityMemory: ReturnType<typeof makeMockEntityMemory>,
+      contact: { id: string } | null,
+      input: Record<string, unknown>,
+    ): ToolContext {
+      const contactService = {
+        findContactByKgNodeId: vi.fn().mockResolvedValue(contact),
+        updateContactFields: vi.fn().mockResolvedValue({ id: contact?.id ?? 'c1' }),
+      };
+      return {
+        input,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory,
+        contactService,
+      } as unknown as ToolContext;
+    }
+
+    it('redirects a canonical attribute write to ContactService when entity is a person with a contact', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        // storeFact should NOT be called — the guard short-circuits
+        storeFact: vi.fn().mockRejectedValue(new Error('storeFact should not be called')),
+      };
+      const ctx = makeCtxWithContact(
+        mockMem,
+        { id: 'contact-1' },
+        { entity: 'Jane Doe', field: 'timezone', value: 'America/Toronto', source: 'test' },
+      );
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(false);
+      expect(data.action).toBe('redirected_to_contact');
+      expect(data.contact_id).toBe('contact-1');
+      expect(data).not.toHaveProperty('canonical_redirect_skipped');
+      expect(data).not.toHaveProperty('canonical_redirect_skip_reason');
+      // storeFact must not have been called
+      expect(mockMem.storeFact).not.toHaveBeenCalled();
+      // updateContactFields should have been called with the canonical field
+      const cs = (ctx as unknown as { contactService: { updateContactFields: ReturnType<typeof vi.fn> } }).contactService;
+      expect(cs.updateContactFields).toHaveBeenCalledWith('contact-1', { timezone: 'America/Toronto' });
+    });
+
+    it('normalizes phone numbers to E.164 before redirecting', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        storeFact: vi.fn().mockRejectedValue(new Error('storeFact should not be called')),
+      };
+      const ctx = makeCtxWithContact(
+        mockMem,
+        { id: 'contact-1' },
+        { entity: 'Jane Doe', field: 'phone', value: '(416) 555-1234', source: 'test' },
+      );
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.action).toBe('redirected_to_contact');
+      const cs = (ctx as unknown as { contactService: { updateContactFields: ReturnType<typeof vi.fn> } }).contactService;
+      expect(cs.updateContactFields).toHaveBeenCalledWith('contact-1', { primaryPhone: '+14165551234' });
+    });
+
+    it('falls back to KG write when phone cannot be normalized to E.164', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        storeFact: vi.fn().mockResolvedValue({ stored: true, action: 'created', nodeId: 'fact-1', sensitivity: 'internal' }),
+      };
+      const ctx = makeCtxWithContact(
+        mockMem,
+        { id: 'contact-1' },
+        { entity: 'Jane Doe', field: 'phone', value: 'not-a-phone-number', source: 'test' },
+      );
+
+      const result = await handler.execute(ctx);
+
+      // Falls through to KG write because normalization failed
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+      expect(data.canonical_redirect_skipped).toBe(true);
+      expect(data.canonical_redirect_skip_reason).toBe('normalization_failed');
+      expect(mockMem.storeFact).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to KG write when findContactByKgNodeId throws (DB error)', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        storeFact: vi.fn().mockResolvedValue({ stored: true, action: 'created', nodeId: 'fact-1', sensitivity: 'internal' }),
+      };
+      const contactService = {
+        findContactByKgNodeId: vi.fn().mockRejectedValue(new Error('connection timeout')),
+        updateContactFields: vi.fn().mockRejectedValue(new Error('should not be called')),
+      };
+      const ctx = {
+        input: { entity: 'Jane Doe', field: 'timezone', value: 'America/Toronto', source: 'test' },
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: mockMem,
+        contactService,
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      // DB error during contact lookup → falls through to KG write, not a skill error.
+      // The skip is flagged so the agent can tell this apart from a real contact write (#1772).
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.action).toBe('created');
+      expect(data.canonical_redirect_skipped).toBe(true);
+      expect(data.canonical_redirect_skip_reason).toBe('lookup_failed');
+      expect(mockMem.storeFact).toHaveBeenCalledTimes(1);
+      expect(contactService.updateContactFields).not.toHaveBeenCalled();
+    });
+
+    it('falls through to KG write when person node has no contact record', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        storeFact: vi.fn().mockResolvedValue({ stored: true, action: 'created', nodeId: 'fact-1', sensitivity: 'internal' }),
+      };
+      // contact is null — person KG node with no linked contact row
+      const ctx = makeCtxWithContact(
+        mockMem,
+        null,
+        { entity: 'Jane Doe', field: 'timezone', value: 'America/Toronto', source: 'test' },
+      );
+
+      const result = await handler.execute(ctx);
+
+      // No contact → falls through to KG write. Distinct from lookup_failed (#1772).
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data.canonical_redirect_skipped).toBe(true);
+      expect(data.canonical_redirect_skip_reason).toBe('no_contact_record');
+      expect(mockMem.storeFact).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not redirect non-person entity types', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-org-1', label: 'Acme Corp', type: 'organization' },
+        }),
+        storeFact: vi.fn().mockResolvedValue({ stored: true, action: 'created', nodeId: 'fact-1', sensitivity: 'internal' }),
+      };
+      const ctx = makeCtxWithContact(
+        mockMem,
+        { id: 'contact-1' },
+        { entity: 'Acme Corp', field: 'timezone', value: 'America/Toronto', source: 'test' },
+      );
+
+      const result = await handler.execute(ctx);
+
+      // organization entity → no redirect
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data).not.toHaveProperty('canonical_redirect_skipped');
+      expect(mockMem.storeFact).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not redirect non-canonical attributes', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        storeFact: vi.fn().mockResolvedValue({ stored: true, action: 'created', nodeId: 'fact-1', sensitivity: 'internal' }),
+      };
+      const ctx = makeCtxWithContact(
+        mockMem,
+        { id: 'contact-1' },
+        { entity: 'Jane Doe', field: 'preferred_airline', value: 'Air Canada', source: 'test' },
+      );
+
+      const result = await handler.execute(ctx);
+
+      // preferred_airline is not canonical → goes to KG
+      expect(result.success).toBe(true);
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.stored).toBe(true);
+      expect(data).not.toHaveProperty('canonical_redirect_skipped');
+      expect(mockMem.storeFact).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns success:false when ContactService.updateContactFields throws a validation error', async () => {
+      const mockMem = {
+        ...makeMockEntityMemory({}),
+        resolveOrCreate: vi.fn().mockResolvedValue({
+          kind: 'found',
+          node: { id: 'kg-1', label: 'Jane Doe', type: 'person' },
+        }),
+        storeFact: vi.fn().mockRejectedValue(new Error('should not be called')),
+      };
+      const contactService = {
+        findContactByKgNodeId: vi.fn().mockResolvedValue({ id: 'contact-1' }),
+        updateContactFields: vi.fn().mockRejectedValue(new Error("primaryEmail not found in contact_channel_identities")),
+      };
+      const ctx = {
+        input: { entity: 'Jane Doe', field: 'primary_email', value: 'jane@example.com', source: 'test' },
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: mockMem,
+        contactService,
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toMatch(/primaryEmail/i);
+    });
+  });
+
+  // ── Infrastructure error handling ─────────────────────────────────────────
+
+  describe('error handling', () => {
+    it('returns success:false when storeFact throws unexpectedly', async () => {
+      const ctx = {
+        input: VALID_INPUT,
+        secret: () => 'test-key',
+        log: pino({ level: 'silent' }),
+        entityMemory: {
+          ...makeMockEntityMemory({}),
+          storeFact: vi.fn().mockRejectedValue(new Error('DB connection lost')),
+        },
+      } as unknown as ToolContext;
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(false);
+      expect((result as { success: false; error: string }).error).toContain('DB connection lost');
+    });
+  });
+
+  // -- PII guard: fact-loop logs (#1713) --
+  //
+  // `entity` is a caller-supplied name (usually a person's name) and the pino
+  // redact list does not cover it. Substitute entityNodeId where a node is
+  // resolved; otherwise log type/presence flags. UUID paths log the UUID as
+  // entityNodeId (it is already a node id, not a name).
+  describe('fact-loop logs never carry the raw entity name (PII guard)', () => {
+    const PII_ENTITY = 'Priya Ramanathan';
+    const NODE_ID = 'entity-1';
+    const UNNORMALIZABLE_PHONE = '020 7946 0958';
+    const UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+    function spyLog() {
+      const log = {
+        warn: vi.fn(),
+        info: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn(),
+      };
+      log.child.mockReturnValue(log);
+      return log;
+    }
+
+    function findCall(fn: ReturnType<typeof vi.fn>, messageRe: RegExp) {
+      return fn.mock.calls.find(c => messageRe.test(String(c[c.length - 1])));
+    }
+
+    function serializeLogPayload(payload: unknown): string {
+      const obj = payload as Record<string, unknown> | null;
+      const err = obj?.err;
+      const errText = err instanceof Error
+        ? `${err.name} ${err.message} ${err.stack ?? ''}`
+        : '';
+      return `${JSON.stringify(payload)}\n${errText}`;
+    }
+
+    function expectNoPii(call: unknown[] | undefined, extraForbidden: string[] = []) {
+      expect(call).toBeDefined();
+      const serialized = serializeLogPayload(call![0]);
+      expect(serialized).not.toContain(PII_ENTITY);
+      for (const s of extraForbidden) {
+        expect(serialized).not.toContain(s);
+      }
+      expect(call![0]).not.toHaveProperty('entity');
+    }
+
+    function piiInput(overrides: Record<string, unknown> = {}) {
+      return {
+        entity: PII_ENTITY,
+        field: 'preferred_airline',
+        value: 'Air Canada',
+        source: 'test',
+        ...overrides,
+      };
+    }
+
+    function mockMem(storeFactResult: Record<string, unknown>, node: { id: string; label: string; type: string } = {
+      id: NODE_ID,
+      label: PII_ENTITY,
+      type: 'person',
+    }) {
+      return {
+        resolveOrCreate: vi.fn().mockResolvedValue({ kind: 'found', node }),
+        storeFact: vi.fn().mockResolvedValue(storeFactResult),
+        getEntity: vi.fn().mockResolvedValue(node),
+        addAlias: vi.fn().mockResolvedValue(undefined),
+      };
+    }
+
+    function ctxFor(
+      entityMemory: ReturnType<typeof mockMem> | EntityMemory,
+      input: Record<string, unknown>,
+      extras: Record<string, unknown> = {},
+    ) {
+      const log = spyLog();
+      const ctx = {
+        input,
+        secret: () => 'test-key',
+        log,
+        entityMemory,
+        ...extras,
+      } as unknown as ToolContext;
+      return { ctx, log };
+    }
+
+    it('UUID entity_type-ignored warn', async () => {
+      const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1' }, {
+        id: UUID, label: PII_ENTITY, type: 'person',
+      });
+      const { ctx, log } = ctxFor(entityMemory, piiInput({ entity: UUID, entity_type: 'person' }));
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /entity_type hint is ignored/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', UUID);
+      expect(call![0]).toHaveProperty('entity_type', 'person');
+    });
+
+    it('UUID-not-found warn', async () => {
+      const entityMemory = {
+        ...mockMem({}),
+        getEntity: vi.fn().mockResolvedValue(undefined),
+      };
+      const { ctx, log } = ctxFor(entityMemory, piiInput({ entity: UUID }));
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /entity UUID not found/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', UUID);
+    });
+
+    it('ambiguous-entity debug', async () => {
+      const { mem, store } = makeEntityMemory();
+      await store.createNode({ type: 'person', label: PII_ENTITY, properties: {}, source: 'test' });
+      await store.createNode({ type: 'organization', label: PII_ENTITY, properties: {}, source: 'test' });
+      const { ctx, log } = ctxFor(mem, piiInput());
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.debug, /ambiguous entity label/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('candidateCount', 2);
+      expect(call![0]).toHaveProperty('expectedType', 'concept');
+      expect(call![0]).not.toHaveProperty('entityNodeId');
+    });
+
+    it('canonical-normalization-failed warn', async () => {
+      const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1' });
+      const { ctx, log } = ctxFor(
+        entityMemory,
+        piiInput({ field: 'phone', value: UNNORMALIZABLE_PHONE }),
+        {
+          contactService: {
+            findContactByKgNodeId: vi.fn().mockResolvedValue({ id: 'contact-1' }),
+            updateContactFields: vi.fn(),
+          },
+        },
+      );
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /canonical attribute normalization failed/);
+      expectNoPii(call, [UNNORMALIZABLE_PHONE, '7946 0958']);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('field', 'phone');
+      expect(call![0]).toHaveProperty('reason', 'phone_normalization_failed');
+    });
+
+    it('findContactByKgNodeId-failed error', async () => {
+      const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1' });
+      const { ctx, log } = ctxFor(
+        entityMemory,
+        piiInput({ field: 'timezone', value: 'America/Toronto' }),
+        {
+          contactService: {
+            // Message echoes the entity name the way a driver error can — the
+            // log must use errorName, not the raw Error (#1772).
+            findContactByKgNodeId: vi.fn().mockRejectedValue(
+              new Error(`connection timeout looking up ${PII_ENTITY}`),
+            ),
+            updateContactFields: vi.fn(),
+          },
+        },
+      );
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.error, /findContactByKgNodeId failed/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('field', 'timezone');
+      expect(call![0]).toHaveProperty('errorName', 'Error');
+      expect(call![0]).not.toHaveProperty('err');
+      expect(call![0]).not.toHaveProperty('error');
+      // Lookup failure is not the phase-2 catch, and it is not a warn.
+      expect(findCall(log.warn, /findContactByKgNodeId failed/)).toBeUndefined();
+      expect(findCall(log.error, /canonical contact redirect failed/)).toBeUndefined();
+    });
+
+    it('no-contact-record does not log an error', async () => {
+      const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1' });
+      const { ctx, log } = ctxFor(
+        entityMemory,
+        piiInput({ field: 'timezone', value: 'America/Toronto' }),
+        {
+          contactService: {
+            findContactByKgNodeId: vi.fn().mockResolvedValue(null),
+            updateContactFields: vi.fn(),
+          },
+        },
+      );
+
+      const result = await handler.execute(ctx);
+
+      expect(result.success).toBe(true);
+      expect(log.error).not.toHaveBeenCalled();
+      const data = (result as { success: true; data: Record<string, unknown> }).data;
+      expect(data.canonical_redirect_skipped).toBe(true);
+      expect(data.canonical_redirect_skip_reason).toBe('no_contact_record');
+    });
+
+    it('canonical-redirected info', async () => {
+      const entityMemory = mockMem({});
+      const { ctx, log } = ctxFor(
+        entityMemory,
+        piiInput({ field: 'timezone', value: 'America/Toronto' }),
+        {
+          contactService: {
+            findContactByKgNodeId: vi.fn().mockResolvedValue({ id: 'contact-1' }),
+            updateContactFields: vi.fn().mockResolvedValue({ id: 'contact-1' }),
+          },
+        },
+      );
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.info, /canonical attribute redirected/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('contactId', 'contact-1');
+    });
+
+    it('canonical-redirect-failed warn', async () => {
+      const entityMemory = mockMem({});
+      const { ctx, log } = ctxFor(
+        entityMemory,
+        piiInput({ field: 'primary_email', value: 'priya@example.com' }),
+        {
+          contactService: {
+            findContactByKgNodeId: vi.fn().mockResolvedValue({ id: 'contact-1' }),
+            updateContactFields: vi.fn().mockRejectedValue(
+              new Error('primaryEmail not found in contact_channel_identities'),
+            ),
+          },
+        },
+      );
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /canonical attribute redirect to ContactService failed/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('contactId', 'contact-1');
+    });
+
+    it('memoryWriteSource-fallback debug', async () => {
+      const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1' });
+      const { ctx, log } = ctxFor(entityMemory, piiInput());
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.debug, /memoryWriteSource not set/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('field', 'preferred_airline');
+    });
+
+    it('sensitivity-fallback warn', async () => {
+      const entityMemory = mockMem({
+        stored: true,
+        action: 'updated',
+        nodeId: 'fact-1',
+        sensitivity: 'internal',
+        sensitivityFallback: true,
+      });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /sensitivity in result may be inaccurate/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('nodeId', 'fact-1');
+    });
+
+    it('fact-stored info', async () => {
+      const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1', sensitivity: 'internal' });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.info, /memory-store: fact stored/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('action', 'created');
+      expect(call![0]).toHaveProperty('nodeId', 'fact-1');
+    });
+
+    it('fact-conflict warn', async () => {
+      const entityMemory = mockMem({
+        stored: false,
+        action: 'conflict',
+        conflict: 'contradicts existing value',
+        existingNodeId: 'fact-old',
+      });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /fact conflicts with existing KG data/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('existingNodeId', 'fact-old');
+    });
+
+    it('entity-gone-at-write-time warn', async () => {
+      const entityMemory = mockMem({
+        stored: false,
+        action: 'entity_not_found',
+        reason: 'Entity node not found: entity-1',
+      });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /entity node gone at write time/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+    });
+
+    it('rate-limited warn', async () => {
+      const entityMemory = mockMem({
+        stored: false,
+        action: 'rate_limited',
+        reason: 'Memory write rate limit exceeded (50 per agent per task)',
+      });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.warn, /write rate limit reached/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+    });
+
+    it('auto-rejected info', async () => {
+      const entityMemory = mockMem({
+        stored: false,
+        action: 'auto_rejected',
+        conflict: 'existing has higher confidence',
+        existingNodeId: 'fact-old',
+      });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.info, /fact auto-rejected/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('existingNodeId', 'fact-old');
+    });
+
+    it('impossible storeFact state error', async () => {
+      const entityMemory = mockMem({ stored: false, action: 'created' });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.error, /impossible storeFact state/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).toHaveProperty('action', 'created');
+    });
+
+    it('unhandled storeFact action error', async () => {
+      const entityMemory = mockMem({ stored: false, action: 'not_a_real_action' });
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.error, /unhandled storeFact action/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+    });
+
+    it('write-path failure logs as fact storage, not a generic unexpected error', async () => {
+      const entityMemory = mockMem({});
+      entityMemory.storeFact.mockRejectedValue(new Error(`DB connection lost for ${PII_ENTITY}`));
+      const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.error, /memory-store: fact storage failed/);
+      expectNoPii(call);
+      expect(call![0]).toHaveProperty('entityNodeId', NODE_ID);
+      expect(call![0]).not.toHaveProperty('entity');
+      expect(call![0]).not.toHaveProperty('err');
+      expect(call![0]).not.toHaveProperty('error');
+      expect(call![0]).toHaveProperty('errorName', 'Error');
+    });
+
+    it('read-path failure logs as entity resolution, not a generic unexpected error', async () => {
+      const entityMemory = mockMem({});
+      entityMemory.resolveOrCreate.mockRejectedValue(new Error(`DB connection lost for ${PII_ENTITY}`));
+      const { ctx, log } = ctxFor(entityMemory, piiInput());
+
+      await handler.execute(ctx);
+
+      const call = findCall(log.error, /memory-store: entity resolution failed/);
+      expectNoPii(call);
+      expect((call![0] as Record<string, unknown>).entityNodeId).toBeUndefined();
+      expect(call![0]).not.toHaveProperty('err');
+      expect(call![0]).not.toHaveProperty('error');
+      expect(call![0]).toHaveProperty('errorName', 'Error');
+    });
+    // #473: the handler used to wrap entity resolution, the canonical-contact redirect,
+    // and fact storage in one try/catch that logged 'unexpected error' for all three, so
+    // an operator could not tell a KG read failure from a KG write failure. Each phase
+    // now has its own catch and its own message.
+    describe('phase-specific error messages (#473)', () => {
+      // Phase 2 ('canonical contact redirect failed') is deliberately not exercised:
+      // both DB calls inside the guard have their own inner catches, and `value` is
+      // type-validated as a string before the guard runs, so the outer catch is
+      // reachable only via a genuine programming error inside buildCanonicalPatch
+      // (which re-raises non-ParseError failures rather than masking them). It is
+      // listed here so the other cases assert it did NOT also fire.
+      const PHASE_MESSAGES = [
+        /memory-store: entity resolution failed/,
+        /memory-store: canonical contact redirect failed/,
+        /memory-store: fact storage failed/,
+      ];
+
+      function expectOnlyPhase(log: { error: { mock: { calls: unknown[][] } } }, expected: RegExp) {
+        const matched = PHASE_MESSAGES.filter(re =>
+          log.error.mock.calls.some(c => typeof c[1] === 'string' && re.test(c[1] as string)),
+        );
+        expect(matched).toEqual([expected]);
+      }
+
+      it('a resolution failure does not also log the write-path message', async () => {
+        const entityMemory = mockMem({});
+        entityMemory.resolveOrCreate.mockRejectedValue(new Error('KG read failed'));
+        const { ctx, log } = ctxFor(entityMemory, piiInput());
+
+        const result = await handler.execute(ctx);
+
+        expect(result.success).toBe(false);
+        expectOnlyPhase(log, /memory-store: entity resolution failed/);
+      });
+
+      it('a storeFact failure does not also log the read-path message', async () => {
+        const entityMemory = mockMem({});
+        entityMemory.storeFact.mockRejectedValue(new Error('KG write failed'));
+        const { ctx, log } = ctxFor(entityMemory, piiInput(), { memoryWriteSource: 'agent:test/task:1' });
+
+        const result = await handler.execute(ctx);
+
+        expect(result.success).toBe(false);
+        expectOnlyPhase(log, /memory-store: fact storage failed/);
+      });
+
+      it('an alias-write failure is absorbed by addAlias and never reaches a phase catch', async () => {
+        // EntityMemory.addAlias declares a non-throwing contract and logs its own
+        // failures, so no phase message should fire and the fact still stores. A mock
+        // that rejects would be testing a contract violation, not the real path.
+        const entityMemory = mockMem({ stored: true, action: 'created', nodeId: 'fact-1' });
+        entityMemory.addAlias = vi.fn().mockResolvedValue(undefined);
+        const { ctx, log } = ctxFor(entityMemory, { ...piiInput(), alias_for: 'the boss' });
+
+        const result = await handler.execute(ctx);
+
+        expect(result.success).toBe(true);
+        expect(entityMemory.addAlias).toHaveBeenCalledWith(NODE_ID, 'the boss');
+        const anyPhaseFired = PHASE_MESSAGES.some(re =>
+          log.error.mock.calls.some(c => typeof c[1] === 'string' && re.test(c[1] as string)),
+        );
+        expect(anyPhaseFired).toBe(false);
+      });
+
+    });
+  });
+});

@@ -1,0 +1,28 @@
+{
+  "name": "meeting-agenda-park",
+  "description": "Park an agenda for a future principal call. Validates the agenda and writes it under /meetings/agendas/. The call loads it later; this does not start a call. Resolve sources into context text first — the call cannot fetch anything. Set scheduled_for when the call has a time. Expiry defaults to 7 days and cannot exceed 30.",
+  "version": "0.1.1",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "title": "string (required — short name, at most 120 characters)",
+    "topics": "string[] (required — 1 to 10 ordered topics, each at most 200 characters)",
+    "context": "string (required — text the spoken model can use, at most 6000 characters; no links it would have to fetch)",
+    "source": "string (required — principal | routine | coordinator | ad_hoc)",
+    "role": "string? (optional stance for the call, at most 500 characters; never interpreted by code)",
+    "sensitivity": "string? (internal | confidential | shareable; default internal)",
+    "expires_at": "string? (ISO timestamp; default 7 days from now, maximum 30 days)",
+    "scheduled_for": "string? (ISO timestamp of the call this agenda is for)"
+  },
+  "outputs": {
+    "agenda_id": "string (id of the parked agenda)",
+    "path": "string (OKF path under /meetings/agendas/)",
+    "expires_at": "string (expiry in the principal's local time)",
+    "displayTimezone": "string? (label for the timezone of expires_at)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 15000,
+  "capabilities": ["workingDocs"],
+  "allowed_callers": ["coordinator"]
+}

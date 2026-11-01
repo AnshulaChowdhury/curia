@@ -1,0 +1,95 @@
+// handler.ts — dismiss-action skill implementation.
+//
+// Dismisses a pending approval request: transitions to outcome = 'resolved_externally'.
+// Used when the principal handled the action outside Curia.
+//
+// SECURITY: sensitivity: "elevated" — authorization is enforced solely by the execution-layer
+// live-principal gate (#1126). No handler-level re-check.
+
+import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
+import { RESOLVED_BY, approvalLabel } from '../../../../src/autonomy/action-log-types.js';
+import { parseApprovalRefInput } from '../../../_shared/approval-ref.js';
+import { createHumanDecision } from '../../../../src/bus/events.js';
+import type { TaskOriginator } from '../../../../src/contacts/types.js';
+
+export class DismissActionHandler implements ToolHandler {
+  async execute(ctx: ToolContext): Promise<ToolResult> {
+    if (!ctx.actionLogRepo) {
+      return { success: false, error: 'dismiss-action requires actionLogRepo capability' };
+    }
+    if (!ctx.bus) {
+      return { success: false, error: 'dismiss-action requires bus capability' };
+    }
+
+    try {
+      // A short_ref that is present but unreadable, or a ref under another key, fails closed here; only an absent one may
+      // fall back to the sole pending approval (#2159 Phase 3, see approval-ref.ts).
+      const parsedRef = parseApprovalRefInput(ctx.input);
+      if (!parsedRef.ok) {
+        ctx.log.warn({ shortRefType: typeof ctx.input.short_ref, inputKeys: Object.keys(ctx.input) }, 'dismiss-action: unusable or mis-keyed approval reference — refusing to resolve');
+        return { success: false, error: parsedRef.error };
+      }
+
+      const resolved = await ctx.actionLogRepo.resolvePending(parsedRef.ref);
+      if (!resolved.found) {
+        return { success: false, error: resolved.error };
+      }
+
+      const { row } = resolved;
+
+      // An agent called this tool on its own reading of the conversation, so the row does not
+      // record it as the principal's decision; only reactions do (#2159).
+      const transitioned = await ctx.actionLogRepo.resolveRow(row.id, 'resolved_externally', RESOLVED_BY.coordinator);
+      if (!transitioned) {
+        ctx.log.warn({ rowId: row.id, shortRef: row.shortRef }, 'dismiss-action: row was already resolved concurrently');
+        return { success: false, error: `${approvalLabel(row)} was already resolved by another action` };
+      }
+
+      // Publish human.decision audit event (best-effort).
+      //
+      // originator is stamped by the dispatcher on every task and carries the contactId
+      // and channel of whoever initiated the task chain. For this elevated skill the
+      // execution-layer live-principal gate (#1126) already guaranteed a principal originator —
+      // if it is missing here, that indicates a dispatch-layer bug.
+      // Log loudly but don't publish a fake audit row with placeholder IDs, as a
+      // counterfeit audit trail is worse than a missing one. See ADR-017.
+      const originator = ctx.taskMetadata?.originator as TaskOriginator | undefined;
+      const senderId = originator?.contactId;
+      const channelId = originator?.channel;
+
+      if (!senderId || !channelId || !ctx.taskEventId) {
+        ctx.log.error(
+          { senderId, channelId, taskEventId: ctx.taskEventId },
+          'dismiss-action: audit metadata incomplete — originator/taskEventId should always be present when task is principal-originated. This indicates a dispatch-layer bug.',
+        );
+      } else {
+        try {
+          await ctx.bus.publish(
+            'dispatch',
+            createHumanDecision({
+              decision: 'dismiss',
+              deciderId: senderId,
+              deciderChannel: channelId,
+              subjectEventId: row.taskId,
+              subjectSummary: `principal dismissed (handled externally): ${row.description ?? row.toolName}`,
+              contextShown: ['short_ref', 'description', 'skill_name'],
+              presentedAt: row.createdAt,
+              decidedAt: new Date(),
+              defaultAction: 'block',
+              parentEventId: ctx.taskEventId,
+            }),
+          );
+        } catch (err) {
+          ctx.log.error({ err, rowId: row.id }, 'dismiss-action: failed to publish human.decision event');
+        }
+      }
+
+      ctx.log.info({ rowId: row.id, shortRef: row.shortRef }, 'dismiss-action: request dismissed');
+      // Named the way the principal saw it: "Approval 3", or the reference for an unnumbered row.
+      return { success: true, data: `Dismissed: ${row.description ?? row.toolName} (${approvalLabel(row)})` };
+    } catch (err) {
+      ctx.log.error({ err }, 'dismiss-action: unexpected failure');
+      return { success: false, error: 'dismiss-action failed unexpectedly' };
+    }
+  }
+}

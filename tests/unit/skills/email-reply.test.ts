@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
-import { EmailReplyHandler } from '../../../skills/email-reply/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { EmailReplyHandler } from '../../../skills/email/tools/email-reply/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
@@ -12,16 +12,19 @@ function makeCtx(
     send: (...args: unknown[]) => unknown;
   }>,
   taskMetadata?: Record<string, unknown>,
-  opts?: { selfEmail?: string },
-): SkillContext {
+  opts?: { selfEmail?: string; selfEmails?: readonly string[] },
+): ToolContext {
   return {
+    toolName: 'email-reply',
+    toolVersion: '1.3.2',
     input,
     secret: () => { throw new Error('no secrets'); },
     log: logger,
     outboundGateway: gateway as never,
     taskMetadata,
     ...(opts?.selfEmail ? { selfEmail: opts.selfEmail } : {}),
-  } as SkillContext;
+    ...(opts?.selfEmails ? { selfEmails: opts.selfEmails } : {}),
+  } as ToolContext;
 }
 
 describe('EmailReplyHandler', () => {
@@ -42,6 +45,26 @@ describe('EmailReplyHandler', () => {
     const result = await handler.execute(makeCtx({ body: 'Hello' }, gateway));
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toContain('reply_to_message_id');
+  });
+
+  it('rejects an outbound_context entry_id UUID before calling the gateway (#1817)', async () => {
+    const gateway = { getEmailMessage: vi.fn(), send: vi.fn() };
+    const result = await handler.execute(
+      makeCtx(
+        {
+          reply_to_message_id: 'f97d6a62-0ec4-4751-96c3-2538eb364f06',
+          body: 'Hello',
+        },
+        gateway,
+      ),
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('outbound_context entry_id');
+      expect(result.error).toContain('Nylas message ID');
+    }
+    expect(gateway.getEmailMessage).not.toHaveBeenCalled();
+    expect(gateway.send).not.toHaveBeenCalled();
   });
 
   it('returns failure when body is missing', async () => {
@@ -133,11 +156,11 @@ describe('EmailReplyHandler — CC modes', () => {
       send: (...args: unknown[]) => unknown;
     }>,
     selfEmail?: string,
-  ): SkillContext {
+  ): ToolContext {
     return makeCtx(input, gateway, {}, { selfEmail });
   }
 
-  it('cc absent (undefined) — auto-populates from original to/cc, excluding primary To and selfEmail', async () => {
+  it('cc absent (undefined) — reply-all keeps the original To on To and CC on CC, excluding selfEmail (#2273)', async () => {
     const gateway = {
       getEmailMessage: vi.fn().mockResolvedValue({
         from: [{ email: 'sender@example.com' }],
@@ -161,20 +184,110 @@ describe('EmailReplyHandler — CC modes', () => {
     if (result.success) {
       const data = result.data as { message_id: string; to: string; subject: string; cc: string };
       expect(data.message_id).toBe('sent-cc-1');
-      expect(data.to).toBe('sender@example.com');
+      // The sender and bob were both on To; curia@example.com (selfEmail) is dropped.
+      expect(data.to).toBe('sender@example.com, bob@example.com');
       expect(data.subject).toBe('Re: Group thread');
-      // sender@example.com is excluded (primary To recipient), curia@example.com is excluded (selfEmail)
-      // bob@example.com and carol@example.com remain
-      expect(data.cc).toBe('bob@example.com, carol@example.com');
+      expect(data.cc).toBe('carol@example.com');
     }
 
-    // Verify the send call received the CC array
     expect(gateway.send).toHaveBeenCalledWith(
       expect.objectContaining({
-        cc: ['bob@example.com', 'carol@example.com'],
+        to: 'sender@example.com',
+        additionalTo: ['bob@example.com'],
+        cc: ['carol@example.com'],
       }),
       expect.anything(),
     );
+  });
+
+  it('cc absent — excludes every owned mailbox from reply-all To and CC', async () => {
+    const gateway = {
+      getEmailMessage: vi.fn().mockResolvedValue({
+        from: [{ email: 'sender@example.com' }],
+        to: [{ email: 'ops@example.com' }, { email: 'bob@example.com' }],
+        cc: [{ email: 'curia@example.com' }],
+        subject: 'Group thread',
+      }),
+      send: vi.fn().mockResolvedValue({ success: true, messageId: 'sent-cc-ops' }),
+    };
+
+    const result = await handler.execute(
+      makeCtx(
+        { reply_to_message_id: 'msg-group', body: 'Sounds good' },
+        gateway,
+        {},
+        { selfEmails: ['curia@example.com', 'ops@example.com'] },
+      ),
+    );
+
+    expect(result.success).toBe(true);
+    expect(gateway.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: 'sender@example.com',
+        additionalTo: ['bob@example.com'],
+      }),
+      expect.anything(),
+    );
+    expect(gateway.send.mock.calls[0]![0]).not.toHaveProperty('cc');
+  });
+
+  it('reads a secondary mailbox and derives reply-all CC from that thread (#1832)', async () => {
+    const gateway = {
+      getEmailMessage: vi.fn().mockResolvedValue({
+        from: [{ email: 'sender@example.com' }],
+        to: [{ email: 'ops@example.com' }, { email: 'bob@example.com' }],
+        cc: [{ email: 'curia@example.com' }, { email: 'carol@example.com' }],
+        subject: 'Personal thread',
+      }),
+      send: vi.fn().mockResolvedValue({ success: true, messageId: 'sent-sec' }),
+    };
+
+    const result = await handler.execute(
+      makeCtx(
+        { reply_to_message_id: 'msg-sec', body: 'Thanks all', account: 'personal' },
+        gateway,
+        {},
+        { selfEmails: ['curia@example.com', 'ops@example.com'] },
+      ),
+    );
+
+    expect(result.success).toBe(true);
+    expect(gateway.getEmailMessage).toHaveBeenCalledWith('msg-sec', 'personal');
+    expect(gateway.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: 'personal',
+        to: 'sender@example.com',
+        additionalTo: ['bob@example.com'],
+        cc: ['carol@example.com'],
+      }),
+      expect.anything(),
+    );
+    if (result.success) {
+      expect((result.data as { cc: string }).cc).toBe('carol@example.com');
+    }
+  });
+
+  it('trims a padded reply_to_message_id before the fetch (#1832)', async () => {
+    const gateway = {
+      getEmailMessage: vi.fn().mockResolvedValue({
+        from: [{ email: 'sender@example.com' }],
+        to: [],
+        cc: [],
+        subject: 'Padded',
+      }),
+      send: vi.fn().mockResolvedValue({ success: true, messageId: 'sent-pad' }),
+    };
+
+    const result = await handler.execute(
+      makeCtx(
+        { reply_to_message_id: '  msg-sec  ', body: 'Thanks', cc: '', account: ' personal ' },
+        gateway,
+      ),
+    );
+
+    expect(result.success).toBe(true);
+    expect(gateway.getEmailMessage).toHaveBeenCalledOnce();
+    expect(gateway.getEmailMessage).toHaveBeenCalledWith('msg-sec', 'personal');
   });
 
   it('cc === "" — reply to sender only, no CC', async () => {

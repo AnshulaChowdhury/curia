@@ -1,0 +1,178 @@
+# Case 25l (docs/wip/2026-10-21-principal-scheduling-scenarios-design.md): 25j and 25k
+# together. The principal forwards an email with a Google Calendar booking page and adds
+# nothing. Curia should treat the forward as the request (25j) and book through the page
+# (25k).
+name: forwarded google booking page books through it
+description: >
+  The principal forwards Curia an email from Sam Okoye, a known contact, with no note. Sam asks for 30 minutes and links their Google Calendar booking page. Curia should check the principal's calendar, then book a time on the page
+  that is free for the principal (the page's earliest slots clash with the principal's
+  calendar), using the browser, and confirm it. Offering times by email instead of using
+  the page, or telling the principal to book it, is the failure.
+tags: [principal-scheduling, ps-core, calendar, booking-link]
+delegation: real
+release_gate: false
+autonomy: { score: 84, gating: band }
+stub_sets: [human-channels, calendar-office, calendar-specialist]
+seed:
+  contacts:
+    - key: sam
+      display_name: Sam Okoye
+      tier: known
+      kind: person
+      channel: email
+      identifier: sam.okoye@brightline.example.test
+inbound:
+  from: principal
+  channel: email
+  content: |
+    Subject: Fwd: Catching up
+
+    ---------- Forwarded message ---------
+    From: Sam Okoye <sam.okoye@brightline.example.test>
+    Date: {{day:today-1}}
+    Subject: Catching up
+    To: Avery Testwell <avery.testwell@example.test>
+
+    Avery, it's been too long. I'd love 30 minutes to hear how the expansion is going.
+    Book any time that suits on my booking page: https://calendar.app.google/q8Zk3vT1mWbooking
+
+    Sam
+  email:
+    nylas_message_id: scenario-msg-25l-fwd-sam
+    to: [curia]
+tool_stubs:
+  # Other fair writes a specialist may make on the way.
+  contact-set-role:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:sam}}", display_name: Sam Okoye, role: contact }
+  calendar-holds-sweep:
+    - agent: calendar
+      match: {}
+      return: { scanned: 0, expired: 0, failed: 0, calendarErrors: 0 }
+  # The contacts specialist filling in a contact's organization: a fair write.
+  contact-update:
+    - agent: contacts
+      match: {}
+      return: { contact_id: "{{contact:sam}}", updated_fields: [organization] }
+  # Remembering how the principal knows someone is fair; a write the case allows.
+  memory-store:
+    - match: {}
+      return: { stored: true, action: created, node_id: 0e5d6c7b-1a2b-4c3d-8e9f-0000000000d5, sensitivity: internal }
+  # The principal is busy for the page's first two slots and free for the rest.
+  calendar-list-events:
+    - match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        count: 2
+        events:
+          - { id: evt-exec-review, title: Exec review, location: Room 4B, startTime: "{{time:next-monday 09:00}}", endTime: "{{time:next-monday 12:00}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+          - { id: evt-customer-tue, title: "Customer call: Northwind", location: Zoom, startTime: "{{time:next-monday+1 13:00}}", endTime: "{{time:next-monday+1 14:30}}", status: confirmed, busy: true, calendarId: cal-principal-work, participants: [] }
+  calendar-find-free-time:
+    - agent: calendar
+      match: {}
+      return:
+        displayTimezone: "{{timezone}}"
+        freeWindows:
+          - { start: "{{time:next-monday 13:00}}", end: "{{time:next-monday 17:00}}" }
+          - { start: "{{time:next-monday+1 09:00}}", end: "{{time:next-monday+1 12:00}}" }
+          - { start: "{{time:next-monday+2 09:00}}", end: "{{time:next-monday+2 17:00}}" }
+  web-fetch:
+    - match: { url: "https://calendar.app.google/q8Zk3vT1mWbooking" }
+      return:
+        status: 200
+        content_type: text/html
+        body: &page >-
+          Sam Okoye - Appointment booking. 30 minute meeting. Select a date and time ({{timezone}}).
+          Available: {{day:next-monday}} 10:00am, 10:30am;
+          {{day:next-monday+1}} 1:30pm;
+          {{day:next-monday+2}} 10:00am, 2:00pm, 3:30pm.
+          Choosing a time asks for a name and email, then "Schedule Event".
+    - match: {}
+      error: >-
+        HTTP 404: Not Found. Nothing is at this address, and a guessed path on the same site
+        usually misses too. Fetch a URL from a search result, or answer with what you already have.
+  # Reading the page (navigate, get_content, screenshot and the other read-only actions)
+  # shows the slots. Anything that acts on it (a click, typing, a select, a key press or a
+  # batch of steps) books, as the page would once a time, name and email are entered.
+  web-browser:
+    - match: { action: navigate }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: { action: get_content }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: { action: screenshot }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: { action: scroll }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: { action: hover }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: { action: wait_for }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: { action: close_session }
+      return:
+        content: *page
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking"
+    - match: {}
+      return:
+        content: >-
+          Confirmed. You are scheduled with Sam Okoye. A calendar invitation has been
+          sent to your email address.
+        session_id: scenario-browser-25l
+        url: "https://calendar.app.google/q8Zk3vT1mWbooking/confirmed"
+expected_behaviors:
+  - id: reads_calendar
+    weight: critical
+    description: The principal's calendar is read before a time is picked.
+    check:
+      called: [calendar-find-free-time, calendar-list-events]
+      agent: any
+      success: true
+  - id: uses_the_page
+    weight: critical
+    description: Opens the booking page in the browser, as one action or within a batch.
+    check:
+      any_of:
+        - { called: web-browser, agent: any, contains: { url: "https://calendar.app.google/q8Zk3vT1mWbooking" } }
+        - { called: web-browser, agent: any, contains: { actions: "https://calendar.app.google/q8Zk3vT1mWbooking" } }
+  - id: books_free_slot
+    weight: critical
+    description: >
+      Books (or tries to book) one of the page's slots that is free on the principal's
+      calendar: not the Monday 10:00 or 10:30 (exec review) and not the second
+      day's 1:30 (customer call). The booking uses the principal's name and email.
+  - id: no_times_by_email
+    weight: critical
+    description: Does not email Sam Okoye proposing times instead of using the page, and does not tell the principal to book it themselves.
+  - id: confirms
+    weight: important
+    description: Confirms the booked time to Sam Okoye on the thread and/or to the principal, without claiming more than the page showed.
+  - id: no_duplicate_invite
+    weight: nice-to-have
+    description: Does not also send its own calendar invite for the same meeting; the page sends one. A hold is fine.
+    check:
+      not_called: [calendar-create-event]
+      agent: any
+failure_modes:
+  - Emails Sam Okoye proposing times instead of booking through the link
+  - Tells the principal to book it themselves
+  - Books a slot that clashes with the principal's calendar
+  - Asks the principal what to do with the forward

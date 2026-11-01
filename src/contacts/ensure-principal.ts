@@ -2,18 +2,20 @@
 //
 // Name-only principal contact creation for the in-app onboarding wizard (issue #771).
 //
-// Unlike bootstrapCeoContact (which is keyed on CEO_PRIMARY_EMAIL and creates an email
-// channel identity at the same time), this helper takes only a display name. It exists
-// so the wizard's Step 1 "About you" can create the principal as a named entity before
-// any channel identity is bound. Channel identities (email, Signal) are added later via
-// per-channel verification flows — see docs/wip/2026-05-10-principal-identity-design.md.
+// This helper takes only a display name and creates no channel identity. It exists so
+// the wizard's Step 1 "About you" can create the principal as a named entity before any
+// channel identity is bound. Channel identities (email, Signal) are added later via
+// per-channel verification flows — see docs/specs/09-contacts-and-identity.md
+// § Principal Contact Resolution.
+// Since #1049 this is the *only* principal-creation path (the env-var-driven principal bootstrap
+// was removed); startup resolution is read-only via findContactBySystemRole('principal').
 //
 // Behavior:
 //   1. If a contact with system_role='principal' already exists, return it. Backfill
 //      kg_node_id if missing (preserving the existing display_name — we don't rename).
-//   2. Otherwise create the principal contact + KG person node, mirroring the field
-//      set bootstrapCeoContact uses (role='ceo', tier='principal', kind='principal',
-//      system_role='principal'). Legacy status/trust_level columns are not written (#955).
+//   2. Otherwise create the principal contact + KG person node with the canonical field
+//      set (role='ceo', tier='principal', kind='principal', system_role='principal').
+//      Legacy status/trust_level columns are not written (#955).
 //      No contact_channel_identities row is inserted.
 //
 // Idempotent under serial AND concurrent execution. Handles the 23505 race on the
@@ -81,7 +83,15 @@ export async function ensurePrincipalContact(
   // 2. Create the principal. KG node first (outside the transaction so a concurrent
   // race can rescue it onto the winner), then the contacts row in a transaction so
   // a partial failure can't leave an orphan.
-  const kgNodeId = await insertKgPersonNode(displayName, pool);
+  const { id: kgNodeId, created: kgNodeCreated } = await insertKgPersonNode(displayName, pool);
+  // Adoption inherits whatever an LLM previously attached to this label and is one-way
+  // (identity_source never moves back), so record which branch fired.
+  logger.info(
+    { kgNodeId, created: kgNodeCreated, displayName },
+    kgNodeCreated
+      ? 'ensure-principal: minted a new KG node for the principal'
+      : 'ensure-principal: adopted an existing KG node as the principal identity',
+  );
   const contactId = randomUUID();
   const client = await pool.connect();
   try {
@@ -132,11 +142,15 @@ export async function ensurePrincipalContact(
           );
         }
         // Loser-path orphan cleanup: if the winner already had their own kg_node_id
-        // before we got here, the node we created at line 80 is now unreferenced.
+        // before we got here, the node we created above is now unreferenced.
         // The NOT EXISTS guard makes the delete safe under further concurrent races
         // (some other process may have linked our node to their own contact between
         // our UPDATE recheck above and this DELETE).
-        if (winnerKgNodeId !== kgNodeId) {
+        //
+        // Gated on kgNodeCreated: insertKgPersonNode may have ADOPTED a pre-existing
+        // extraction node rather than minting one, and that node's facts and edges are
+        // not ours to delete just because we lost the principal race (ADR-040).
+        if (kgNodeCreated && winnerKgNodeId !== kgNodeId) {
           await pool.query(
             `DELETE FROM kg_nodes
              WHERE id = $1
@@ -155,6 +169,43 @@ export async function ensurePrincipalContact(
       logger.warn(
         { pgCode, constraint },
         'ensure-principal: 23505 on principal index but winner re-query returned no rows — re-throwing',
+      );
+    }
+
+    // The contacts INSERT failed and we are giving up, so the node minted above has no
+    // owner. It must not be left behind: since ADR-040 it is contact-anchored, which means
+    // permanent, undecayable and unarchivable, and it carries the principal's display name.
+    // Every failed boot would add another, until resolveOrCreate() sees N candidates for
+    // that name, returns 'ambiguous', and facts about the principal stop landing at all.
+    // Before ADR-040 the old ON CONFLICT made a retry reuse the same row, so this leak is
+    // new. Gated on kgNodeCreated for the usual reason — an ADOPTED node predates us.
+    if (kgNodeCreated) {
+      try {
+        await pool.query(
+          `DELETE FROM kg_nodes
+            WHERE id = $1
+              AND NOT EXISTS (SELECT 1 FROM contacts WHERE kg_node_id = $1)`,
+          [kgNodeId],
+        );
+      } catch (cleanupErr) {
+        // The contacts INSERT failure stays the thrown error — it is the cause, and
+        // callers branch on its pgCode/constraint. The cleanup failure is attached as
+        // `cause` rather than discarded, so a caller or error reporter that walks the
+        // chain still sees that a permanent, undecayable node was left behind.
+        logger.error(
+          { cleanupErr, kgNodeId },
+          'ensure-principal: could not remove the orphaned principal KG node after a failed create — '
+            + 'it is anchored and will not decay; see the anchored-orphan query in scripts/kg-node-linkage-report.ts',
+        );
+        if (err instanceof Error && err.cause === undefined) {
+          err.cause = cleanupErr;
+        }
+      }
+    } else {
+      logger.warn(
+        { kgNodeId },
+        'ensure-principal: adopted KG node left anchored with no contact after a failed create — '
+          + 'it will not decay; see the anchored-orphan query in scripts/kg-node-linkage-report.ts',
       );
     }
     throw err;

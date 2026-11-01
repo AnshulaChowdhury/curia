@@ -5,6 +5,10 @@ import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
 import { buildContactViewFields, kgNodeHref, formatDateTime } from './contacts-utils.js';
+import {
+  LINKABLE_CHANNEL_IDENTITIES,
+  type LinkableChannelIdentity,
+} from '../linkable-channels.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -19,7 +23,7 @@ type IdentityStatus = 'active' | 'defunct' | 'bounced';
 type DrawerMode = 'view' | 'edit' | 'create' | null;
 
 // A contact's linked channel identity, as serialized by
-// GET /api/kg/contacts/:id/identities (Date fields are ISO strings here).
+// GET /api/contacts/:id/identities (Date fields are ISO strings here).
 interface ContactIdentity {
   id: string;
   contactId: string;
@@ -137,9 +141,11 @@ function Pagination({ total, page, pageSize, totalPages, onPage, onPageSize }: P
 interface DrawerProps {
   contact: Contact | null;
   creating: boolean;
+  allContacts: Contact[];
   onClose: () => void;
   onSaved: (contact: Contact) => void;
   onDeleted: (id: string) => void;
+  onMerged: (primaryId: string, secondaryId: string) => void;
 }
 
 interface AuthOverride {
@@ -147,7 +153,9 @@ interface AuthOverride {
   granted: boolean;
 }
 
-function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: DrawerProps) {
+const IDENTITY_CHANNEL_OPTIONS = LINKABLE_CHANNEL_IDENTITIES;
+
+function ContactEditDrawer({ contact, creating, allContacts, onClose, onSaved, onDeleted, onMerged }: DrawerProps) {
   const [displayName, setDisplayName] = useState(contact?.displayName ?? '');
   const [role, setRole] = useState(contact?.role ?? '');
   const [tier, setTier] = useState<ContactTier>(contact?.tier ?? 'unknown');
@@ -175,10 +183,36 @@ function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: D
   const [overridesError, setOverridesError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
 
+  // Channel identities (#1514)
+  const [identities, setIdentities] = useState<ContactIdentity[]>([]);
+  const [identitiesError, setIdentitiesError] = useState<string | null>(null);
+  const [newChannel, setNewChannel] = useState<LinkableChannelIdentity>('email');
+  const [newIdentifier, setNewIdentifier] = useState('');
+  const [newLabel, setNewLabel] = useState('');
+  const [identityBusy, setIdentityBusy] = useState<string | null>(null);
+
+  // Merge lookalike into another contact (current = secondary)
+  const [mergePrimaryId, setMergePrimaryId] = useState('');
+  const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+
+  const reloadIdentities = useCallback(async () => {
+    if (!contact || creating) return;
+    setIdentitiesError(null);
+    try {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities`);
+      if (!res.ok) { setIdentitiesError('Failed to load identities'); return; }
+      const d = await res.json() as { identities: ContactIdentity[] };
+      setIdentities(d.identities);
+    } catch (_err: unknown) {
+      setIdentitiesError('Failed to load identities');
+    }
+  }, [contact, creating]);
+
   useEffect(() => {
     if (!contact || creating) return;
     setOverridesError(null);
-    apiFetch(`/api/kg/contacts/${contact.id}/overrides`)
+    apiFetch(`/api/contacts/${contact.id}/overrides`)
       .then(async res => {
         if (!res.ok) { setOverridesError('Failed to load permissions'); return; }
         const d = await res.json() as { overrides: AuthOverride[] };
@@ -188,17 +222,153 @@ function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: D
       .catch((_err: unknown) => setOverridesError('Failed to load permissions'));
   }, [contact, creating]);
 
+  useEffect(() => {
+    void reloadIdentities();
+  }, [reloadIdentities]);
+
   async function handleRevokeOverride(permission: string) {
     if (!contact) return;
     setRevoking(permission);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}/overrides/${permission}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/contacts/${contact.id}/overrides/${permission}`, { method: 'DELETE' });
       if (!res.ok) { setOverridesError('Failed to revoke permission'); return; }
       setOverrides(prev => prev.filter(o => o.permission !== permission));
     } catch (_err: unknown) {
       setOverridesError('Failed to revoke permission');
     } finally {
       setRevoking(null);
+    }
+  }
+
+  async function handleAddIdentity() {
+    if (!contact) return;
+    const identifier = newIdentifier.trim();
+    if (!identifier) {
+      setIdentitiesError('Identifier is required.');
+      return;
+    }
+    setIdentityBusy('add');
+    setIdentitiesError(null);
+    try {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: newChannel,
+          channelIdentifier: identifier,
+          label: newLabel.trim() || undefined,
+        }),
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      setNewIdentifier('');
+      setNewLabel('');
+      await reloadIdentities();
+    } catch (err) {
+      console.error('[ContactEditDrawer] add identity failed:', err);
+      setIdentitiesError(err instanceof Error ? err.message : 'Failed to add identity');
+    } finally {
+      setIdentityBusy(null);
+    }
+  }
+
+  async function handleVerifyIdentity(identityId: string) {
+    if (!contact) return;
+    setIdentityBusy(identityId);
+    setIdentitiesError(null);
+    try {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities/${identityId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ verified: true }),
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      await reloadIdentities();
+    } catch (err) {
+      console.error('[ContactEditDrawer] verify identity failed:', err);
+      setIdentitiesError(err instanceof Error ? err.message : 'Failed to verify identity');
+    } finally {
+      setIdentityBusy(null);
+    }
+  }
+
+  async function handleSetIdentityStatus(identityId: string, status: IdentityStatus) {
+    if (!contact) return;
+    setIdentityBusy(identityId);
+    setIdentitiesError(null);
+    try {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities/${identityId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      await reloadIdentities();
+    } catch (err) {
+      console.error('[ContactEditDrawer] set identity status failed:', err);
+      setIdentitiesError(err instanceof Error ? err.message : 'Failed to update identity');
+    } finally {
+      setIdentityBusy(null);
+    }
+  }
+
+  async function handleRemoveIdentity(identityId: string) {
+    if (!contact) return;
+    setIdentityBusy(identityId);
+    setIdentitiesError(null);
+    try {
+      const res = await apiFetch(`/api/contacts/${contact.id}/identities/${identityId}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      await reloadIdentities();
+    } catch (err) {
+      console.error('[ContactEditDrawer] remove identity failed:', err);
+      setIdentitiesError(err instanceof Error ? err.message : 'Failed to remove identity');
+    } finally {
+      setIdentityBusy(null);
+    }
+  }
+
+  async function handleMerge() {
+    if (!contact || !mergePrimaryId) return;
+    setMerging(true);
+    setMergeError(null);
+    try {
+      const preview = await apiFetch('/api/contacts/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          primaryContactId: mergePrimaryId,
+          secondaryContactId: contact.id,
+          dryRun: true,
+        }),
+      });
+      if (!preview.ok) throw new Error(await errorMessage(preview));
+      const previewData = await preview.json() as {
+        goldenRecord: { displayName: string; identityCount: number };
+      };
+      const confirmed = window.confirm(
+        `Merge "${contact.displayName}" into "${previewData.goldenRecord.displayName}"?\n\n` +
+        `This re-points ${previewData.goldenRecord.identityCount} channel identities onto the primary and deletes this contact.`,
+      );
+      if (!confirmed) return;
+
+      const res = await apiFetch('/api/contacts/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          primaryContactId: mergePrimaryId,
+          secondaryContactId: contact.id,
+          dryRun: false,
+        }),
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      onMerged(mergePrimaryId, contact.id);
+    } catch (err) {
+      console.error('[ContactEditDrawer] merge failed:', err);
+      setMergeError(err instanceof Error ? err.message : 'Merge failed');
+    } finally {
+      setMerging(false);
     }
   }
 
@@ -241,13 +411,13 @@ function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: D
 
       let res: Response;
       if (creating) {
-        res = await apiFetch('/api/kg/contacts', {
+        res = await apiFetch('/api/contacts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
       } else {
-        res = await apiFetch(`/api/kg/contacts/${contact!.id}`, {
+        res = await apiFetch(`/api/contacts/${contact!.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -273,7 +443,7 @@ function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: D
     setDeleting(true);
     setError(null);
     try {
-      const res = await apiFetch(`/api/kg/contacts/${contact.id}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/contacts/${contact.id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(await errorMessage(res));
       onDeleted(contact.id);
     } catch (err) {
@@ -429,6 +599,96 @@ function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: D
             <textarea id="cf-notes" rows={4} value={notes} onChange={e => setNotes(e.target.value)} />
           </div>
 
+          {/* Section: Channel identities (#1514) */}
+          {!creating && (
+            <>
+              <p style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-fg-muted)', margin: '16px 0 6px' }}>Channel identities</p>
+              {contact?.systemRole === 'principal' && (
+                <p style={{ color: 'var(--app-fg-muted)', fontSize: 12, margin: '0 0 8px' }}>
+                  Bind Slack / Signal / phone identities here so outbound messages to you skip the Stage-2 judge.
+                </p>
+              )}
+              {identitiesError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: 0 }}>{identitiesError}</p>}
+              {identities.length === 0 && !identitiesError && (
+                <p style={{ color: 'var(--app-fg-muted)', fontSize: 12, margin: 0 }}>No channel identities on file.</p>
+              )}
+              {identities.map(idn => (
+                <div key={idn.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, marginBottom: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 11, color: 'var(--app-fg-muted)', textTransform: 'uppercase', minWidth: 48 }}>{idn.channel}</span>
+                  <span style={{ flex: 1, fontFamily: 'JetBrains Mono, monospace', fontSize: 12, wordBreak: 'break-all' }}>{idn.channelIdentifier}</span>
+                  <span style={{ fontSize: 11, color: idn.verified ? 'var(--app-success, #22c55e)' : 'var(--app-fg-muted)' }}>
+                    {idn.verified ? 'verified' : 'unverified'}
+                  </span>
+                  <select
+                    value={idn.status}
+                    disabled={identityBusy === idn.id}
+                    onChange={e => void handleSetIdentityStatus(idn.id, e.target.value as IdentityStatus)}
+                    style={{ fontSize: 11, padding: '2px 4px' }}
+                    aria-label={`Status for ${idn.channelIdentifier}`}
+                  >
+                    <option value="active">active</option>
+                    <option value="defunct">defunct</option>
+                    <option value="bounced">bounced</option>
+                  </select>
+                  {!idn.verified && (
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ padding: '2px 8px', fontSize: 11 }}
+                      onClick={() => void handleVerifyIdentity(idn.id)}
+                      disabled={identityBusy === idn.id}
+                    >
+                      Verify
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    style={{ padding: '2px 8px', fontSize: 11 }}
+                    onClick={() => void handleRemoveIdentity(idn.id)}
+                    disabled={identityBusy === idn.id}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <div className="form-grid" style={{ marginTop: 8 }}>
+                <div className="form-field">
+                  <label htmlFor="ci-channel">Channel</label>
+                  <select
+                    id="ci-channel"
+                    value={newChannel}
+                    onChange={e => setNewChannel(e.target.value as LinkableChannelIdentity)}
+                  >
+                    {IDENTITY_CHANNEL_OPTIONS.map(ch => (
+                      <option key={ch} value={ch}>{ch}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-field">
+                  <label htmlFor="ci-identifier">Identifier</label>
+                  <input
+                    id="ci-identifier"
+                    type="text"
+                    value={newIdentifier}
+                    onChange={e => setNewIdentifier(e.target.value)}
+                    placeholder={newChannel === 'slack' ? 'U0123ABCDEF' : newChannel === 'email' ? 'you@example.com' : '+15551234567'}
+                  />
+                </div>
+                <div className="form-field">
+                  <label htmlFor="ci-label">Label (optional)</label>
+                  <input id="ci-label" type="text" value={newLabel} onChange={e => setNewLabel(e.target.value)} placeholder="work, personal…" />
+                </div>
+              </div>
+              <button
+                className="btn btn-secondary btn-sm"
+                style={{ marginTop: 4 }}
+                onClick={() => void handleAddIdentity()}
+                disabled={identityBusy === 'add' || !newIdentifier.trim()}
+              >
+                {identityBusy === 'add' ? 'Adding…' : 'Add identity'}
+              </button>
+            </>
+          )}
+
           {/* Section: Permission grants */}
           {!creating && (
             <>
@@ -455,6 +715,42 @@ function ContactEditDrawer({ contact, creating, onClose, onSaved, onDeleted }: D
                   </button>
                 </div>
               ))}
+            </>
+          )}
+
+          {/* Section: Merge lookalike (#1514) — current contact is the secondary (deleted). */}
+          {!creating && contact && contact.systemRole === null && (
+            <>
+              <p style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--app-fg-muted)', margin: '16px 0 6px' }}>Merge into…</p>
+              <p style={{ color: 'var(--app-fg-muted)', fontSize: 12, margin: '0 0 8px' }}>
+                Re-point this contact&apos;s channel identities onto another contact and delete this one.
+                Use when inbound resolution created a lookalike of the principal.
+              </p>
+              {mergeError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: 0 }}>{mergeError}</p>}
+              <div className="form-field">
+                <label htmlFor="ci-merge-primary">Primary (survivor)</label>
+                <select
+                  id="ci-merge-primary"
+                  value={mergePrimaryId}
+                  onChange={e => setMergePrimaryId(e.target.value)}
+                >
+                  <option value="">Select contact…</option>
+                  {allContacts
+                    .filter(c => c.id !== contact.id)
+                    .map(c => (
+                      <option key={c.id} value={c.id}>
+                        {c.displayName}{c.systemRole === 'principal' ? ' (principal)' : ''} · {c.tier}
+                      </option>
+                    ))}
+                </select>
+              </div>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => void handleMerge()}
+                disabled={merging || !mergePrimaryId}
+              >
+                {merging ? 'Merging…' : 'Preview & merge'}
+              </button>
             </>
           )}
         </div>
@@ -523,7 +819,7 @@ function ContactViewDrawer({ contact, onClose, onEdit }: ViewDrawerProps) {
     setIdentities([]);
     setIdentitiesLoaded(false);
     setIdentitiesError(null);
-    apiFetch(`/api/kg/contacts/${contact.id}/identities`)
+    apiFetch(`/api/contacts/${contact.id}/identities`)
       .then(async res => {
         if (cancelled) return;
         if (!res.ok) { setIdentities([]); setIdentitiesError('Failed to load identities'); return; }
@@ -538,7 +834,7 @@ function ContactViewDrawer({ contact, onClose, onEdit }: ViewDrawerProps) {
   useEffect(() => {
     let cancelled = false;
     setOverrides([]);
-    apiFetch(`/api/kg/contacts/${contact.id}/overrides`)
+    apiFetch(`/api/contacts/${contact.id}/overrides`)
       .then(async res => {
         if (cancelled) return;
         if (!res.ok) { setOverrides([]); return; }
@@ -665,15 +961,20 @@ export default function ContactsPage() {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
   }, [mobileOpen]);
 
-  const load = useCallback(async () => {
+  // Returns the freshly-fetched contacts (or null on failure) so callers can
+  // reconcile drawer state against the authoritative server response, not a
+  // stale pre-fetch closure.
+  const load = useCallback(async (): Promise<Contact[] | null> => {
     try {
-      const res = await apiFetch('/api/kg/contacts');
+      const res = await apiFetch('/api/contacts');
       if (!res.ok) throw new Error(await errorMessage(res));
       const data = await res.json() as { contacts: Contact[] };
       setContacts(data.contacts);
+      return data.contacts;
     } catch (err) {
       console.error('[ContactsPage] failed to load contacts:', err);
       setLoadError(err instanceof Error ? err.message : 'Failed to load contacts');
+      return null;
     }
   }, []);
 
@@ -754,6 +1055,19 @@ export default function ContactsPage() {
     setContacts(prev => prev.filter(c => c.id !== id));
     setSelected(null);
     setDrawerMode(null);
+  }
+
+  function handleMerged(primaryId: string, secondaryId: string) {
+    // Drop the merged-away secondary immediately for responsiveness.
+    setContacts(prev => prev.filter(c => c.id !== secondaryId));
+    // The merge recomputes the golden record (displayName/tier/notes) onto the
+    // primary server-side, so the pre-merge `contacts` closure is stale. Reconcile
+    // `selected` against load()'s fresh response instead of the old snapshot.
+    void load().then(fresh => {
+      const primary = fresh?.find(c => c.id === primaryId) ?? null;
+      setSelected(primary);
+      setDrawerMode(primary ? 'view' : null);
+    });
   }
 
   function openView(contact: Contact) {
@@ -966,9 +1280,11 @@ export default function ContactsPage() {
                     key={drawerMode === 'edit' ? selected?.id ?? 'edit' : 'new'}
                     contact={drawerMode === 'edit' ? selected : null}
                     creating={drawerMode === 'create'}
+                    allContacts={contacts}
                     onClose={closeDrawer}
                     onSaved={handleSaved}
                     onDeleted={handleDeleted}
+                    onMerged={handleMerged}
                   />
                 )}
               </div>

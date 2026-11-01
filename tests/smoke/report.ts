@@ -2,6 +2,7 @@
 // Generates a self-contained HTML report from smoke test results.
 // No external CSS/JS/fonts — everything is inline.
 
+import { formatUsd } from '../shared/usage.js';
 import type { RunResult, HistoricalEntry, CaseResult, BehaviorRating } from './types.js';
 
 /**
@@ -139,7 +140,15 @@ function buildTrendChart(history: HistoricalEntry[]): string {
  * Render a single case result as a collapsible details card.
  */
 function renderCaseCard(caseResult: CaseResult): string {
-  const { testCase, responses, scores, weightedScore, error } = caseResult;
+  const { testCase, responses, scores, weightedScore, failures, passed, firstAttempt } = caseResult;
+  // The gate's verdict, as the CLI summary prints it: PASS* passed only on its retry,
+  // KNOWN is a known_failure case that failed (reported, not gated).
+  const verdict = passed
+    ? (firstAttempt ? 'PASS*' : 'PASS')
+    : (testCase.knownFailure && !caseResult.error && !caseResult.judgeError ? `KNOWN ${testCase.knownFailure.issue}` : 'FAIL');
+  const retryNote = firstAttempt
+    ? `<div class="error-banner">First attempt ${pct(firstAttempt.weightedScore)}: ${firstAttempt.failures.map(f => escapeHtml(f)).join('<br>')}</div>`
+    : '';
   const color = scoreColor(weightedScore);
 
   // Tags as pills
@@ -157,6 +166,9 @@ function renderCaseCard(caseResult: CaseResult): string {
     .map(r => `
       <div class="response-block">
         <div class="response-meta">Agent: ${escapeHtml(r.agentId)} &middot; ${formatDuration(r.durationMs)}</div>
+        ${r.toolCalls.length > 0
+          ? `<div class="response-meta">Tools: ${r.toolCalls.map(c => escapeHtml(c.result && !c.result.success ? `${c.name} (failed)` : c.name)).join(', ')}</div>`
+          : ''}
         <div class="response-content">${escapeHtml(r.content)}</div>
       </div>`)
     .join('\n');
@@ -187,9 +199,9 @@ function renderCaseCard(caseResult: CaseResult): string {
       </div>`
     : '';
 
-  // Error banner (if execution errored)
-  const errorBanner = error
-    ? `<div class="error-banner">${escapeHtml(error)}</div>`
+  // Gate failures (execution or judge error, critical MISS, score below threshold)
+  const errorBanner = failures.length > 0
+    ? `<div class="error-banner">${failures.map(f => escapeHtml(f)).join('<br>')}</div>`
     : '';
 
   return `
@@ -197,10 +209,12 @@ function renderCaseCard(caseResult: CaseResult): string {
       <summary class="case-header">
         <span class="case-name">${escapeHtml(testCase.name)}</span>
         ${tagPills}
+        <span class="tag">${escapeHtml(verdict)}</span>
         <span class="case-score" style="background:${color}">${pct(weightedScore)}</span>
       </summary>
       <div class="case-body">
         ${errorBanner}
+        ${retryNote}
         <h4>Prompt</h4>
         ${promptBlocks}
 
@@ -556,7 +570,7 @@ export function generateReport(run: RunResult, history?: HistoricalEntry[]): str
   <div class="container">
     <div class="header">
       <h1>Curia Smoke Test Report</h1>
-      <div class="meta">${escapeHtml(formattedTime)} &middot; Duration: ${duration}</div>
+      <div class="meta">${escapeHtml(formattedTime)} &middot; Duration: ${duration} &middot; Estimated model spend: ${formatUsd(run.usage.total.estimatedCostUsd)} (judge ${formatUsd(run.usage.judge.estimatedCostUsd)})</div>
       <div class="overall-label">Overall Score</div>
       <div class="overall-score" style="color:${overallColor}">${pct(run.overallScore)}</div>
     </div>

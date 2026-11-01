@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CalendarCheckConflictsHandler } from '../../../skills/calendar-check-conflicts/handler.js';
-import type { SkillContext } from '../../../src/skills/types.js';
+import { CalendarCheckConflictsHandler } from '../../../skills/calendar/tools/calendar-check-conflicts/handler.js';
+import type { ToolContext } from '../../../src/skills/types.js';
 import pino from 'pino';
 
 const logger = pino({ level: 'silent' });
 
-function makeCtx(input: Record<string, unknown>, overrides?: Partial<SkillContext>): SkillContext {
-  return { input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
+function makeCtx(input: Record<string, unknown>, overrides?: Partial<ToolContext>): ToolContext {
+  return { toolName: 'calendar-check-conflicts', toolVersion: '1.2.3', input, secret: () => { throw new Error('no secrets'); }, log: logger, ...overrides };
 }
 
 describe('CalendarCheckConflictsHandler', () => {
@@ -73,6 +73,95 @@ describe('CalendarCheckConflictsHandler', () => {
       // Timestamps must be ISO strings, not raw Unix seconds (1000s → 16:40, 2000s → 33:20)
       expect(data.conflicts[0].startTime).toBe('1970-01-01T00:16:40.000Z');
       expect(data.conflicts[0].endTime).toBe('1970-01-01T00:33:20.000Z');
+    }
+  });
+
+  it('clamps a one-sided epoch-zero start and still reports the conflict', async () => {
+    const warn = vi.spyOn(logger, 'warn');
+    const nylasCalendarClient = {
+      getFreeBusy: vi.fn().mockResolvedValue([{
+        email: 'cal-1',
+        timeSlots: [
+          { startTime: 0, endTime: 1775480400, status: 'busy' }, // 13:00Z
+        ],
+      }]),
+    };
+
+    const result = await handler.execute(makeCtx(
+      { calendarIds: ['cal-1'], proposedStart: '2026-04-06T12:00:00Z', proposedEnd: '2026-04-06T12:30:00Z' },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { conflicts: Array<{ startTime: string; endTime: string }>; clear: boolean };
+      expect(data.clear).toBe(false);
+      expect(data.conflicts).toHaveLength(1);
+      expect(data.conflicts[0]!.startTime).toBe('2026-04-06T12:00:00.000Z');
+      expect(data.conflicts[0]!.endTime).toBe('2026-04-06T13:00:00.000Z');
+    }
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ startTime: 0, endTime: 1775480400 }),
+      expect.stringContaining('clamping'),
+    );
+    warn.mockRestore();
+  });
+
+  it('drops a slot only when neither endpoint is usable', async () => {
+    const warn = vi.spyOn(logger, 'warn');
+    const nylasCalendarClient = {
+      getFreeBusy: vi.fn().mockResolvedValue([{
+        email: 'cal-1',
+        timeSlots: [
+          { startTime: 0, endTime: Number.NaN, status: 'busy' },
+          { startTime: 1775480400000, endTime: 1775484000000, status: 'busy' },
+        ],
+      }]),
+    };
+
+    const result = await handler.execute(makeCtx(
+      { calendarIds: ['cal-1'], proposedStart: '2026-04-06T12:00:00Z', proposedEnd: '2026-04-06T13:00:00Z' },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { conflicts: Array<{ startTime: string; endTime: string }>; clear: boolean };
+      expect(data.clear).toBe(true);
+      expect(data.conflicts).toHaveLength(0);
+    }
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls.some((call) =>
+      call[1] === 'calendar-check-conflicts: skipping free/busy slot with suspicious Unix timestamp'
+      && (call[0] as { startTime: number }).startTime === 0,
+    )).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('reports valid conflicts when mixed with a one-sided corrupt overlapping slot', async () => {
+    const nylasCalendarClient = {
+      getFreeBusy: vi.fn().mockResolvedValue([{
+        email: 'cal-1',
+        timeSlots: [
+          { startTime: 0, endTime: 1775480400, status: 'busy' }, // clamp → 12:30Z–13:00Z
+          { startTime: 1775480400, endTime: 1775484000, status: 'busy' }, // 13:00Z–14:00Z
+        ],
+      }]),
+    };
+
+    const result = await handler.execute(makeCtx(
+      { calendarIds: ['cal-1'], proposedStart: '2026-04-06T12:30:00Z', proposedEnd: '2026-04-06T13:30:00Z' },
+      { nylasCalendarClient: nylasCalendarClient as never },
+    ));
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      const data = result.data as { conflicts: Array<{ startTime: string; endTime: string }>; clear: boolean };
+      expect(data.clear).toBe(false);
+      expect(data.conflicts).toEqual([
+        { calendarId: 'cal-1', contactName: null, startTime: '2026-04-06T12:30:00.000Z', endTime: '2026-04-06T13:00:00.000Z', status: 'busy' },
+        { calendarId: 'cal-1', contactName: null, startTime: '2026-04-06T13:00:00.000Z', endTime: '2026-04-06T14:00:00.000Z', status: 'busy' },
+      ]);
     }
   });
 

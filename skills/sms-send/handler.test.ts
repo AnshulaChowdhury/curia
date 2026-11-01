@@ -1,0 +1,204 @@
+import { describe, it, expect, vi } from 'vitest';
+import { REDACTION_NOTE } from '../../src/skills/_shared/principal-directed.js';
+import { SmsSendHandler } from './handler.js';
+import type { ToolContext } from '../../src/skills/types.js';
+import pino from 'pino';
+
+function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
+  return {
+    input: {},
+    log: pino({ level: 'silent' }),
+    agentId: 'coordinator',
+    ...overrides,
+  } as ToolContext;
+}
+
+// Resolves to a number that is not E.164, so the handler's own check is exercised.
+const BOB_ID = '22222222-2222-4222-8222-222222222222';
+
+/** Stands in for the gateway's reference resolver (#2033); its rules are tested elsewhere. */
+const resolveRecipientReference = vi.fn(async (_channel: string, value: string) => {
+  if (value === 'principal') return { ok: true, kind: 'principal', contactId: 'principal-id', identifier: '+15195550100', displayName: 'Principal' };
+  if (value === BOB_ID) return { ok: true, kind: 'contact', contactId: BOB_ID, identifier: '4155552671', displayName: 'Bob' };
+  return { ok: false, error: `No contact for "${value}". Nothing was sent.` };
+});
+
+describe('sms-send handler', () => {
+  it('asks for a recipient and points to contact-create when none is given', async () => {
+    const send = vi.fn();
+    const missing = await new SmsSendHandler().execute(makeCtx({
+      input: { message: 'hi' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+    }));
+    expect(missing.success).toBe(false);
+    if (!missing.success) expect(missing.error).toMatch(/contact-create/);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('refuses a stored number that is not E.164', async () => {
+    const handler = new SmsSendHandler();
+    const send = vi.fn();
+    const bad = await handler.execute(makeCtx({
+      input: { recipient: BOB_ID, message: 'hi' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+    }));
+    expect(bad.success).toBe(false);
+    if (!bad.success) expect(bad.error).toMatch(/E\.164/);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  describe('send by reference (#2033)', () => {
+    it('resolves recipient through the gateway and sends to the looked-up number', async () => {
+      const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm2' });
+      const result = await new SmsSendHandler().execute(makeCtx({
+        input: { recipient: 'principal', message: 'Hello' },
+        outboundGateway: { send, resolveRecipientReference } as never,
+      }));
+      expect(result.success).toBe(true);
+      expect(resolveRecipientReference).toHaveBeenCalledWith('sms', 'principal', { field: 'recipient' });
+      expect(send).toHaveBeenCalledWith(
+        { channel: 'sms', recipient: '+15195550100', message: 'Hello' },
+        // Replayed on approval if band review holds the send (#2159).
+        expect.objectContaining({
+          holdRecipe: { toolName: 'sms-send', partialPayload: { recipient: 'principal', message: 'Hello' }, description: expect.stringMatching(/^SMS to /) },
+        }),
+      );
+      if (result.success) {
+        expect(result.data).toMatchObject({ delivered_to: '+15195550100' });
+        expect(result.data).not.toHaveProperty('contact_id');
+      }
+    });
+
+    it('passes an approved replay on as humanApproved, so band review does not hold it again (#2159)', async () => {
+      const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm3' });
+      await new SmsSendHandler().execute(makeCtx({
+        input: { recipient: 'principal', message: 'Hello' },
+        outboundGateway: { send, resolveRecipientReference } as never,
+        humanApproved: true,
+      }));
+      expect(send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ humanApproved: true }));
+    });
+
+    it('sends nothing when the reference does not resolve', async () => {
+      const send = vi.fn();
+      const result = await new SmsSendHandler().execute(makeCtx({
+        input: { recipient: '+14155552671', message: 'Hello' },
+        outboundGateway: { send, resolveRecipientReference } as never,
+      }));
+      expect(result.success).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('refuses the retired recipient_number (#2041)', async () => {
+      const send = vi.fn();
+      const result = await new SmsSendHandler().execute(makeCtx({
+        input: { recipient: 'principal', recipient_number: '+14155552671', message: 'Hello' },
+        outboundGateway: { send, resolveRecipientReference } as never,
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatch(/no longer accepted/);
+        expect(result.error).toMatch(/contact-create/);
+      }
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('refuses the retired recipient_number on its own (#2041)', async () => {
+      const send = vi.fn();
+      const result = await new SmsSendHandler().execute(makeCtx({
+        input: { recipient_number: '+14155552671', message: 'Hello' },
+        outboundGateway: { send, resolveRecipientReference } as never,
+      }));
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toMatch(/no longer accepted/);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    // Review Focus 1: models fill unused optional inputs with "" or whitespace.
+    it.each([[''], ['  '], [null], [[]]])(
+      'ignores a blank retired recipient_number %o beside a reference (Review Focus 1)',
+      async (blank) => {
+        const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm3' });
+        const result = await new SmsSendHandler().execute(makeCtx({
+          input: { recipient: 'principal', recipient_number: blank, message: 'Hello' },
+          outboundGateway: { send, resolveRecipientReference } as never,
+        }));
+        expect(result.success).toBe(true);
+        expect(send).toHaveBeenCalledWith({ channel: 'sms', recipient: '+15195550100', message: 'Hello' }, expect.any(Object));
+      },
+    );
+  });
+});
+
+describe('sms-send relay budget (#1320)', () => {
+  const OUTSIDER = { originator: { contactId: 'dana-contact', systemRole: null, channel: 'email', initiatedAt: '2026-10-19T12:00:00Z', tier: 'known' } };
+
+  it('passes the task originator to the gateway and surfaces a relay-budget deferral', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, deferredToDigest: true });
+    const outboundContext = { register: vi.fn().mockResolvedValue('entry-1'), release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 };
+    const result = await new SmsSendHandler().execute(makeCtx({
+      input: { recipient: 'principal', message: 'Hello' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+      taskMetadata: OUTSIDER,
+      outboundContext: outboundContext as never,
+    }));
+    expect(send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ originator: OUTSIDER.originator }));
+    expect(result.success).toBe(true);
+    // Nothing reached the principal, so no reply should bind to it.
+    expect(outboundContext.register).not.toHaveBeenCalled();
+    if (result.success) expect(result.data).toMatchObject({ deferred_to_digest: true, note: expect.stringMatching(/digest/) });
+  });
+});
+
+// #2261: the entry records who the message went to, so their reply sees it.
+describe('sms-send outbound-context recipients (#2261)', () => {
+  it('registers the resolved contact as the entry\'s recipient', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, messageId: 'sms-1' });
+    const register = vi.fn().mockResolvedValue('entry-1');
+    const result = await new SmsSendHandler().execute(makeCtx({
+      input: { recipient: 'principal', message: 'Which day works?' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+      outboundContext: { register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 } as never,
+    }));
+    expect(result.success).toBe(true);
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ recipientContactIds: ['principal-id'] }));
+  });
+});
+
+// #2312: the agent is told what was removed, and the entry records what was delivered.
+describe('sms-send redactions (#2312)', () => {
+  const RED = [{ label: 'phone_us', field: 'body' as const }];
+  const SENT = 'x [REDACTED: PHONE_US]';
+  const OC = () => { const register = vi.fn().mockResolvedValue('entry-1'); return { register, ctx: { register, release: vi.fn(), defaultExpiryHours: 6, explicitExpiryHours: 24, defaultExpiryHoursFor: () => 6 } as never }; };
+
+  it('reports the redactions and records the delivered content', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm', redactions: RED, sentContent: SENT });
+    const oc = OC();
+    const result = await new SmsSendHandler().execute(makeCtx({
+      input: { recipient: 'principal', message: 'x 519-555-0100' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+      outboundContext: oc.ctx,
+    }));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).toMatchObject({ redactions: RED, redaction_note: REDACTION_NOTE });
+    }
+    expect(oc.register).toHaveBeenCalledWith(expect.objectContaining({ content: SENT }));
+  });
+
+  it('adds no redactions key when nothing was removed', async () => {
+    const send = vi.fn().mockResolvedValue({ success: true, messageId: 'm' });
+    const oc = OC();
+    const result = await new SmsSendHandler().execute(makeCtx({
+      input: { recipient: 'principal', message: 'hello' },
+      outboundGateway: { send, resolveRecipientReference } as never,
+      outboundContext: oc.ctx,
+    }));
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('redactions');
+      expect(result.data).not.toHaveProperty('redaction_note');
+    }
+    expect(oc.register).toHaveBeenCalledWith(expect.objectContaining({ content: 'hello' }));
+  });
+});

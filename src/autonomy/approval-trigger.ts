@@ -1,22 +1,126 @@
 // approval-trigger.ts — ApprovalTriggerService.
 //
-// Owns the approval request flow when the autonomy gate blocks a skill:
-// dedup check, row insertion, short_ref generation, description building,
-// and CEO notification. See ADR-018 and issue #427.
+// Owns the approval request flow when an autonomy gate blocks a skill: dedup check, row
+// insertion, short_ref generation and description building. See ADR-018 and issue #427.
+//
+// It notifies no one (#2159). It used to email the principal and DM every chat identity
+// for each request. Now it records one principal.report item (the request's single digest
+// mention) and registers what the principal should be shown; the agent that owns the turn
+// delivers the approval on one channel with deliver-approval. Approvals no agent delivers
+// within 15 minutes are emailed by the expiry sweep's safety net.
 
 import { randomBytes } from 'node:crypto';
 import type { ActionLogRepo } from './action-log-repo.js';
-import type { OutboundGateway } from '../skills/outbound-gateway.js';
+import type { ApprovalDelivery } from './approval-delivery.js';
+import type { EventBus } from '../bus/bus.js';
+import { createAgentTask, createPrincipalReport, type AgentTaskEvent } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import { sanitizeOutput } from '../skills/sanitize.js';
-
+import type { SendRecipientPin } from '../skills/_shared/recipient-reference.js';
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 export type ApprovalRequestResult =
-  | { created: true; shortRef: string; notificationSent: boolean }
+  /** approvalNumber is null when the row has none (all 999 in use) or it could not be read back. */
+  | { created: true; shortRef: string; approvalNumber: number | null }
   | { created: false; reason: 'duplicate'; existingShortRef: string };
+
+/**
+ * What the blocked agent is told about a new approval. One place, so every gate gives the
+ * same instruction: deliver it on one channel (#2159). deliver-approval is the coordinator's
+ * tool, so a specialist is told to hand the ref back instead.
+ *
+ * When the approval has a number (#2159 Phase 3) the advisory quotes it too: it is what the
+ * principal sees and answers with ("approve 3"). The ref stays, because deliver-approval is
+ * keyed on it.
+ */
+export function approvalAdvisory(shortRef: string, agentId?: string, approvalNumber?: number | null): string {
+  const created = approvalNumber != null
+    ? `An approval request was created (approval ${approvalNumber}, ref: ${shortRef}).`
+    : `An approval request was created (ref: ${shortRef}).`;
+  if (agentId !== undefined && agentId !== 'coordinator') {
+    const which = approvalNumber != null ? `approval ${approvalNumber} (ref ${shortRef})` : `approval ${shortRef}`;
+    return `${created} Tell the coordinator, in your reply, that ${which} needs delivering to the principal.`;
+  }
+  return (
+    `${created} Deliver it to the principal now with ` +
+    `deliver-approval, on the channel their standing preferences name for urgent items.`
+  );
+}
+
+/**
+ * Read back the approval number insert() allocated for a pending row (#2159 Phase 3). Never
+ * throws: the row already exists and works by its short_ref, so a failed read only means the
+ * advisory and display go without the number. Delivery re-reads the row, so the principal is
+ * still shown its number.
+ */
+export async function readApprovalNumber(
+  actionLogRepo: Pick<ActionLogRepo, 'findApprovalNumber'>,
+  rowId: number,
+  logger: Logger,
+): Promise<number | null> {
+  try {
+    return await actionLogRepo.findApprovalNumber(rowId);
+  } catch (err) {
+    // Shared by the trigger and the gateway's gates; rowId says which approval.
+    logger.warn({ err, rowId }, 'approval: could not read back the approval number — the approval still works by its reference');
+    return null;
+  }
+}
+
+/**
+ * A personal-data ask behind a held relayed reply (#2312): `details` are the human labels
+ * ("SIN and phone number"), never the values; `requester` is who asked. `replyTo` is the email
+ * the held reply answers, so the holding reply can thread under it.
+ */
+export interface ApprovalWakeAsk {
+  details: string;
+  requester: string;
+  replyTo?: { messageId: string; account?: string };
+}
+
+/**
+ * A task that wakes the coordinator to deliver an approval raised after an agent's turn ended
+ * (a dispatcher-relayed reply), when no agent is there to read the advisory (#2159). If it is
+ * lost, the expiry sweep's safety net still delivers the approval.
+ *
+ * With `ask` (#2312) the wake says the hold is the requester's request for the principal's
+ * personal data, that it is urgent, and that the coordinator may send the requester one short
+ * holding reply on the thread, without the requested details. Nothing else.
+ */
+export function buildApprovalDeliveryWake(shortRef: string, what: string, parentEventId: string, ask?: ApprovalWakeAsk): AgentTaskEvent {
+  const lines = ask
+    ? [
+      `${what} was held for the principal's approval (ref: ${shortRef}).`,
+      `It is a personal-data request: ${ask.requester} asked for the principal's ${ask.details}, and the reply that shares it waits on the principal's yes.`,
+      "This is urgent. Deliver it now with deliver-approval, on the channel the principal's standing preferences name for urgent items.",
+      `Then you may send ${ask.requester} one short holding reply on the thread${holdingReplyHow(ask.replyTo)}. It must not include the requested details.`,
+      'Do not do anything else.',
+    ]
+    : [
+      `${what} was held for the principal's approval (ref: ${shortRef}).`,
+      "Deliver it with deliver-approval, on the channel the principal's standing preferences name for urgent items.",
+      'Do not do anything else.',
+    ];
+  return createAgentTask({
+    agentId: 'coordinator',
+    conversationId: `approval-delivery:${shortRef}`,
+    channelId: 'scheduler',
+    senderId: 'system',
+    content: lines.join(' '),
+    // Curia telling itself to deliver an approval, not a person reaching out (#2018).
+    syntheticTurn: true,
+    parentEventId,
+  });
+}
+
+/** How to thread the holding reply: email-reply on the message the held reply answers. */
+function holdingReplyHow(replyTo: ApprovalWakeAsk['replyTo']): string {
+  if (!replyTo) return '';
+  const account = replyTo.account ? `, account ${replyTo.account}` : '';
+  return ` (email-reply with reply_to_message_id ${replyTo.messageId}${account})`;
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers — exported for testing
@@ -46,28 +150,40 @@ const VERB_RULES: Array<{ test: (name: string) => boolean; verb: string }> = [
   { test: (n) => n === 'calendar-create-event', verb: 'Create calendar event' },
   { test: (n) => n === 'calendar-update-event', verb: 'Update calendar event' },
   { test: (n) => n === 'calendar-delete-event', verb: 'Delete calendar event' },
+  { test: (n) => n === 'calendar-respond-to-invite', verb: 'Respond to calendar invite' },
   { test: (n) => n === 'email-reply', verb: 'Send email reply' },
   { test: (n) => n === 'email-draft-save', verb: 'Save email draft' },
+  { test: (n) => n === 'dispatcher-relay', verb: 'Relay withheld reply' },
   { test: (n) => n === 'store-fact', verb: 'Store fact' },
   { test: (n) => n.startsWith('signal-'), verb: 'Send Signal message' },
-  { test: (n) => n.startsWith('schedule-'), verb: 'Schedule job' },
+  { test: (n) => n.startsWith('sms-'), verb: 'Send SMS' },
+  { test: (n) => n.startsWith('scheduler-'), verb: 'Schedule job' },
+  // Tools the spot-check pool samples (#2159 Phase 3). A pool row's description is written
+  // once and shown to the principal as-is, so "Run ceo-inbox-archive" would never improve.
+  { test: (n) => n === 'ceo-inbox-archive' || n === 'email-archive', verb: 'Archive an email' },
+  { test: (n) => n === 'ceo-inbox-label' || n === 'email-label', verb: 'Label an email' },
+  { test: (n) => n === 'contact-merge', verb: 'Merge contacts' },
+  { test: (n) => n === 'contact-set-tier', verb: 'Change a contact\'s trust tier' },
+  { test: (n) => n === 'contact-set-role', verb: 'Change a contact\'s role' },
+  { test: (n) => n === 'executive-profile-update', verb: 'Update the principal\'s profile' },
+  { test: (n) => n === 'calendar-create-hold', verb: 'Place a calendar hold' },
 ];
 
 /**
  * Build a human-readable one-liner from skill name and input fields.
- * Used in CEO notifications, the pending-actions digest, and the
+ * Used in principal notifications, the pending-actions digest, and the
  * coordinator's advisory failure message.
  */
 export function buildDescription(
-  skillName: string,
+  toolName: string,
   input: Record<string, unknown>,
 ): string {
   // Determine verb
   let verb = '';
   for (const rule of VERB_RULES) {
-    if (rule.test(skillName)) { verb = rule.verb; break; }
+    if (rule.test(toolName)) { verb = rule.verb; break; }
   }
-  if (!verb) return `Run ${skillName}`;
+  if (!verb) return `Run ${toolName}`;
 
   // Pick context fields in priority order
   const contextParts: string[] = [];
@@ -78,9 +194,17 @@ export function buildDescription(
       contextParts.push(truncate(val.trim(), MAX_VALUE_LENGTH));
     }
   }
+  // Label tools take `labels` as a list of names (ceo-inbox-label, email-label); name them
+  // so "Label an email" says which label. A single string is accepted too.
+  const labels = input.labels;
+  const labelNames = typeof labels === 'string'
+    ? [labels]
+    : Array.isArray(labels) ? labels.filter((l): l is string => typeof l === 'string') : [];
+  const labelText = labelNames.map((l) => l.trim()).filter(Boolean).join(', ');
+  if (labelText) contextParts.push(truncate(labelText, MAX_VALUE_LENGTH));
 
   // Known skill but no recognizable context fields — return just the verb.
-  // (Fallback to "Run {skillName}" is only for truly unknown skills above.)
+  // (Fallback to "Run {toolName}" is only for truly unknown skills above.)
   if (contextParts.length === 0) return verb;
 
   const context = contextParts.join(', ');
@@ -95,11 +219,11 @@ export function buildDescription(
 export class ApprovalTriggerService {
   constructor(
     private readonly actionLogRepo: ActionLogRepo,
-    // outboundGateway is optional — row creation does not depend on the outbound stack.
-    // If absent, notification is skipped (same as when ceoEmail is not configured).
-    private readonly outboundGateway: OutboundGateway | undefined,
     private readonly logger: Logger,
-    private readonly ceoEmail?: string,
+    /** Publishes the request's digest mention. Absent in tests that only exercise rows. */
+    private readonly bus?: Pick<EventBus, 'publish'>,
+    /** Receives the principal-facing display for delivery. Absent without an outbound stack. */
+    private readonly approvalDelivery?: Pick<ApprovalDelivery, 'registerDisplay'>,
   ) {}
 
   /**
@@ -109,37 +233,78 @@ export class ApprovalTriggerService {
    *   1. Dedup — check for existing pending_approval row with same skill + payload in same task
    *   2. Generate short_ref and description
    *   3. Insert autonomy_action_log row
-   *   4. Notify CEO (best-effort — failure does not prevent row creation)
+   *   4. Register the display for deliver-approval, and queue the digest mention
    *
    * Returns the result so the execution layer can enrich the advisory error message.
    */
   async request(opts: {
     taskId: string;
     conversationId?: string;
-    skillName: string;
+    toolName: string;
     actionRisk: string;
     input: Record<string, unknown>;
     currentScore: number;
     requiredScore: number;
-    /** Optional override for the CEO notification body. When absent, the default
+    /** Optional override for the principal notification body. When absent, the default
      *  score-based message is used. Provide this for non-score gate blocks (e.g. tier gate). */
     reason?: string;
+    /**
+     * When set, treat a pending_approval on this task whose skill is in the list
+     * as a duplicate (#1733) — used by the dispatcher relay so it joins a
+     * reply-class approval already pending on the same turn, not an unrelated
+     * calendar (etc.) approval.
+     */
+    dedupePendingSkillsOnTask?: readonly string[];
+    /**
+     * What the principal is shown: the description and the notification details.
+     * Defaults to `input`. The stored payload is always `input`, so an approval
+     * re-runs the skill exactly as the agent called it. Send skills pass a copy
+     * whose contact references are resolved to "Name <address>" (#2033) — a bare
+     * contact UUID tells the approver nothing about where the message goes.
+     */
+    displayInput?: Record<string, unknown>;
+    /**
+     * Hinted recipients pinned beside the skill payload. Replay refuses the
+     * send when the identity or its name no longer matches (#2047).
+     */
+    sendResolution?: readonly SendRecipientPin[];
   }): Promise<ApprovalRequestResult> {
-    const { taskId, conversationId, skillName, actionRisk, input, currentScore, requiredScore } = opts;
+    const { taskId, conversationId, toolName, actionRisk, input, currentScore, requiredScore } = opts;
+    const shown = opts.displayInput ?? input;
 
     // Step 1: Dedup check
-    const existing = await this.actionLogRepo.findPendingByTaskAndSkill(taskId, skillName, input);
+    if (opts.dedupePendingSkillsOnTask && opts.dedupePendingSkillsOnTask.length > 0) {
+      const replyPending = await this.actionLogRepo.findPendingByTaskAndSkills(
+        taskId,
+        opts.dedupePendingSkillsOnTask,
+      );
+      if (replyPending) {
+        const existingShortRef = replyPending.shortRef ?? 'unknown';
+        this.logger.info(
+          {
+            taskId,
+            toolName,
+            existingShortRef,
+            existingSkill: replyPending.toolName,
+            skillScope: opts.dedupePendingSkillsOnTask,
+          },
+          'approval-trigger: duplicate request — reply-class pending_approval already exists on this task',
+        );
+        return { created: false, reason: 'duplicate', existingShortRef };
+      }
+    }
+    const existing = await this.actionLogRepo.findPendingByTaskAndSkill(taskId, toolName, input);
     if (existing) {
       const existingShortRef = existing.shortRef ?? 'unknown';
       if (!existing.shortRef) {
         // A pending_approval row without a short_ref should not happen — flag it.
         this.logger.warn(
-          { taskId, skillName },
+          { taskId, toolName },
           'approval-trigger: existing pending_approval row has null short_ref — data inconsistency',
         );
       }
       this.logger.info(
-        { taskId, skillName, existingShortRef },
+        { taskId, toolName, existingShortRef },
         'approval-trigger: duplicate request — pending_approval row already exists',
       );
       return { created: false, reason: 'duplicate', existingShortRef };
@@ -155,7 +320,7 @@ export class ApprovalTriggerService {
     let shortRef!: string;
     // Sanitize description before storing and sending — the input fields come from
     // LLM-generated skill arguments and may contain dangerous tags.
-    const description = sanitizeOutput(buildDescription(skillName, input));
+    const description = sanitizeOutput(buildDescription(toolName, shown));
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h from now
 
     for (let attempt = 1; attempt <= MAX_INSERT_RETRIES; attempt++) {
@@ -165,13 +330,14 @@ export class ApprovalTriggerService {
         rowId = await this.actionLogRepo.insert({
           taskId,
           conversationId,
-          skillName,
+          toolName,
           actionRisk,
           outcome: 'pending_approval',
           payload: input,
           expiresAt,
           shortRef,
           description,
+          sendResolution: opts.sendResolution ? [...opts.sendResolution] : undefined,
         });
         break; // Insert succeeded
       } catch (err) {
@@ -200,47 +366,39 @@ export class ApprovalTriggerService {
       }
     }
 
+    // insert() allocated the number inside its transaction but returns only the id.
+    const approvalNumber = await readApprovalNumber(this.actionLogRepo, rowId, this.logger);
+
     this.logger.info(
-      { rowId, taskId, skillName, shortRef, currentScore, requiredScore },
+      { rowId, taskId, toolName, shortRef, approvalNumber, currentScore, requiredScore },
       'approval-trigger: pending_approval row created',
     );
 
-    // Step 4: Notify CEO (best-effort).
-    // sendNotification() catches publish errors internally and returns false rather than
-    // throwing, so we check the return value to know whether to stamp notification_sent_at.
-    let notificationSent = false;
-    if (this.ceoEmail && this.outboundGateway) {
-      const defaultBody =
-        `Curia wanted to ${description.charAt(0).toLowerCase() + description.slice(1)}, ` +
-        `but the autonomy score (${currentScore}) is below the required threshold (${requiredScore}).`;
-      const notificationBody =
-        `${opts.reason ?? defaultBody}\n\n` +
-        `Reference: ${shortRef}\n` +
-        `Expires: ${expiresAt.toISOString()}\n\n` +
-        `Reply to approve, deny, or dismiss this request.`;
-      const sent = await this.outboundGateway.sendNotification({
-        notificationType: 'approval_requested',
-        ceoEmail: this.ceoEmail,
-        subject: `Approval needed — ${description}`,
-        body: notificationBody,
-      });
-      if (sent) {
-        await this.actionLogRepo.setNotificationSentAt(rowId);
-        notificationSent = true;
-        this.logger.info({ rowId, shortRef }, 'approval-trigger: CEO notification sent');
-      } else {
-        this.logger.warn(
-          { rowId, shortRef },
-          'approval-trigger: CEO notification failed — row exists, CEO will see it in digest',
-        );
+    // Step 4: what the principal will be shown when the agent delivers it. displayInput has
+    // contact references resolved to names (#2033); the stored payload keeps the references.
+    const preamble = opts.reason ??
+      `Curia wanted to ${description.charAt(0).toLowerCase() + description.slice(1)}, ` +
+      `but the autonomy score (${currentScore}) is below the required threshold (${requiredScore}).`;
+    this.approvalDelivery?.registerDisplay(shortRef, { preamble, payload: shown, approvalNumber });
+
+    // The request's one digest mention (#2159). Best-effort: the row exists either way, and
+    // the agent has been told to deliver it.
+    if (this.bus) {
+      try {
+        await this.bus.publish('dispatch', createPrincipalReport({
+          summary: `Waiting for your approval: ${description}`,
+          urgency: 'digest',
+          source: 'approval_pending',
+          ...(conversationId ? { conversationId } : {}),
+          actionShortRef: shortRef,
+          parentEventId: taskId,
+          sourceLayer: 'dispatch',
+        }));
+      } catch (err) {
+        this.logger.error({ err, rowId, shortRef }, 'approval-trigger: failed to queue the digest mention — the approval still exists');
       }
-    } else {
-      this.logger.warn(
-        { rowId, shortRef },
-        'approval-trigger: ceoEmail not configured — skipping notification',
-      );
     }
 
-    return { created: true, shortRef, notificationSent };
+    return { created: true, shortRef, approvalNumber };
   }
 }
