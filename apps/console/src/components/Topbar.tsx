@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
 import { useMobileMenu } from '../context/MobileMenu';
+import { AnimatedMoonrayMark } from './Icons';
 
 interface TopbarProps {
   crumb?: string;
@@ -38,6 +39,7 @@ export function Topbar({ crumb, title, children }: TopbarProps) {
         <h1 className="topbar-h1">{title}</h1>
       </div>
       <div className="topbar-controls">{children}</div>
+      <AnimatedMoonrayMark className="topbar-logo" size={32} />
     </header>
   );
 }

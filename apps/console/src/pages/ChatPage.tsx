@@ -31,7 +31,7 @@ export default function ChatPage() {
       <div className="app-root">
         <Sidebar activeView="chat" theme={theme} onThemeChange={setTheme} />
         <main className="main">
-          <Topbar crumb="Curia" title="Chat" />
+          <Topbar crumb="Moonray Ventures OS" title="Chat" />
           <div className="chat-page">
             <ChatThread
               messages={messages}
