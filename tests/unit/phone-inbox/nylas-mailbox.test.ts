@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { MailboxRateLimitedError } from '../../../src/phone-inbox/phone-inbox-service.js';
 import { NylasMailbox, NylasMailboxError } from '../../../src/phone-inbox/nylas-mailbox.js';
 import { loadPhoneInboxAccounts } from '../../../src/phone-inbox/accounts.js';
 
@@ -54,6 +55,17 @@ describe('NylasMailbox', () => {
     expect(sent).toEqual([{ threadId: 't1', date: 2000 }]);
     expect(String(fetchMock.mock.calls[0]![0])).toContain('in=SENT');
     expect(String(fetchMock.mock.calls[0]![0])).toContain('received_after=1500');
+  });
+
+  it('turns a 429 into a rate-limit error carrying Retry-After', async () => {
+    const limited = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      new Response('{}', { status: 429, headers: { 'retry-after': '90' } }));
+    const err = await new NylasMailbox('key', 'g', limited as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MailboxRateLimitedError);
+    expect((err as MailboxRateLimitedError).retryAfterSeconds).toBe(90);
+    const noHeader = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response('{}', { status: 429 }));
+    const err2 = await new NylasMailbox('key', 'g', noHeader as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);
+    expect((err2 as MailboxRateLimitedError).retryAfterSeconds).toBeUndefined();
   });
 
   it('throws with the status only on an error response', async () => {

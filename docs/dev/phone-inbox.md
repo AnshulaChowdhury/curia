@@ -9,8 +9,10 @@ Per mailbox (`personal`, `moonray`, `work-outlook`; always all three): the unrea
 you replied to after the message arrived (sent mail from the last 14 days is checked). Only sender, subject,
 group, time and ids. Never bodies, snippets or attachments. State is read from Nylas on every request.
 
-If any configured mailbox can't be read the whole answer is a 502, so the phone keeps its cached list instead of
-showing a false "0 need you".
+Each mailbox is cached in memory for a minute, so refreshing the phone doesn't hammer Nylas. If a mailbox can't be read, its
+last good answer is served for up to 30 minutes, then it is reported as `syncing: false` (never as "0 need you"). Other
+mailboxes are unaffected. On a Nylas 429 the mailbox is left alone for at least a minute (or its `Retry-After`). Calls to one
+mailbox are made one at a time.
 
 ## Auth
 Its own bearer token, vault secret `phone_inbox_token`. It sits outside `/api`, so `api_token` does not work
