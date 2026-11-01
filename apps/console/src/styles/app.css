@@ -293,6 +293,17 @@ body {
   flex: 1 1 auto; min-width: 0;
   justify-content: flex-end;
 }
+.topbar-logo { flex: none; color: var(--app-fg); }
+/* Moonray mark animations (from the brand loader). */
+@keyframes mr-orbit { to { transform: rotate(360deg); } }
+@keyframes mr-phase { 0%,100% { transform: scaleX(.5); } 50% { transform: scaleX(.12); } }
+@keyframes mr-glow  { 0%,100% { opacity: 0; } 50% { opacity: .12; } }
+.mr-orbit { transform-origin: 100px 100px; animation: mr-orbit 1.6s cubic-bezier(.6,.15,.4,.85) infinite; }
+.mr-phase { transform-origin: 100px 100px; animation: mr-phase 2.4s ease-in-out infinite; }
+.mr-glow  { animation: mr-glow 2.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .mr-orbit, .mr-phase, .mr-glow { animation-duration: 6s; }
+}
 .topbar-divider { width: 1px; height: 22px; background: var(--app-border); }
 
 .mobile-menu-btn {

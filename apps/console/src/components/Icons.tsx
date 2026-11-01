@@ -1,4 +1,5 @@
 // Curia — Lucide icon set, inlined. ISC-licensed; lucide.dev.
+import { useId } from 'react';
 import type { SVGProps, ReactNode, HTMLAttributes } from 'react';
 
 interface IconProps extends SVGProps<SVGSVGElement> {
@@ -166,5 +167,30 @@ export function BrandWordmark(props: HTMLAttributes<HTMLSpanElement>) {
       <span className="brand-wordmark-name">Moonray Ventures OS</span>
       <span className="brand-wordmark-sub">powered by Curia</span>
     </span>
+  );
+}
+
+// Animated Moonray gibbous-moon mark, ported from the brand loader
+// (MVMarketing/business_analysis/Moonray Ventures Loader.html). A faint contour,
+// a breathing terminator line and an orbiting ray. Animations are defined in
+// app.css (.mr-*); colour follows currentColor.
+export function MoonrayMark({ size = 32, ...rest }: { size?: number } & SVGProps<SVGSVGElement>) {
+  const clipId = useId();
+  const sw = 8;
+  return (
+    <svg width={size} height={size} viewBox="0 0 200 200" role="img" aria-label="Moonray Ventures" {...rest}>
+      <defs>
+        <clipPath id={clipId}><circle cx="100" cy="100" r="80" /></clipPath>
+      </defs>
+      <path className="mr-glow" d="M100 20 A80 80 0 0 1 100 180 A40 80 0 0 1 100 20 Z" fill="currentColor" />
+      <circle cx="100" cy="100" r="80" fill="none" stroke="currentColor" strokeWidth={sw} opacity=".22" />
+      <g clipPath={`url(#${clipId})`}>
+        <path className="mr-phase" d="M100 20 A80 80 0 0 0 100 180" fill="none" stroke="currentColor"
+              strokeWidth={sw} strokeLinecap="round" vectorEffect="non-scaling-stroke"
+              style={{ strokeWidth: (sw * size) / 200 }} />
+      </g>
+      <circle className="mr-orbit" cx="100" cy="100" r="80" fill="none" stroke="currentColor"
+              strokeWidth={sw} strokeLinecap="round" strokeDasharray="150 353" />
+    </svg>
   );
 }
