@@ -257,14 +257,14 @@ export function IconBrain({ size }: IconProps) {
   );
 }
 
-// Brand wordmark — Moonray Ventures lockup with an "OS powered by Curia" byline.
+// Brand wordmark — Moonray Ventures lockup with a "powered by Curia" byline.
 // The lockup PNG is used as a CSS mask filled with currentColor so it follows
 // the light/dark theme (the source art is navy on transparent).
 export function BrandWordmark(props: HTMLAttributes<HTMLSpanElement>) {
   return (
     <span className="brand-wordmark" {...props}>
       <span className="brand-lockup" role="img" aria-label="Moonray Ventures" />
-      <span className="brand-wordmark-sub">OS powered by Curia</span>
+      <span className="brand-wordmark-sub">powered by Curia</span>
     </span>
   );
 }
