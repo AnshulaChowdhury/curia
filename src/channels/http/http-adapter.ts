@@ -190,6 +190,7 @@ export class HttpAdapter implements Channel {
         routeUrl.startsWith('/api/autonomy') ||
         routeUrl.startsWith('/api/registry') ||
         routeUrl.startsWith('/api/vault') ||
+        routeUrl.startsWith('/api/connections') ||
         // Secret-capture routes are token-authed (the single-use token in the URL is the
         // capability), so they bypass bearer auth and self-authorize via the token (#971).
         routeUrl.startsWith('/api/secret-capture') ||

@@ -47,6 +47,15 @@ describe('quickbooks routes', () => {
     expect(no.statusCode).toBe(401);
   });
 
+  it('connections lists QuickBooks for a signed-in person only, without any token', async () => {
+    await build(fakeConnection().conn);
+    const ok = await app.inject({ method: 'GET', url: '/api/connections', headers: { cookie: 'curia_session=sess' } });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json().connections[0]).toMatchObject({ id: 'quickbooks', connected: true, connectUrl: '/books/qbo/connect' });
+    expect(ok.body).not.toMatch(/token/i);
+    expect((await app.inject({ method: 'GET', url: '/api/connections' })).statusCode).toBe(401);
+  });
+
   it('callback shows success, and a plain message when the state is bad', async () => {
     await build(fakeConnection().conn);
     const ok = await app.inject({ method: 'GET', url: '/books/qbo-callback?code=c&realmId=1&state=s' });
