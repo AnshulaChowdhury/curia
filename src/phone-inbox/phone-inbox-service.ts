@@ -31,10 +31,18 @@ export interface SentMessage {
   date: number;
 }
 
+/** What the inbox looks like right now: the tagged unread messages, and how many unread there are in all. */
+export interface InboxSnapshot {
+  /** Unread messages still in the inbox that carry a triage tag (Urgent, Drafted or Seen). Never the whole inbox. */
+  messages: InboxMessage[];
+  /** Total unread in the inbox when the provider reports it; otherwise undefined. */
+  unreadCount: number | undefined;
+}
+
 /** Read-only view of one mailbox. Implemented over Nylas; faked in tests. */
 export interface MailboxReader {
-  /** Unread messages currently in the inbox, newest first. */
-  unreadInbox(): Promise<InboxMessage[]>;
+  /** The tagged, unread, still-in-inbox messages. Deliberately small: it must not scan the whole inbox. */
+  inboxSnapshot(): Promise<InboxSnapshot>;
   /** Messages the principal sent on or after [sinceSeconds]. */
   sentSince(sinceSeconds: number): Promise<SentMessage[]>;
 }
@@ -182,10 +190,14 @@ export class PhoneInboxService {
 
   private async readAccount(account: PhoneInboxAccountConfig, reader: MailboxReader, now: Date): Promise<PhoneInboxAccount> {
     const { id, address } = account;
-    const sinceSeconds = Math.floor(now.getTime() / 1000) - REPLY_LOOKBACK_SECONDS;
     // One call at a time: the provider limits per mailbox, and parallel calls are what trips it.
-    const unreadMessages = await reader.unreadInbox();
-    const sent = await reader.sentSince(sinceSeconds);
+    const snapshot = await reader.inboxSnapshot();
+    const unreadMessages = snapshot.messages;
+    // Only look for replies since the oldest candidate arrived (and never further back than the lookback);
+    // with no candidates there is nothing to check, so no call at all.
+    const floor = Math.floor(now.getTime() / 1000) - REPLY_LOOKBACK_SECONDS;
+    const oldest = unreadMessages.reduce((min, m) => Math.min(min, m.date), Number.POSITIVE_INFINITY);
+    const sent = unreadMessages.length === 0 ? [] : await reader.sentSince(Math.max(floor, oldest - 60));
 
     const lastReplyByThread = new Map<string, number>();
     for (const message of sent) {
@@ -214,6 +226,6 @@ export class PhoneInboxService {
         ...(id === 'work-outlook' ? { messageId: message.id } : {}),
       }));
 
-    return { id, address, syncing: true, needsYou: items.length, unread: unreadMessages.length, items };
+    return { id, address, syncing: true, needsYou: items.length, unread: snapshot.unreadCount ?? unreadMessages.length, items };
   }
 }

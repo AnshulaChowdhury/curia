@@ -7,7 +7,9 @@ MVOS repo (`contracts/phone-inbox.openapi.yaml`); this is how Curia serves it.
 Per mailbox (`personal`, `moonray`, `work-outlook`; always all three): the unread inbox messages tagged
 **Urgent**, **Drafted** or **Seen** by the `ceo-inbox` triage, newest first, one per thread, minus any thread
 you replied to after the message arrived (sent mail from the last 14 days is checked). Only sender, subject,
-group, time and ids. Never bodies, snippets or attachments. State is read from Nylas on every request.
+group, time and ids. Never bodies, snippets or attachments. State is read from Nylas, never by scanning the inbox: it lists the
+folders (which also gives the inbox's unread total), then asks only for each triage tag's unread mail. Google limits queries per
+user per minute and Nylas passes reads through, so large scans trigger 429s.
 
 Each mailbox is cached in memory for a minute, so refreshing the phone doesn't hammer Nylas. If a mailbox can't be read, its
 last good answer is served for up to 30 minutes, then it is reported as `syncing: false` (never as "0 need you"). Other
