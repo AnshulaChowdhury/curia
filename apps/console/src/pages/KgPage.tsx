@@ -168,7 +168,7 @@ const CY_STYLE = [
     },
   },
   // Type colour overrides.
-  { selector: 'node[type="person"]',       style: { 'background-color': '#36aab7' } },
+  { selector: 'node[type="person"]',       style: { 'background-color': '#53A0DB' } },
   { selector: 'node[type="organization"]', style: { 'background-color': '#6BAED6' } },
   { selector: 'node[type="project"]',      style: { 'background-color': '#7E6BA8' } },
   { selector: 'node[type="decision"]',     style: { 'background-color': '#C9874A' } },
