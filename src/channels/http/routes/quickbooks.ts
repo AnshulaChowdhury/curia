@@ -1,5 +1,6 @@
 // quickbooks.ts — the QuickBooks connection and the narrow API the books agent on the Mac mini uses.
 //
+//   GET  /api/connections       — signed-in person only: the API connections and their status, for the Settings page
 //   GET  /books/qbo/connect     — signed-in person only (session cookie): redirects to Intuit to authorise
 //   GET  /books/qbo-callback    — where Intuit sends the browser back; the single-use `state` is the credential
 //   GET  /books/qbo/status      — books token: is QuickBooks connected
@@ -42,6 +43,21 @@ const page = (title: string, body: string): string =>
 export async function quickbooksRoutes(app: FastifyInstance, options: QuickbooksRouteOptions): Promise<void> {
   const { logger, connection, getToken, webAppBootstrapSecret, sessions } = options;
   const RATE = { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } };
+
+  // The console's API connections page. Session auth like the other console routes; never returns a token.
+  app.get('/api/connections', RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
+    const status = await connection.status();
+    return reply.header('Cache-Control', 'no-store').send({
+      connections: [{
+        id: 'quickbooks',
+        name: 'QuickBooks Online',
+        description: 'MowMow Ventures books. Curia holds the authorisation and the books agent posts through it.',
+        ...status,
+        connectUrl: '/books/qbo/connect',
+      }],
+    });
+  });
 
   // A person starts the connection from a browser that is signed in to Curia.
   app.get('/books/qbo/connect', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {

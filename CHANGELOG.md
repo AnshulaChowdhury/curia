@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **API connections page** — Settings → API connections shows QuickBooks status and a Connect/Reconnect button; no tokens are ever shown.
 - **QuickBooks connection for the books system** — `/books/qbo/connect` and `/books/qbo-callback` authorise QuickBooks in Curia, which holds and refreshes the tokens in the vault; `/books/qbo/{status,query,create}` give the books agent a narrow, token-gated API.
 - **`GET /phone/inbox`** — read-only email summary for the Command Hub phone launcher: Urgent/Seen/Drafted mail that is still unread, in the inbox and unanswered, per mailbox. Own token, no bodies.
 
