@@ -10,8 +10,25 @@ import { validateTaskErrorBudget } from '../tasks/task-error-budget.js';
 
 // -- Public types --
 
+/** Longest job name the database accepts (CHECK scheduled_jobs_name_length). */
+export const MAX_JOB_NAME_LENGTH = 120;
+
+/**
+ * Validates a job name from outside input. Returns the trimmed name, or null for an absent or blank one
+ * (which clears a name). Throws for a non-string or one that is too long, so callers return a clear 400.
+ */
+export function normaliseJobName(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string') throw new Error('name must be a string');
+  const name = raw.trim();
+  if (name.length > MAX_JOB_NAME_LENGTH) throw new Error(`name must be at most ${MAX_JOB_NAME_LENGTH} characters`);
+  return name === '' ? null : name;
+}
+
 export interface CreateJobParams {
   agentId: string;
+  /** Optional human name shown on the Jobs page. */
+  name?: string;
   cronExpr?: string;
   runAt?: Date;
   taskPayload: Record<string, unknown>;
@@ -40,6 +57,8 @@ export interface CreateJobResult {
 /** Full job row with optional linked task fields (from a LEFT JOIN on tasks). */
 export interface JobRow {
   id: string;
+  /** Human name, or null for a job that was never named. */
+  name: string | null;
   agentId: string;
   cronExpr: string | null;
   runAt: string | null;
@@ -85,6 +104,7 @@ export interface ListJobsFilters {
 
 interface DbJobRow {
   id: string;
+  name: string | null;
   agent_id: string;
   cron_expr: string | null;
   run_at: string | null;
@@ -176,6 +196,7 @@ export class SchedulerService {
 
   async createJob(params: CreateJobParams): Promise<CreateJobResult> {
     const { agentId, cronExpr, runAt, taskPayload, createdBy, intentAnchor, errorBudget } = params;
+    const jobName = normaliseJobName(params.name);
     if (errorBudget !== undefined) {
       const budgetError = validateTaskErrorBudget(errorBudget);
       if (budgetError) {
@@ -221,8 +242,8 @@ export class SchedulerService {
     // originator is always written — null for non-principal-initiated jobs. Always including
     // it (rather than conditionally) keeps the SQL simpler and matches the nullable column.
     const insertSql = `
-      INSERT INTO scheduled_jobs (agent_id, cron_expr, run_at, task_payload, status, next_run_at, created_by, timezone, originator${hasExpectedDuration ? ', expected_duration_seconds' : ''})
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9${hasExpectedDuration ? ', $10' : ''})
+      INSERT INTO scheduled_jobs (agent_id, cron_expr, run_at, task_payload, status, next_run_at, created_by, timezone, originator, name${hasExpectedDuration ? ', expected_duration_seconds' : ''})
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10${hasExpectedDuration ? ', $11' : ''})
       RETURNING id
     `;
     const insertParams: unknown[] = [
@@ -236,6 +257,7 @@ export class SchedulerService {
       jobTimezone,
       // Serialize as JSON string for pg JSONB — null when no originator was provided.
       params.originator ? JSON.stringify(params.originator) : null,
+      jobName,
     ];
     if (hasExpectedDuration) {
       insertParams.push(rawDuration);
@@ -544,11 +566,18 @@ export class SchedulerService {
 
   async updateJob(
     jobId: string,
-    updates: { cronExpr?: string; runAt?: Date; taskPayload?: Record<string, unknown> },
+    updates: { cronExpr?: string; runAt?: Date; taskPayload?: Record<string, unknown>; name?: string | null },
   ): Promise<void> {
     const setClauses: string[] = [];
     const params: unknown[] = [];
     let paramIndex = 1;
+
+    // undefined leaves the name alone; null or a blank string clears it.
+    if (updates.name !== undefined) {
+      setClauses.push(`name = $${paramIndex}`);
+      params.push(normaliseJobName(updates.name));
+      paramIndex++;
+    }
 
     if (updates.cronExpr !== undefined) {
       // Validate frequency before accepting the update.
@@ -1423,6 +1452,7 @@ export class SchedulerService {
 function mapJobRow(row: DbJobRow): JobRow {
   return {
     id: row.id,
+    name: row.name ?? null,
     agentId: row.agent_id,
     cronExpr: row.cron_expr,
     runAt: row.run_at,

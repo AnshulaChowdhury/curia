@@ -1926,6 +1926,7 @@ table.records-table tbody tr:hover td { background: transparent; }
 table.records-table tbody tr.active td { background: transparent; }
 
 .cell-primary { font-weight: 600; color: var(--app-fg); }
+.cell-secondary { font-size: 12px; color: var(--app-fg-muted); }
 .cell-muted   { color: var(--app-fg-muted); font-size: 12px; }
 .cell-mono    { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--app-fg-muted); }
 .cell-actions { display: flex; gap: 4px; justify-content: flex-end; }

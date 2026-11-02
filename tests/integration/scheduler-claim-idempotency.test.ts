@@ -61,7 +61,7 @@ describeIf('Scheduler cron claim idempotency (#1159)', () => {
 
     // The stale in-memory row both overlapping polls hold: next_run_at still in the past.
     const staleRow: JobRow = {
-      id: jobId, agentId: AGENT_ID, cronExpr: '0 9 * * *', runAt: null,
+      id: jobId, name: null, agentId: AGENT_ID, cronExpr: '0 9 * * *', runAt: null,
       taskPayload: { task: 'send digest' }, status: 'pending',
       lastRunAt: null, nextRunAt: pastDue, lastError: null, consecutiveFailures: 0,
       createdBy: 'system', createdAt: new Date().toISOString(), timezone: 'UTC',

@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Job names** — name a scheduled job on the Jobs page; the books reminders are now named (migration 116).
 - **Sort unsorted mail from the phone** — `GET`/`POST /phone/triage/review`: one card per email triage could not sort, tap a category.
 - **Morning brief "unsorted" section** — lists emails triage could not sort; migration 115 stores them.
 - **Accounting Knowledge Graph coverage** — shows how many chart-of-accounts categories no rule can assign, how many wait for confirmation, and a list of the ones needing a decision. Needs the books agent's coverage field in the snapshot (books PR #8).
