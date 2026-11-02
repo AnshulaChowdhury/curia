@@ -30,6 +30,7 @@ import { DEFAULT_CONSOLE_EDIT_MAX_BYTES, DEFAULT_HEALTH_CONFIG } from '../../con
 import { healthRoutes } from './routes/health.js';
 import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
+import { JobRunHistory } from '../../scheduler/job-run-history.js';
 import { antfarmRoutes } from './routes/antfarm.js';
 import { activityRoutes } from './routes/activity.js';
 import { dashboardRoutes } from './routes/dashboard.js';
@@ -409,6 +410,7 @@ export class HttpAdapter implements Channel {
         sessions,
         // Needed so console-created jobs carry principal lineage (#1127).
         contactService: this.config.contactService,
+        runHistory: new JobRunHistory(pool),
         logger,
       });
     }
