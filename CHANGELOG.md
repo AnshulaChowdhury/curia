@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Mailbox category from the phone** — `PUT /phone/inbox/accounts/{id}/category` stores each mailbox's Work/Personal choice from Command Hub (migration 118).
 - **Books specialist** — the Digital EA can ask a read-only `books` agent about cash, review queue and uploads (ADR-060).
 - **Job names** — name a scheduled job on the Jobs page; the books reminders are now named (migration 116).
 - **Sort unsorted mail from the phone** — `GET`/`POST /phone/triage/review`: one card per email triage could not sort, tap a category.
