@@ -15,7 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
-- **Accounting graph on the Knowledge Graph page** — the books agent pushes a read-only snapshot of the accounting rules (never transactions) to `POST /books/graph`; a Memory / Accounting selector on the page shows it with a text filter, type filter and detail panel. (ADR-059)
+- **`GET /phone/message`** — plain text of one email for the phone's email page; shares the `/phone/inbox` token.
 - **Books review** — the weekly batch of bank rows the books agent pushes shows on a new Books page: edit category, tax code, location, class and payee, then approve or skip rows; the agent pulls the approved rows, posts them to QuickBooks and reports the results back. Rows with an open flag cannot be approved without a category, and a posted row is final.
 - **Bank files folder (Google Drive)** — the books agent fetches the weekly RBC download files from one Drive folder through Curia (service account, folder-scoped; set up on the API connections page), and finished files move to a Processed subfolder.
 - **QuickBooks connection and API connections page** — Settings → API connections sets up QuickBooks (enter the app's client ID and secret, authorise, make the books agent's token); Curia holds and refreshes the tokens, and `/books/qbo/{status,query,create}` give the books agent a narrow, token-gated API.

@@ -1,7 +1,7 @@
 // phone-inbox.ts — GET /phone/inbox, the read-only email summary for the Command Hub phone launcher.
 //
-// Deliberately outside /api: it has its own token (secret `phone_inbox_token`) that works for this one
-// route only, and the main API_TOKEN does not work here. The global /api bearer hook never sees it.
+// Deliberately outside /api: it has its own token (secret `phone_inbox_token`) that works for this route and
+// GET /phone/message only, and the main API_TOKEN does not work here. The global /api bearer hook never sees it.
 // Not configured (no token in the vault) → 404, so the route is invisible until it's switched on.
 // Contract: contracts/phone-inbox.openapi.yaml in the MVOS repo.
 
