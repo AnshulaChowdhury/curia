@@ -91,7 +91,11 @@ export type IdentitySource =
   // send before #2041, or an email-reply whose From failed the auth, ownership,
   // or duplicate check. Not auto-verified (#2033, #2071, ADR-047). A later
   // reply that passes those checks verifies this identity in place.
-  | 'outbound_recipient';
+  | 'outbound_recipient'
+  // Person brought in by the contacts import (bridge contact lists, address books). The
+  // identifier came from a third party's list, so it is never auto-verified and must not be
+  // added to AUTO_VERIFIED_SOURCES (contacts-import, design section 4).
+  | 'bulk_import';
 
 // -- Identity status --
 // active: address is believed to be valid and usable (default)
