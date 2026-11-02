@@ -20,7 +20,7 @@
     "body_plain": "string (plain text body)",
     "body_html": "string (HTML body)",
     "date": "number (unix timestamp)",
-    "labels": "array of label display names (messages only; for example ✍️ Drafted). Ids with no folder name are returned unchanged",
+    "labels": "array of label display names (messages only; for example Needs a reply). Ids with no folder name are returned unchanged",
     "attachments": "array of { id, filename, contentType, size, isCalendarInvite? } (messages only; non-inline file attachments; pass filename + message id to ceo-inbox-download-attachment; isCalendarInvite=true for ICS/text-calendar parts)",
     "is_draft": "boolean (true when a draft was read; absent for messages)"
   },

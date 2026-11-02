@@ -430,14 +430,14 @@ describe('CeoNylasClient.listFolders (pagination)', () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(pageResponse([{ id: 'INBOX', name: 'INBOX' }], 'CUR2'))
-      .mockResolvedValueOnce(pageResponse([{ id: 'Label_39', name: '✍️ Drafted' }]));
+      .mockResolvedValueOnce(pageResponse([{ id: 'Label_39', name: 'Needs a reply' }]));
     const client = new CeoNylasClient('key', 'grant', logger);
 
     const folders = await client.listFolders();
 
     expect(folders).toEqual([
       { id: 'INBOX', name: 'INBOX' },
-      { id: 'Label_39', name: '✍️ Drafted' },
+      { id: 'Label_39', name: 'Needs a reply' },
     ]);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     const first = new URL(fetchSpy.mock.calls[0]![0] as string);

@@ -15,7 +15,7 @@ const INBOX = RULE_SETS[0]!;
 const CALENDAR = RULE_SETS[1]!;
 
 const INBOX_RULES = JSON.stringify([
-  { condition: 'From the board (anyone @board.example.test)', instruction: 'Label BOARD and classify as 🚨 Urgent', active: true },
+  { condition: 'From the board (anyone @board.example.test)', instruction: 'Label BOARD and classify as Urgent', active: true },
   { condition: 'Newsletters from Substack', instruction: 'Archive (✔️ Cleared)', active: false },
   { condition: 'Newsletters from Substack', instruction: 'Label READING', active: true },
 ]);

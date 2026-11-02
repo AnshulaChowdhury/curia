@@ -1,7 +1,7 @@
 # ceo-inbox, scheduled triage of a scheduling email (#2025). Rules: agents/ceo-inbox.yaml,
 # "Scheduling-specific drafting rules": do not draft blind; 1. Tap (a CONSULT REQUEST on
 # the bullpen with participants [calendar] and the email's source_message_id), 2. Park
-# (the ⏳ In Progress label and mark-read, no archive, no draft), 3. the ✍️ Drafted label
+# (the ⏳ In Progress label and mark-read, no archive, no draft), 3. the Needs a reply label
 # only once a draft exists, 4. the consult-timeout safety wake.
 #
 # Drafting a reply succeeds (ceo-inbox-mailroom), so proposing times blind is available.
@@ -143,10 +143,10 @@ expected_behaviors:
       with: { source_message_id: msg-30c-sched }
   - id: no_drafted_label_while_parked
     weight: important
-    description: Does not apply the ✍️ Drafted label to the parked email (no draft exists).
+    description: Does not apply the Needs a reply label to the parked email (no draft exists).
     check:
       not_called: [ceo-inbox-label]
-      contains: { labels: Drafted }
+      contains: { labels: Needs a reply }
   - id: timeout_wake
     weight: important
     description: Creates the consult-timeout safety task.
@@ -156,5 +156,5 @@ expected_behaviors:
 failure_modes:
   - Drafts a reply proposing times without consulting the calendar specialist
   - Mentions calendar instead of making it a participant, so the consult never wakes it
-  - Archives the email, or labels it ✍️ Drafted while no draft exists
+  - Archives the email, or labels it Needs a reply while no draft exists
   - Leaves the email unread

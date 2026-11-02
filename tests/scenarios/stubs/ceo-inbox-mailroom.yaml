@@ -8,7 +8,7 @@
 ceo-inbox-label:
   - agent: ceo-inbox
     match: {}
-    return: { success: true, message_id: scenario-msg, applied: ["📌 Seen"], created: [], folders: [INBOX, "📌 Seen"] }
+    return: { success: true, message_id: scenario-msg, applied: ["FYI, no action needed"], created: [], folders: [INBOX, "FYI, no action needed"] }
 ceo-inbox-update-folders:
   - agent: ceo-inbox
     match: {}

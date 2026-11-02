@@ -4,11 +4,11 @@
 ceo-inbox-label:
   - agent: ceo-inbox
     match: {}
-    return: { success: true, message_id: scenario-msg, applied: ["✍️ Drafted"], created: [], folders: [INBOX, "✍️ Drafted"] }
+    return: { success: true, message_id: scenario-msg, applied: ["Needs a reply"], created: [], folders: [INBOX, "Needs a reply"] }
 ceo-inbox-update-folders:
   - agent: ceo-inbox
     match: {}
-    return: { success: true, message_id: scenario-msg, folders: [INBOX, "✍️ Drafted"], created: [], removed_unresolved: [] }
+    return: { success: true, message_id: scenario-msg, folders: [INBOX, "Needs a reply"], created: [], removed_unresolved: [] }
 ceo-inbox-archive:
   - agent: ceo-inbox
     match: {}

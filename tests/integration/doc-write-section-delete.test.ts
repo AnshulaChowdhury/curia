@@ -16,7 +16,7 @@ const RULES = `Each rule is a \`##\` section with When / Do / Status lines.
 ## Board mail
 
 - When: from anyone at the board's domain
-- Do: label BOARD, classify as 🚨 Urgent
+- Do: label BOARD, classify as Urgent
 - Status: active
 
 ## Newsletters
