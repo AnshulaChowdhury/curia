@@ -2826,6 +2826,9 @@ table.records-table tbody tr.active td { background: transparent; }
 .kg-gnode.kg-shape-rule { border-radius: 28%; }
 .kg-gnode.kg-st-proposed { outline-style: dashed; outline-width: 1.5px; }
 .kg-gnode.kg-st-retired .kg-gnode-label { text-decoration: line-through; }
+.kg-coverage { margin: 12px 0 0; padding: 10px 12px; border: 1px solid var(--app-border); border-radius: 8px; font-size: 13px; line-height: 1.6; color: var(--app-fg); }
+.kg-coverage-title { font-weight: 600; margin-bottom: 4px; }
+.kg-coverage-line strong { font-variant-numeric: tabular-nums; }
 .kg-accounting-note { font-size: 12px; color: var(--app-fg-muted); margin: 8px 0 0; line-height: 1.5; }
 .kg-graph-switch { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--app-border); border-radius: 8px; }
 .kg-graph-switch button {

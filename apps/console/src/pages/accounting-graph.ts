@@ -95,6 +95,37 @@ export function typeCounts(m: GraphModel): Array<{ value: string; count: number 
   return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([value, count]) => ({ value, count }));
 }
 
+/** How the chart of accounts is covered by rules. Null when the snapshot predates the coverage field. */
+export interface CoverageCounts { total: number; covered: number; proposed: number; uncovered: number }
+
+export function coverageCounts(m: GraphModel): CoverageCounts | null {
+  const counts: CoverageCounts = { total: 0, covered: 0, proposed: 0, uncovered: 0 };
+  let seen = false;
+  for (const n of m.nodes.values()) {
+    if (n.type !== 'category') continue;
+    const state = n.properties?.['coverage'];
+    if (typeof state !== 'string') continue;
+    seen = true;
+    counts.total += 1;
+    if (state === 'uncovered') counts.uncovered += 1;
+    else if (state === 'proposed') counts.proposed += 1;
+    else counts.covered += 1;
+  }
+  return seen ? counts : null;
+}
+
+/** A category that needs a decision: nothing reaches it, or only a proposed rule or mark does. */
+export const needsAttention = (n: ApiKgNode): boolean =>
+  n.type === 'category' && (n.properties?.['coverage'] === 'uncovered' || n.properties?.['coverage'] === 'proposed');
+
+const COVERAGE_TEXT: Record<string, string> = {
+  rule: 'A confirmed rule assigns it',
+  'bank-account': 'A bank account is booked against it',
+  manual: 'Manual on purpose (confirmed)',
+  proposed: 'Only a proposed rule or mark: awaiting confirmation',
+  uncovered: 'Uncovered: no rule can assign it',
+};
+
 const PROPERTY_LABELS: Record<string, string> = {
   ruleKind: 'Rule kind',
   status: 'Status',
@@ -103,6 +134,8 @@ const PROPERTY_LABELS: Record<string, string> = {
   confirmedBy: 'Confirmed by',
   confirmedOn: 'Confirmed on',
   note: 'Note',
+  coverage: 'Coverage',
+  manualReason: 'Why no rule',
 };
 const PROPERTY_ORDER = Object.keys(PROPERTY_LABELS);
 
@@ -114,7 +147,7 @@ export function nodeRows(n: ApiKgNode): Array<{ label: string; value: string }> 
   const rows = [{ label: 'Kind', value: typeLabel(n.type) }, { label: 'Id', value: n.id }];
   const known = PROPERTY_ORDER.filter(k => props[k] !== undefined && props[k] !== null && asText(props[k]) !== '');
   const rest = Object.keys(props).filter(k => !PROPERTY_ORDER.includes(k) && asText(props[k]) !== '').sort();
-  for (const k of [...known, ...rest]) rows.push({ label: PROPERTY_LABELS[k] ?? k, value: asText(props[k]) });
+  for (const k of [...known, ...rest]) rows.push({ label: PROPERTY_LABELS[k] ?? k, value: k === 'coverage' ? COVERAGE_TEXT[asText(props[k])] ?? asText(props[k]) : asText(props[k]) });
   return rows;
 }
 

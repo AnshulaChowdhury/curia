@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyPositions, modelFrom } from './kg-graph-model.js';
-import { matchesText, neighbours, nodeRows, normaliseSnapshot, subModel, typeCounts, typeLabel, visibleIds } from './accounting-graph.js';
+import { coverageCounts, matchesText, needsAttention, neighbours, nodeRows, normaliseSnapshot, subModel, typeCounts, typeLabel, visibleIds } from './accounting-graph.js';
 import type { AccountingGraphResponse } from './accounting-graph.js';
 
 const response = (): AccountingGraphResponse => ({
@@ -89,5 +89,35 @@ describe('facts for the panel', () => {
     expect(neighbours(m, 'rule:cat-canva').map(n => `${n.relation}:${n.direction}:${n.label}`)).toEqual(['assigns:out:Canva', 'assigns:out:Software subscriptions']);
     expect(neighbours(m, 'category:Software')).toEqual([{ id: 'rule:cat-canva', label: 'cat-020-software-canva', type: 'rule', relation: 'assigns', direction: 'in' }]);
     expect(neighbours(m, 'tax:HST ON')).toEqual([]);
+  });
+});
+
+describe('coverage', () => {
+  const withCoverage = () => {
+    const res = response();
+    const states = ['rule', 'manual', 'proposed', 'uncovered', 'uncovered'];
+    res.snapshot!.nodes = states.map((coverage, i) => ({ id: `category:c${i}`, type: 'category', label: `C${i}`, properties: { coverage } }));
+    res.snapshot!.nodes.push({ id: 'payee:p', type: 'payee', label: 'P' });
+    res.snapshot!.edges = [];
+    return modelFrom(normaliseSnapshot(res));
+  };
+
+  it('counts what is covered, awaiting confirmation and uncovered', () => {
+    expect(coverageCounts(withCoverage())).toEqual({ total: 5, covered: 2, proposed: 1, uncovered: 2 });
+  });
+
+  it('says nothing for a snapshot made before the field existed', () => {
+    expect(coverageCounts(build())).toBeNull();
+  });
+
+  it('flags only categories that need a decision', () => {
+    const m = withCoverage();
+    expect([...m.nodes.values()].filter(needsAttention).map(n => n.label)).toEqual(['C2', 'C3', 'C4']);
+  });
+
+  it('spells the coverage out in the detail panel', () => {
+    const m = withCoverage();
+    const rows = nodeRows(m.nodes.get('category:c3')!);
+    expect(rows.find(r => r.label === 'Coverage')?.value).toBe('Uncovered: no rule can assign it');
   });
 });
