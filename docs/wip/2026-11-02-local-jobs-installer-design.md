@@ -36,32 +36,37 @@ Non-goals
 
 ## 4. The pieces
 
-### 4.1 Job manifest: `ops/job.yaml` in each job's repo
+### 4.1 Job manifest: `ops/job.json` in each job's repo
 
-Declarative and small. The installer reads it; nothing else is hardcoded.
+Declarative and small. **JSON, not YAML**: a fresh mini has only Apple's `/usr/bin/python3` 3.9.6, with no PyYAML and no
+`tomllib`, so the installer must read its own manifest with the standard library (`json`) or `plutil` before any `pip` has run.
+The installer reads the manifest; nothing else about a job is hardcoded.
 
-```yaml
-id: contacts                 # lowercase letters/digits; becomes the macOS user, file and daemon names
-label: Contacts export
-repo: git@github.com:<owner>/<repo>.git
-ref: v0.1.0                  # pinned tag; the installer verifies it, never "main"
-macos_user: contacts
-entry: scripts/run.sh        # the program the daemon runs
-interval_seconds: 900        # LaunchDaemon StartInterval
-install: ["/usr/bin/python3 -m pip install --user -r requirements.txt"]
-secrets:                     # names only; values are entered at silent prompts
-  - name: CONTACTS_API_TOKEN
-    source: curia            # issued on the Local jobs page
-  - name: MATRIX_ACCESS_TOKEN
-    source: manual           # entered by the owner, never shown to an agent
-  - name: CLAUDE_CODE_OAUTH_TOKEN
-    source: claude-setup-token
-    optional: true
-curia:
-  scopes: [contacts-import]  # what the Curia token can reach (see 4.3)
-  heartbeat: true
-check: "python3 -m contacts.check"   # a dry run that must exit 0
+```json
+{
+  "id": "contacts",
+  "label": "Contacts export",
+  "repo": "git@github.com:<owner>/<repo>.git",
+  "ref": "v0.1.0",
+  "macos_user": "contacts",
+  "entry": "scripts/run.sh",
+  "interval_seconds": 60,
+  "install": ["/usr/bin/python3 -m pip install --user -r requirements.txt"],
+  "import_check": ["requests"],
+  "test": "/usr/bin/python3 -m pytest -q",
+  "secrets": [
+    { "name": "CONTACTS_API_TOKEN", "source": "curia" },
+    { "name": "MATRIX_ACCESS_TOKEN", "source": "manual" },
+    { "name": "CLAUDE_CODE_OAUTH_TOKEN", "source": "claude-setup-token", "optional": true }
+  ],
+  "curia": { "scopes": ["contacts-import"], "heartbeat": true },
+  "check": "/usr/bin/python3 -m contacts.check"
+}
 ```
+`ref` is a pinned tag, never `main`. `entry` is **always run as `/bin/sh <entry>`** (by the installer, `doctor` and the plist),
+never through its exec bit: Books' `run-batch.sh` was mode 644 in git, `sudo -u books .../run-batch.sh` said "command not found",
+and a plist that executed it directly would never have started. `check` must make a real call to Curia with the job's token
+(Books' `qbo_status.py`, which prints the company name, is the model), not only import the code.
 
 ### 4.2 The installer: `ops/local-jobs/setup-local-job`
 
@@ -71,18 +76,23 @@ re-run only does what is missing.
 | # | Step | Needs sudo | Notes |
 |---|------|-----------|-------|
 | 1 | Preflight | no | macOS version, FileVault on (warn, do not block), disk space, `git` and `python3` present |
-| 2 | Create the user | yes | `sysadminctl -addUser`, password at its own prompt; standard user only |
+| 2 | Create the user | yes | `sysadminctl -addUser <id> -fullName <label> -password - -home /Users/<id>` (the `-` is its own argument; `-password --home` fails with a usage error). It prints "Home directory is assigned (not created!)", so also run `sudo createhomedir -c -u <id>` and `chmod 700`. Never pass `-admin`. The "will not allow user to use FDE" warning is expected |
 | 3 | Folders | yes | `data/{inbox,state,out,logs}`, `chmod 700` on home and data |
 | 4 | Deploy key | no | `ssh-keygen` as the job user; prints the **public** key; waits for the owner to add it in GitHub as read-only; tests `git ls-remote` |
 | 5 | Clone and pin | no | clone, check out `ref`, print the commit and the manifest's SHA-256 for the owner to compare |
-| 6 | Install dependencies | no | runs the manifest's `install` commands as the job user |
+| 6 | Install dependencies | no | runs the manifest's `install` commands as the job user, then **verifies by importing** each `import_check` package and **runs the repo's tests as the job user**. (pip once silently did not run and nothing noticed until 17 tests failed at import.) Apple's python is 3.9.6 with pip 21 |
 | 7 | Secrets | no | silent prompts, one per manifest secret (4.4); writes the 600 env file |
-| 8 | Dry run | no | runs the manifest's `check`; must pass before a daemon exists |
-| 9 | Daemon | yes | renders the plist from a template (user, interval, paths) into `/Library/LaunchDaemons/`, `launchctl bootstrap`, verifies state `waiting` |
+| 8 | Dry run | no | runs the manifest's `check`, an end-to-end call to Curia with the job's token; must pass before a daemon exists. If the job has a Claude token, verifies it as the job user with only that file loaded: `claude -p "Reply with the single word: ok"` ("Not logged in" means the token or file is wrong) |
+| 9 | Daemon | yes | renders the plist (owner `root:wheel`, mode 644, `UserName` = the job user, `ProgramArguments` = `/bin/sh` + the entry) into `/Library/LaunchDaemons/`; `launchctl bootstrap`. `RunAtLoad` runs it at once, so verify by **reading the job's log**, not only `launchctl print`. **Detects an existing daemon with the same label and is idempotent**, so it can adopt Books' hand-installed one. The entry keeps an atomic `mkdir` lock so runs cannot overlap (cleared after 2 hours). Logs are monthly files plus `launchd.out/err`; nothing rotates the launchd ones |
 | 10 | First heartbeat | no | waits up to 2 minutes for Curia to report the job alive (via the token); prints the Local jobs page link |
 
 Companion commands: `setup-local-job doctor <id>` (re-verifies every step above and prints a pass/fail line each, no changes),
 `setup-local-job rotate-token <id>` and `setup-local-job uninstall <id>` (bootout, remove plist; leaves data unless `--purge`).
+
+Mechanics learned from Books by hand:
+- The installer is **bash run from a file**, never pasted lines (zsh does not word-split a command held in a variable, and a pasted multi-line command once lost its closing quote).
+- `sudo -u <user>` keeps the caller's working directory, which the job user cannot read: each sudo'd shell starts with `cd` to the job's home and uses absolute paths.
+- `doctor` also **runs the entry as the job user** (as `/bin/sh <entry>`), checks the plist's owner and mode, and checks the env file's mode.
 
 What it never does: read or print a token, pass a secret on a command line or in an environment visible to `ps`, edit
 `sudoers`, open a listener, run a model, or touch another job's user or files. `--dry-run` prints every command and exits.
@@ -109,11 +119,15 @@ write and the contacts token reaches the contacts import and run-request routes 
 ### 4.4 Entering secrets safely
 
 The installer's prompt function, shared by every job, follows what `temp_logs` learned:
-- `read -rs` (no echo), no value ever in `argv`, the environment of a child process, shell history, or a log.
-- Rejects empty values, values containing whitespace or a newline, values shorter than 20 characters, and values that
-  look like a command (`sudo`, `curl`, `export`, `=`-assignments, quotes). The earlier mistake pasted a command into a
-  token file.
-- Writes with `umask 077` to a temp file in the job's home, then renames to `~/.<id>-env`; re-reads only its length to confirm.
+- `read -rs` (no echo). The value goes by **stdin**, never `argv` (the first Books version put it in `$0`, briefly visible in `ps`), the
+  environment of a child process, shell history, or a log.
+- After the silent prompt it prints **"received N characters"**. With no echo the prompt looked broken, and the count is what caught a
+  truncated or wrong paste. Real lengths seen: Claude `setup-token` 108, Curia books token 64.
+- Rejects empty values, any whitespace or newline, values shorter than 20 characters, and anything outside a token charset
+  (`[A-Za-z0-9._~+/=-]`) or that looks like a command. **No upper length cap.**
+- **The env file is sourced by the shell**, so a bad value is not just wrong, it runs. Books once got `VAR=sudo ls -l ...` in the
+  file and sourcing it ran `ls`. So values are written **single-quoted**, and where possible the file is parsed without being executed.
+- Writes with `umask 077` to a temp file in the job's home, then renames to `~/.<id>-env`; confirms only its length.
 - A secret already present is kept unless the owner asks to replace it.
 
 ### 4.5 Run requests (for jobs Curia schedules)
@@ -130,6 +144,10 @@ hour") and a how-to pointing at the Local jobs page and the docs, per the repo r
 with its catalog entry.
 
 ## 5. Security notes
+
+- **The Mac mini is the machine the owner works on** (the owner's own login, the T7 volume and the Curia checkouts are all on it). So a job's user is
+  separated from the owner's login on the same machine, not from a dedicated box. The isolation boundary is macOS user permissions alone
+  (home `700`, env file `600`, no admin), and the owner's own account has admin rights. State this plainly in the Local jobs page. Confirm with the owner.
 
 - **No `curl | sh`.** The installer comes from the repo at a pinned tag; the page shows its hash and the owner compares it.
 - One token, one macOS user, one deploy key per job. Compromise of one job reaches nothing of another.
@@ -148,17 +166,23 @@ with its catalog entry.
 4. The **contacts** job as the second job (the exporter is designed separately).
 5. Move Books' heartbeat onto the generic route.
 
-## 7. Open questions
+## 7. Decisions (from web_dev's review, 2026-11-02; owner to confirm)
 
-1. Where the installer lives: this repo (`ops/local-jobs/`) or a small separate one. It has to be pinned and reviewable.
-2. Shell or Python for the installer. Shell matches `run-batch.sh`; Python makes the prompts and checks easier to test.
-3. The power-cut case: FileVault waits for a password before the daemon can start. Accept and alert (as Books does), or discuss
-   alternatives separately.
-4. How strict the token format check should be before it blocks a legitimate token.
-5. Whether `uninstall --purge` should exist at all, or deletion stays a manual step.
+1. **Where:** the installer lives in this repo at a pinned tag (`ops/local-jobs/`).
+2. **Shell or Python:** bash from a file, with a **JSON** manifest (section 4.1). No YAML on a fresh mini.
+3. **Power cut:** accept it. Daemons start at boot but only after FileVault is unlocked; Curia's 60-minute silence alert is the remedy.
+4. **Token strictness:** reject empty, whitespace, newline and command-like values; floor of 20 characters; no upper cap.
+5. **`uninstall --purge`:** does not exist. Deleting a job's data stays a manual step.
+
+Still open
+- Whether the owner is comfortable with job users sharing the machine with their own admin login (section 5).
+- Whether Books' hand-installed daemon (label `ventures.moonray.books-run`, 60 s interval) is adopted by the installer or left alone.
 
 ## 8. Not verified yet
 
-- Behaviour of `sysadminctl -addUser`, `launchctl bootstrap` and `claude setup-token` on the mini's current macOS version.
-- That the Books daemon, which has never been installed, works as the runbook describes.
-- Which Railway or Curia pieces need changes to expose the generic heartbeat and run-request routes (small, but unmeasured).
+- Behaviour of `sysadminctl`, `createhomedir`, `launchctl bootstrap` and `claude setup-token` on the mini's current macOS (web_dev has
+  run the first three by hand and the notes above come from that).
+- **The daemon path.** The Books pipeline itself now works end to end on the mini (first real run: 2 files fetched, 35 transactions pushed
+  for review, report accepted by Curia), but it has never run under launchd. web_dev plans to install the Books daemon by hand this
+  week; the installer must then detect it and be idempotent.
+- Which Curia pieces the generic heartbeat and run-request routes need (small, but unmeasured).
