@@ -4,14 +4,14 @@
 // Command Hub cannot see ntfy's Priority header, so urgency travels in the body: "mail:urgent" asks for a notification,
 // "mail" is a quiet refresh.
 
-import type { TriageGroup } from './types.js';
+import type { PushGroup } from './types.js';
 import type { TriageNotifier } from './watcher.js';
 
 /** ntfy priorities: 4 = high (loud), 2 = low (quiet). Urgent is loud; drafted and seen are quiet (FR-ETP-2). */
-const PRIORITY: Record<TriageGroup, string> = { urgent: '4', drafted: '2', seen: '2' };
+const PRIORITY: Record<PushGroup, string> = { urgent: '4', drafted: '2', seen: '2' };
 
 /** What the phone receives. Fixed strings only; Command Hub keys off these exactly. */
-const BODY: Record<TriageGroup, string> = { urgent: 'mail:urgent', drafted: 'mail', seen: 'mail' };
+const BODY: Record<PushGroup, string> = { urgent: 'mail:urgent', drafted: 'mail', seen: 'mail' };
 
 export class NtfyNotifier implements TriageNotifier {
   constructor(
@@ -21,7 +21,7 @@ export class NtfyNotifier implements TriageNotifier {
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
-  async notify(group: TriageGroup): Promise<void> {
+  async notify(group: PushGroup): Promise<void> {
     const headers: Record<string, string> = { Priority: PRIORITY[group], Title: 'inbox' };
     if (this.token) headers.Authorization = `Bearer ${this.token}`;
     const res = await this.fetchImpl(this.topicUrl, { method: 'POST', headers, body: BODY[group] });

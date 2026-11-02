@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { InboxWatcher, type SeenStore, type TriageSource } from '../../../src/inbox-triage/watcher.js';
-import type { TriageCandidate, TriageGroup, TriageVerdict } from '../../../src/inbox-triage/types.js';
+import type { PushGroup, TriageCandidate, TriageGroup, TriageVerdict } from '../../../src/inbox-triage/types.js';
 
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never;
 
@@ -34,6 +34,16 @@ describe('InboxWatcher', () => {
     await new InboxWatcher({ sources: [s], classifier: { classify }, notifier: { notify }, seen: memorySeen(), logger, intervalMs: 1000 }).tick();
     expect(applied).toEqual([['a', 'urgent'], ['b', 'drafted'], ['c', 'seen']]);
     expect(notify.mock.calls.map((c) => c[0])).toEqual(['urgent', 'drafted', 'seen']);
+  });
+
+  it('labels newsletter and spam mail but never pushes for it', async () => {
+    const { s, applied } = source([candidate('a', 1), candidate('b', 2)]);
+    const groups: TriageVerdict['group'][] = ['newsletter', 'spam'];
+    const classify = vi.fn(async () => verdict(groups.shift()!));
+    const notify = vi.fn(async (_group: PushGroup) => {});
+    await new InboxWatcher({ sources: [s], classifier: { classify }, notifier: { notify }, seen: memorySeen(), logger, intervalMs: 1000 }).tick();
+    expect(applied).toEqual([['a', 'newsletter'], ['b', 'spam']]);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it('does nothing for none', async () => {

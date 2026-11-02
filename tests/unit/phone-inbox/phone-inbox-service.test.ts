@@ -45,6 +45,18 @@ describe('groupOfLabel', () => {
     expect(groupOfLabel('✍️ Drafted')).toBe('drafted');
     expect(groupOfLabel('📌 Seen')).toBe('seen');
     expect(groupOfLabel('✅ Handled')).toBeNull();
+  });
+
+  it('recognises the current label names as well as the earlier ones', () => {
+    expect(groupOfLabel('Urgent')).toBe('urgent');
+    expect(groupOfLabel('Needs a reply')).toBe('drafted');
+    expect(groupOfLabel('FYI, no action needed')).toBe('seen');
+  });
+
+  it('does not show newsletter or spam mail, and never mistakes Gmail\'s SPAM folder for a group', () => {
+    expect(groupOfLabel('Newsletter')).toBeNull();
+    expect(groupOfLabel('Likely spam')).toBeNull();
+    expect(groupOfLabel('SPAM')).toBeNull();
     expect(groupOfLabel('INBOX')).toBeNull();
   });
 });

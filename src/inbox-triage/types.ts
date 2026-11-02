@@ -2,16 +2,53 @@
 //
 // Requirements: MVOS business_analysis/email-triage-requirements.md (FR-ETW, FR-ETC, FR-ETP).
 
-/** The triage groups that reach the phone. They match the Gmail labels the ceo-inbox agent applies. */
-export const TRIAGE_GROUPS = ['urgent', 'drafted', 'seen'] as const;
+import { groupOfLabel } from '../phone-inbox/phone-inbox-service.js';
+
+/**
+ * The groups the classifier can pick. The keys are internal (the phone contract still says urgent / drafted /
+ * seen); the Gmail label text is in TRIAGE_LABELS.
+ */
+export const TRIAGE_GROUPS = ['urgent', 'drafted', 'seen', 'newsletter', 'spam'] as const;
 export type TriageGroup = (typeof TRIAGE_GROUPS)[number];
 
-/** Label text per group. phone-inbox's groupOfLabel() ignores the emoji and case, so these round-trip. */
+/** The groups that wake the phone and show on its Home screen. Newsletter and spam are labelled and marked read only. */
+export const PUSH_GROUPS = ['urgent', 'drafted', 'seen'] as const;
+export type PushGroup = (typeof PUSH_GROUPS)[number];
+
+export function isPushGroup(group: TriageGroup): group is PushGroup {
+  return (PUSH_GROUPS as readonly string[]).includes(group);
+}
+
+/** Groups whose mail is marked read as well as labelled, so it stops counting as unread. */
+export function marksRead(group: TriageGroup): boolean {
+  return group === 'newsletter' || group === 'spam';
+}
+
+/**
+ * Gmail label text per group. "Spam" itself is a Gmail system label (user labels cannot reuse system names, and
+ * applying the real one would move the mail into the Spam folder), so that label is "Likely spam".
+ */
 export const TRIAGE_LABELS: Record<TriageGroup, string> = {
-  urgent: '🚨 Urgent',
-  drafted: '✍️ Drafted',
-  seen: '📌 Seen',
+  urgent: 'Urgent',
+  drafted: 'Needs a reply',
+  seen: 'FYI, no action needed',
+  newsletter: 'Newsletter',
+  spam: 'Likely spam',
 };
+
+/**
+ * Which group a label name belongs to, ignoring emoji, punctuation and case. Also recognises the previous names
+ * ("🚨 Urgent", "✍️ Drafted", "📌 Seen") so mail tagged before the rename still counts as tagged. The bare word
+ * "spam" is deliberately not matched: that is Gmail's own folder.
+ */
+export function triageGroupOfLabel(name: string): TriageGroup | null {
+  const phoneGroup = groupOfLabel(name);
+  if (phoneGroup) return phoneGroup;
+  const letters = name.replace(/[^\p{L}]/gu, '').toLowerCase();
+  if (letters === 'likelyspam') return 'spam';
+  if (letters === 'newsletter') return 'newsletter';
+  return null;
+}
 
 /** One unread, untagged message the classifier is asked about. Text is untrusted data. */
 export interface TriageCandidate {
@@ -27,7 +64,7 @@ export interface TriageCandidate {
 }
 
 export interface TriageVerdict {
-  /** 'none' = leave it for the 15-minute sweep; no label, no push. */
+  /** 'none' = no label and no push; the 15-minute sweep still sees it. */
   group: TriageGroup | 'none';
   /** 0..1. */
   confidence: number;
@@ -39,8 +76,9 @@ export const NO_VERDICT: TriageVerdict = { group: 'none', confidence: 0, unsure:
 
 /**
  * Reads the classifier agent's reply and validates it (FR-ETC-3). Anything that is not a recognised
- * group is 'none': the model's text never reaches a label unchecked. Below `minConfidence`, urgent and
- * drafted are downgraded to 'seen' and marked unsure, so a guess never makes a loud alert (FR-ETC-5).
+ * group is 'none': the model's text never reaches a label unchecked. Below `minConfidence`, every group except
+ * 'seen' is downgraded to 'seen' and marked unsure: a guess never makes a loud alert, and a guess that something is
+ * spam or a newsletter never marks real mail read and hides it (FR-ETC-5).
  */
 export function parseVerdict(text: string, minConfidence: number): TriageVerdict {
   const start = text.indexOf('{');

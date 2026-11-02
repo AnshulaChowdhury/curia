@@ -86,11 +86,20 @@ export interface PhoneInbox {
 /** How far back a sent reply counts. Older unread mail with no recent reply still needs you. */
 const REPLY_LOOKBACK_SECONDS = 14 * 24 * 60 * 60;
 
-/** Matches the triage labels ("🚨 Urgent", "✍️ Drafted", "📌 Seen") ignoring emoji and case. */
+// Letters-only label names (emoji, spaces, punctuation and case ignored) → the phone's three groups. Both the current
+// names ("Urgent", "Needs a reply", "FYI, no action needed") and the earlier ones ("🚨 Urgent", "✍️ Drafted", "📌 Seen").
+const LABEL_GROUPS: ReadonlyMap<string, PhoneInboxGroup> = new Map([
+  ['urgent', 'urgent'],
+  ['drafted', 'drafted'],
+  ['needsareply', 'drafted'],
+  ['seen', 'seen'],
+  ['fyinoactionneeded', 'seen'],
+]);
+
+/** Matches the triage labels (current and earlier names) ignoring emoji, punctuation and case. */
 export function groupOfLabel(name: string): PhoneInboxGroup | null {
   const letters = name.replace(/[^\p{L}]/gu, '').toLowerCase();
-  if (letters === 'urgent' || letters === 'drafted' || letters === 'seen') return letters;
-  return null;
+  return LABEL_GROUPS.get(letters) ?? null;
 }
 
 // Most pressing first when a message carries more than one triage label.
