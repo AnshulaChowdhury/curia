@@ -73,6 +73,7 @@ import { loadPhoneMessageReader } from '../../phone-inbox/nylas-message.js';
 import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
 import { BooksToken } from '../../quickbooks/books-token.js';
 import { DriveInbox } from '../../books/drive-inbox.js';
+import { UploadStore } from '../../books/upload-store.js';
 import { booksMonitorRoutes } from './routes/books-monitor.js';
 import { MonitorStore } from '../../books/monitor-store.js';
 import { BooksNotifier } from '../../books/notifier.js';
@@ -713,6 +714,7 @@ export class HttpAdapter implements Channel {
       await this.app.register(booksInboxRoutes, {
         logger,
         driveInbox: new DriveInbox(this.config.secretsService),
+        uploads: new UploadStore(pool),
         booksToken: new BooksToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,
