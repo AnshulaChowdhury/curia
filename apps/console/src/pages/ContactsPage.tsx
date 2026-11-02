@@ -5,6 +5,7 @@ import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
 import { buildContactViewFields, kgNodeHref, formatDateTime } from './contacts-utils.js';
+import SourcesDrawer from './SourcesDrawer.js';
 import {
   LINKABLE_CHANNEL_IDENTITIES,
   type LinkableChannelIdentity,
@@ -20,7 +21,7 @@ type IdentityStatus = 'active' | 'defunct' | 'bounced';
 // Which drawer (if any) is open. `view` is read-only; `edit`/`create` show the
 // editable form. Splitting view from edit means a single row click can never
 // mutate data (#1069).
-type DrawerMode = 'view' | 'edit' | 'create' | null;
+type DrawerMode = 'view' | 'edit' | 'create' | 'sources' | null;
 
 // A contact's linked channel identity, as serialized by
 // GET /api/contacts/:id/identities (Date fields are ISO strings here).
@@ -1105,6 +1106,12 @@ export default function ContactsPage() {
             />
             <TopbarDivider />
             <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => { setSelected(null); setDrawerMode('sources'); }}
+            >
+              Sources
+            </button>
+            <button
               className="btn btn-primary btn-sm"
               onClick={() => { setSelected(null); setDrawerMode('create'); }}
             >
@@ -1267,6 +1274,7 @@ export default function ContactsPage() {
                   />
                 </div>
 
+                {drawerMode === 'sources' && <SourcesDrawer key="sources" onClose={closeDrawer} />}
                 {drawerMode === 'view' && selected && (
                   <ContactViewDrawer
                     key={`view-${selected.id}`}
