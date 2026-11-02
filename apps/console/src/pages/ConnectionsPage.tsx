@@ -6,6 +6,8 @@ import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
 import ConnectionCard from './ConnectionCard.js';
 import InboxTriageCard from './InboxTriageCard.js';
+import MatrixBridgesCard from './MatrixBridgesCard.js';
+import ContactsImportCard from './ContactsImportCard.js';
 
 // Mirrors GET /api/connections (src/channels/http/routes/quickbooks.ts). Secrets and tokens are never returned.
 interface Connection {
@@ -339,6 +341,8 @@ export default function ConnectionsPage() {
             {connections.map(c => <QuickbooksCard key={c.id} c={c} reload={() => load()} />)}
             <DriveCard />
             <InboxTriageCard />
+            <MatrixBridgesCard />
+            <ContactsImportCard />
           </div>
         </main>
       </div>
