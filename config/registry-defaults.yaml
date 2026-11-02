@@ -81,6 +81,9 @@ tools:
   #        read internal audit + operational state and are the principal-only
   #        diagnostics agent's toolset. Opt-in: enable them alongside the diagnostics
   #        agent (Settings → Skills), not on a fresh install.
+  # NOTE: books skills (books-summary, books-review-queue, books-uploads) excluded — they read the
+  #        principal's QuickBooks balances and bank-file queue and are the read-only books
+  #        agent's toolset (ADR-060). Opt-in: enable them alongside the books agent.
   # NOTE: ceo-inbox-* excluded — companion to the ceo-inbox agent; enable alongside it.
   #        The email-observation-learning companions (voice-learn, task-completion-from-sent,
   #        list-learning-digest, resolve-learning-digest) are likewise excluded and must be
@@ -97,6 +100,8 @@ agents:
   - email-classifier   # internal; only runs when real-time inbox triage tasks it (off until the Settings switch is on)
   # NOTE: calendar agent excluded — enable after calendar credentials are configured
   # NOTE: ceo-inbox excluded — specialized inbox agent; must be enabled manually
+  # NOTE: books excluded — principal-only, read-only bookkeeping agent (ADR-060). Opt-in: it reads
+  #        financial data, so an operator enables it (and its skills) manually.
   # NOTE: diagnostics excluded — principal-only, read-only forensic agent (#1356). Opt-in:
   #        reads internal audit + operational state, so an operator enables it (and its
   #        audit-query/audit-trace/ops-lookup skills) manually. First `powerful`-tier agent.

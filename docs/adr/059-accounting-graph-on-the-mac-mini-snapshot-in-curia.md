@@ -29,4 +29,5 @@ The Knowledge Graph page gets a **second, selectable graph**: a control in the p
 - If the Mac mini is down, the page still works; it just stops updating. The missing-run and heartbeat alerts cover the Mac mini being down.
 - A bad or hostile snapshot cannot do more than be refused: the endpoint needs the books token, rejects anything outside the known shape, and everything in it is rendered as text. A snapshot is replaced wholesale, so there is nothing to migrate or merge.
 - The snapshot format is a contract between the exporter (`books/graph/export.py` in `mowmowaccounting`) and `src/books/graph-store.ts`. Both reject or ignore nothing silently: an unknown field fails the push with a message the sender logs.
+- The books specialist (ADR-060) reads the books but is not given this graph.
 - Edits to rules are not possible from this page. That is deliberate for now; if it changes, it is a new decision.
