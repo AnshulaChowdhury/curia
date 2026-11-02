@@ -63,6 +63,7 @@ import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
+import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
@@ -688,6 +689,12 @@ export class HttpAdapter implements Channel {
         logger,
         getToken: () => secrets.get('phone_inbox_token'),
         getReader: (account) => loadPhoneMessageReader(secrets, account),
+      });
+      // The transactions waiting for the owner (books), as cards for the phone. Same token; read-only.
+      await this.app.register(phoneBooksRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        batches: new BatchStore(pool),
       });
     }
     // Telnyx SMS webhook — always mounted; SmsAdapter installs the handler on start.
