@@ -284,7 +284,7 @@ function AccountingGraphInner() {
                             {neighbours(model, selected.id).map(nb => (
                               <tr key={`${nb.relation}|${nb.direction}|${nb.id}`}>
                                 <td>{nb.direction === 'out' ? nb.relation : `${nb.relation} (from)`}</td>
-                                <td><button className="kg-node-card" style={{ padding: 0, border: 'none', background: 'none', textAlign: 'left' }} onClick={() => selectNode(nb.id)}>{nb.label}</button></td>
+                                <td><button className="kg-neighbour-link" onClick={() => selectNode(nb.id)}>{nb.label}</button></td>
                               </tr>
                             ))}
                           </tbody>
