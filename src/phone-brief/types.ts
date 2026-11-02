@@ -2,7 +2,7 @@
 // Contract: contracts/phone-inbox.openapi.yaml in the MVOS repo (path /phone/brief).
 
 /** Section ids the phone knows, in the order they are sent. */
-export const BRIEF_SECTION_IDS = ['accounting', 'contacts', 'newsletters'] as const;
+export const BRIEF_SECTION_IDS = ['accounting', 'contacts', 'newsletters', 'unsorted'] as const;
 export type BriefSectionId = (typeof BRIEF_SECTION_IDS)[number];
 
 export const MAX_ITEMS_PER_SECTION = 10;

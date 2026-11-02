@@ -97,4 +97,46 @@ describe('InboxWatcher', () => {
     await new InboxWatcher({ sources: [s], classifier: { classify: async () => verdict('seen') }, notifier: { notify: async () => {} }, seen: memorySeen(), logger, intervalMs: 1000, maxPerTick: 2 }).tick();
     expect(applied.map(([id]) => id)).toEqual(['old', 'mid']);
   });
+
+  it('reports how each message ended: tagged, none, or failed', async () => {
+    const { s: src } = source([candidate('a', 1), candidate('b', 2), candidate('c', 3)]);
+    const answers: Array<TriageVerdict | Error> = [verdict('seen'), verdict('none'), new Error('model down')];
+    const record = vi.fn(async () => {});
+    await new InboxWatcher({
+      sources: [src], seen: memorySeen(), logger, intervalMs: 1000, notifier: { notify: async () => {} }, outcomes: { record },
+      classifier: { classify: async () => { const a = answers.shift()!; if (a instanceof Error) throw a; return a; } },
+    }).tick();
+    expect((record.mock.calls as unknown as Array<[TriageCandidate, string]>).map(([c, o]) => [c.messageId, o])).toEqual([['a', 'tagged'], ['b', 'none'], ['c', 'failed']]);
+  });
+
+  it('reports a label that could not be applied as failed, so it can be sorted by hand', async () => {
+    const record = vi.fn(async (_c: TriageCandidate, _o: string) => {});
+    const src: TriageSource = { accountId: 'moonray', listUntagged: async () => [candidate('a')], applyLabel: async () => { throw new Error('boom'); } };
+    await new InboxWatcher({ sources: [src], seen: memorySeen(), logger, intervalMs: 1000, notifier: { notify: async () => {} }, outcomes: { record }, classifier: { classify: async () => verdict('urgent') } }).tick();
+    expect(record.mock.calls[0]![1]).toBe('failed');
+  });
+
+  it('a recorder failure never stops the pass', async () => {
+    const { s: src, applied } = source([candidate('a', 1), candidate('b', 2)]);
+    await new InboxWatcher({ sources: [src], seen: memorySeen(), logger, intervalMs: 1000, notifier: { notify: async () => {} }, outcomes: { record: async () => { throw new Error('db down'); } }, classifier: { classify: async () => verdict('seen') } }).tick();
+    expect(applied.map(([id]) => id)).toEqual(['a', 'b']);
+  });
+
+  it('labels mail the owner already read but does not wake the phone for it', async () => {
+    const { s: src, applied } = source([{ ...candidate('a'), unread: false }]);
+    const notify = vi.fn(async () => {});
+    await new InboxWatcher({ sources: [src], seen: memorySeen(), logger, intervalMs: 1000, notifier: { notify }, classifier: { classify: async () => verdict('urgent') } }).tick();
+    expect(applied).toEqual([['a', 'urgent']]);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('asks the source to skip mail it has already handled', async () => {
+    const seen = memorySeen();
+    seen.keys.add('moonray:old');
+    let skip: ((id: string) => Promise<boolean>) | undefined;
+    const src: TriageSource = { accountId: 'moonray', listUntagged: async (isKnown) => { skip = isKnown; return []; }, applyLabel: async () => {} };
+    await new InboxWatcher({ sources: [src], seen, logger, intervalMs: 1000, notifier: { notify: async () => {} }, classifier: { classify: async () => verdict('seen') } }).tick();
+    expect(await skip!('old')).toBe(true);
+    expect(await skip!('new')).toBe(false);
+  });
 });

@@ -10,7 +10,7 @@ function deps(vault: Record<string, string>) {
     fetchImpl: (async () => { throw new Error('no network in this test'); }) as unknown as typeof fetch,
     logger: createSilentLogger(),
     secrets: { get: vi.fn(async (k: string) => vault[k] ?? null) },
-    store: undefined,
+    items: {} as never, timezone: 'America/Toronto',
   };
 }
 

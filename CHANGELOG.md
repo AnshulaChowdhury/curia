@@ -14,6 +14,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Sort unsorted mail from the phone** — `GET`/`POST /phone/triage/review`: one card per email triage could not sort, tap a category.
+- **Morning brief "unsorted" section** — lists emails triage could not sort; migration 115 stores them.
 - **Accounting Knowledge Graph coverage** — shows how many chart-of-accounts categories no rule can assign, how many wait for confirmation, and a list of the ones needing a decision. Needs the books agent's coverage field in the snapshot (books PR #8).
 
 - **`/phone/inbox` `assistantName`** — the assistant's name from the office identity, for the phone's morning-brief row.
@@ -35,6 +37,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Inbox triage window** — labels every inbox email received since 1 Nov 2026, read or unread; read mail never pings the phone.
+- **Inbox triage memory** — classified ids now live in Postgres, so a redeploy no longer re-classifies mail.
 - **Knowledge Graph detail panel in dark mode** — values and linked names now use the main text colour instead of the muted grey, and linked names no longer render as stray cards.
 - **Triage labels** — Urgent, Needs a reply, FYI, no action needed; new Newsletter and Likely spam are marked read.
 - **`ceo-inbox` labels** — renamed to match: Needs a reply and FYI, no action needed replace Drafted and Seen.
@@ -273,6 +277,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
+- **`GET /phone/brief`** — route was no longer registered after a merge, so the phone got 404; registered again.
 
 - **Contact merge** — carries the contacts-import source mappings and label decisions to the survivor, so none are lost.
 - **Real-time inbox triage** — the classifier agent is now enabled by default; before, every classification failed as unowned.
