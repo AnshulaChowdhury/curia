@@ -19,3 +19,11 @@ Railway variables still work as a fallback: `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`
 - `POST /books/qbo/create` `{entity, payload, request_id}` — Purchase, Deposit, Transfer or Vendor; QuickBooks de-duplicates on `request_id`.
 
 Errors: 409 `not_connected` (connect again), 422 QuickBooks refused the entry (message and fault included), 502 QuickBooks unavailable.
+
+## Bank files folder (Google Drive)
+
+The weekly RBC download files (.qbo/.ofx/.csv) are dropped in one Drive folder. Curia reads it with a Google **service account**, which can see only what is shared with it, so Curia needs no broad Google access for this.
+
+Set up on **Settings → API connections → Google Drive: bank files**: paste the service account's JSON key and the folder link (share the folder with the key's `client_email` as Editor first). Curia checks it can open the folder before saving. The key is stored encrypted in the vault (`books_drive`) and never returned.
+
+Routes (books token): `GET /books/inbox` (files waiting; only .qbo/.ofx/.csv up to 5 MB, directly in the folder), `GET /books/inbox/:id/content` (the bytes, uncached and opaque), `POST /books/inbox/:id/processed` (moves the file to a `Processed` subfolder). A file id outside the folder, of another type, or too large is refused. Curia never opens or parses the files.

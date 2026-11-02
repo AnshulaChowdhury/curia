@@ -12,11 +12,12 @@
 // Outside /api on purpose, like /phone/inbox: the books token (env BOOKS_API_TOKEN) works for these routes only and the
 // main API_TOKEN does not work here. QuickBooks tokens never leave Curia. Without BOOKS_API_TOKEN the machine routes are 404.
 
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import type { BooksToken } from '../../../quickbooks/books-token.js';
 import { QboApiError, QboAuthError, QboSettingsError, type QboConnection } from '../../../quickbooks/qbo-connection.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
+import { booksAuth } from '../books-auth.js';
 
 const READABLE = new Set([
   'Account', 'Class', 'Department', 'TaxCode', 'Vendor', 'Customer', 'Purchase', 'Deposit', 'Transfer',
@@ -111,21 +112,7 @@ export async function quickbooksRoutes(app: FastifyInstance, options: Quickbooks
   );
 
   // Everything below is for the books agent and needs the books token.
-  const authorised = async (request: FastifyRequest, reply: FastifyReply): Promise<boolean> => {
-    const header = request.headers.authorization;
-    const provided = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
-    const ok = await booksToken.verify(provided);
-    if (ok === null) {
-      void reply.status(404).send({ error: 'Not found' });
-      return false;
-    }
-    if (!provided || !ok) {
-      logger.warn({ ip: request.ip, reason: provided ? 'invalid_token' : 'missing_token' }, 'books: auth failed');
-      void reply.status(401).header('WWW-Authenticate', 'Bearer').send({ error: 'Unauthorized' });
-      return false;
-    }
-    return true;
-  };
+  const authorised = booksAuth(booksToken, logger);
 
   const fail = (reply: FastifyReply, err: unknown) => {
     if (err instanceof QboAuthError) return reply.status(409).send({ error: 'not_connected', message: err.message });
