@@ -7,7 +7,7 @@
 //   GET  /books/qbo-callback    — where Intuit sends the browser back; the single-use `state` is the credential
 //   GET  /books/qbo/status      — books token: is QuickBooks connected
 //   POST /books/qbo/query       — books token: a read-only `select ... from <entity>`
-//   POST /books/qbo/create      — books token: create a Purchase, Deposit, Transfer or Vendor (idempotent by request_id)
+//   POST /books/qbo/create      — books token: create a Purchase, Deposit, Transfer, Vendor or JournalEntry (idempotent by request_id)
 //
 // Outside /api on purpose, like /phone/inbox: the books token (env BOOKS_API_TOKEN) works for these routes only and the
 // main API_TOKEN does not work here. QuickBooks tokens never leave Curia. Without BOOKS_API_TOKEN the machine routes are 404.
@@ -22,8 +22,10 @@ import { booksAuth } from '../books-auth.js';
 const READABLE = new Set([
   'Account', 'Class', 'Department', 'TaxCode', 'Vendor', 'Customer', 'Purchase', 'Deposit', 'Transfer',
   'Preferences', 'CompanyInfo', 'Item',
+  // Read by the duplicate check (--qbo), the history audit and the month-end run.
+  'BillPayment', 'JournalEntry', 'SalesReceipt', 'RefundReceipt', 'Bill', 'Invoice', 'CreditMemo', 'CreditCardPayment',
 ]);
-const CREATABLE = new Set(['Purchase', 'Deposit', 'Transfer', 'Vendor']);
+const CREATABLE = new Set(['Purchase', 'Deposit', 'Transfer', 'Vendor', 'JournalEntry']);
 const SELECT_RX = /^select\s+[\w*,\s().]+?\s+from\s+(\w+)(\s|$)/i;
 
 export interface QuickbooksRouteOptions {
