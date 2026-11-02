@@ -294,6 +294,132 @@ function DriveCard() {
   );
 }
 
+interface BooksStatus {
+  heartbeat: { lastSeenAt: string; ageMinutes: number; state: string | null; version: string | null } | null;
+  lastRun: { receivedAt: string; status: string; batchId: string | null } | null;
+  week: { since: string; expectedAccounts: string[]; received: string[]; missing: string[] };
+  jobs: {
+    reminder: { cronExpr: string; timezone: string; enabled: boolean } | null;
+    deadline: { cronExpr: string; timezone: string; enabled: boolean } | null;
+  };
+  lastNotifiedAt: string | null;
+}
+
+interface Reviewer {
+  name: string;
+  email?: string;
+  ntfyTopic?: string;
+}
+
+function ageText(minutes: number): string {
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} min ago`;
+  const h = Math.round(minutes / 60);
+  return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
+}
+
+/** Books monitoring: is the Mac mini checking in, did this week's files arrive, who gets told when they don't. */
+function BooksMonitorCard() {
+  const [status, setStatus] = useState<BooksStatus | null>(null);
+  const [reviewers, setReviewers] = useState<Reviewer[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [s, r] = await Promise.all([apiFetch('/api/books/status'), apiFetch('/api/books/reviewers')]);
+      if (!s.ok) throw new Error(await errorText(s));
+      if (!r.ok) throw new Error(await errorText(r));
+      setStatus(await s.json() as BooksStatus);
+      setReviewers((await r.json() as { reviewers: Reviewer[] }).reviewers);
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : 'Failed to load', error: true });
+    }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const update = (i: number, patch: Partial<Reviewer>) => setReviewers(rs => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+
+  async function save() {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const res = await apiFetch('/api/books/reviewers', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reviewers }),
+      });
+      if (!res.ok) throw new Error(await errorText(res));
+      setReviewers((await res.json() as { reviewers: Reviewer[] }).reviewers);
+      setMessage({ text: 'Saved.', error: false });
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : 'Could not save', error: true });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const muted = { color: 'var(--app-fg-muted)' } as const;
+  const hb = status?.heartbeat;
+  const silent = hb ? hb.ageMinutes >= 60 : false;
+  return (
+    <section className="settings-section">
+      <div className="settings-section-head">
+        <h3 className="settings-section-title">Books: deadlines and alerts</h3>
+        <p className="settings-section-sub">
+          Curia tells the reviewers when the weekly files are missing, a run fails, a file sits unprocessed, or the Mac mini goes quiet.
+          The reminder (Monday) and deadline (Tuesday) times are scheduled jobs: change or pause them in Scheduled Jobs.
+        </p>
+      </div>
+      <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 }}>
+        {message && <div style={{ color: message.error ? 'var(--app-destructive)' : 'var(--app-fg)' }}>{message.text}</div>}
+        {status && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div>
+              Mac mini:{' '}
+              {hb ? <span style={silent ? { color: 'var(--app-destructive)' } : undefined}>checked in {ageText(hb.ageMinutes)}{hb.state ? ` (${hb.state})` : ''}</span>
+                  : <span style={muted}>has not checked in yet</span>}
+            </div>
+            <div>
+              Last run:{' '}
+              {status.lastRun ? <>{status.lastRun.status}, {formatDate(status.lastRun.receivedAt)}</> : <span style={muted}>none yet</span>}
+            </div>
+            <div>
+              This week&apos;s files:{' '}
+              {status.week.expectedAccounts.length === 0 ? <span style={muted}>no run has named the accounts yet</span>
+                : status.week.missing.length === 0 ? <>all in ({status.week.received.join(', ')})</>
+                : <span style={{ color: 'var(--app-destructive)' }}>missing {status.week.missing.join(', ')}</span>}
+            </div>
+            <div style={muted}>
+              Reminder: {status.jobs.reminder ? `${status.jobs.reminder.cronExpr} (${status.jobs.reminder.timezone})${status.jobs.reminder.enabled ? '' : ', paused'}` : 'not scheduled yet'}
+              {' · '}
+              Deadline: {status.jobs.deadline ? `${status.jobs.deadline.cronExpr} (${status.jobs.deadline.timezone})${status.jobs.deadline.enabled ? '' : ', paused'}` : 'not scheduled yet'}
+              {status.lastNotifiedAt ? ` · last alert ${formatDate(status.lastNotifiedAt)}` : ''}
+            </div>
+          </div>
+        )}
+        <div style={{ fontWeight: 600 }}>Reviewers to notify</div>
+        <div style={muted}>
+          Push alerts go to the ntfy topic you give (a topic name on the ntfy server used for inbox triage, or a full https address).
+          Alerts name accounts and weeks only, never amounts or bank text. Email alerts are not sent yet.
+        </div>
+        {reviewers.map((r, i) => (
+          <div key={i} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            <label style={fieldStyle}>Name<input style={inputStyle} value={r.name} onChange={e => update(i, { name: e.target.value })} /></label>
+            <label style={fieldStyle}>Email<input style={inputStyle} value={r.email ?? ''} onChange={e => update(i, { email: e.target.value })} /></label>
+            <label style={fieldStyle}>ntfy topic<input style={inputStyle} value={r.ntfyTopic ?? ''} onChange={e => update(i, { ntfyTopic: e.target.value })} spellCheck={false} /></label>
+            <button type="button" className="btn btn-secondary" onClick={() => setReviewers(rs => rs.filter((_, j) => j !== i))}>Remove</button>
+          </div>
+        ))}
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button type="button" className="btn btn-secondary" onClick={() => setReviewers(rs => [...rs, { name: '' }])}>Add a reviewer</button>
+          <button type="button" className="btn btn-primary" disabled={saving} onClick={() => void save()}>{saving ? 'Saving…' : 'Save reviewers'}</button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export default function ConnectionsPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -340,6 +466,7 @@ export default function ConnectionsPage() {
             {loadError && <div style={{ color: 'var(--app-destructive)', fontSize: 13 }}>{loadError}</div>}
             {connections.map(c => <QuickbooksCard key={c.id} c={c} reload={() => load()} />)}
             <DriveCard />
+            <BooksMonitorCard />
             <InboxTriageCard />
             <MatrixBridgesCard />
             <ContactsImportCard />

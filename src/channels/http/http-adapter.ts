@@ -71,6 +71,9 @@ import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
 import { BooksToken } from '../../quickbooks/books-token.js';
 import { DriveInbox } from '../../books/drive-inbox.js';
+import { booksMonitorRoutes } from './routes/books-monitor.js';
+import { MonitorStore } from '../../books/monitor-store.js';
+import { BooksNotifier } from '../../books/notifier.js';
 import { booksInboxRoutes } from './routes/books-inbox.js';
 import { booksBatchRoutes } from './routes/books-batches.js';
 import { BatchStore } from '../../books/batch-store.js';
@@ -139,6 +142,8 @@ export interface HttpAdapterConfig {
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
+  /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
+  booksMonitor?: import('../../books/monitor.js').BooksMonitor;
   /** Backs the public /api/secret-capture/* routes (one-time tokenized secret capture, #971).
    *  Token-authed, so mounted independently of the bootstrap secret. */
   secretCaptureService?: import('../../secrets/secret-capture-service.js').SecretCaptureService;
@@ -702,6 +707,17 @@ export class HttpAdapter implements Channel {
         webAppBootstrapSecret,
         sessions,
       });
+      if (this.config.booksMonitor) {
+        await this.app.register(booksMonitorRoutes, {
+          logger,
+          store: new MonitorStore(pool),
+          monitor: this.config.booksMonitor,
+          notifier: new BooksNotifier(this.config.secretsService, logger),
+          booksToken: new BooksToken(this.config.secretsService),
+          webAppBootstrapSecret,
+          sessions,
+        });
+      }
       await this.app.register(booksBatchRoutes, {
         logger,
         batchStore: new BatchStore(pool),
