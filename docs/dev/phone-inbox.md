@@ -1,4 +1,4 @@
-# Phone inbox endpoints (`GET /phone/inbox`, `GET /phone/message`)
+# Phone endpoints (`GET /phone/inbox`, `GET /phone/message`, `GET /phone/brief`)
 
 Read-only summary of email that "needs you", for the Command Hub Android launcher. The contract lives in the
 MVOS repo (`contracts/phone-inbox.openapi.yaml`); this is how Curia serves it.
@@ -27,11 +27,28 @@ an email. `/phone/inbox` itself still never returns bodies.
 - 404 when the email is gone, is not in that mailbox, or the mailbox has no Nylas grant. 400 for a missing or bad parameter.
   502 when Nylas fails, 503 (with `Retry-After` when Nylas gave one) when it rate-limits.
 
+## The morning brief (`GET /phone/brief`)
+`{ date, generatedAt, signalNumber, sections: [{ id, items: [{ text?, from?, subject? }] }] }`, for the Command Hub Home row.
+Sections are `accounting`, `contacts`, `newsletters`, always in that order, only those with items, at most 10 items each, text
+at most 280 characters, plain text. `204` when there is nothing to report; `404` with no token. It never serves a previous
+day's brief.
+- **Built once a day** at 06:30 in the configured timezone (`TIMEZONE`, default America/Toronto) by `PhoneBriefScheduler`, and
+  stored in `phone_briefs` (one row per local date, 30 days kept). A restart after 06:30 and before noon still builds it; a failed
+  build is retried up to three times, ten minutes apart. An empty day is stored too, so the job does not rerun.
+- **`signalNumber`** is the number the Signal channel runs on (`SIGNAL_PHONE_NUMBER`), only if it is E.164, else `null`.
+- **Newsletters:** yesterday's mail (local day) that triage labelled `Newsletter`, newest first. Each item has sender, subject and a
+  one-to-two sentence summary written by the fast model from the email's text (the only place email text leaves Curia for the
+  brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only.
+- **Other sections** are supplied by their owners: `PhoneBriefService.registerSource({ id, items(ctx) })` with `ctx.yesterday`
+  as the local-day window. A source that throws loses only its own section. Counts only for accounting and contacts (no amounts,
+  bank text or contact details).
+- The same `phone_inbox_token` as the other phone routes.
+
 ## Auth
-One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox` and `/phone/message` (owner's decision,
+One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message` and `/phone/brief` (owner's decision,
 2026-11-02). Because it now also unlocks email text, treat it as sensitive: a leaked token exposes the text of any email you
 can name by thread id. It sits outside `/api`, so `api_token` does not work here and the phone token works on nothing else.
-With no token in the vault both routes answer 404.
+With no token in the vault the phone routes answer 404.
 
 ## Vault secrets
 | Secret | Purpose |

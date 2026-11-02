@@ -68,6 +68,11 @@ import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
 import { InboxTriageController } from './inbox-triage/controller.js';
+import { PgBriefStore } from './phone-brief/brief-store.js';
+import { PhoneBriefService } from './phone-brief/brief-service.js';
+import { PhoneBriefScheduler } from './phone-brief/scheduler.js';
+import { NewsletterBriefSource } from './phone-brief/newsletter-source.js';
+import { InfraLlmSummarizer } from './phone-brief/summarizer.js';
 import { ConfigStore } from './memory/config-store.js';
 import { ToolRegistry } from './skills/registry.js';
 import { ExecutionLayer } from './skills/execution.js';
@@ -3203,6 +3208,17 @@ async function main(): Promise<void> {
     logger.error({ err }, 'inbox-triage failed to start; the 15-minute sweep still runs');
   }
 
+  // Command Hub morning brief (GET /phone/brief): built once a day at 06:30 local time and stored. The newsletter
+  // section is registered here; the accounting and contacts sections are added by their owners via registerSource().
+  const phoneBrief = new PhoneBriefService(new PgBriefStore(pool), logger, config.timezone, () => config.signalPhoneNumber);
+  phoneBrief.registerSource(new NewsletterBriefSource({
+    secrets: secretsService,
+    summarizer: new InfraLlmSummarizer(infraLlmService.scoped({ toolName: 'phone-brief' })),
+    logger,
+  }));
+  const phoneBriefScheduler = new PhoneBriefScheduler(phoneBrief, logger, config.timezone);
+  phoneBriefScheduler.start();
+
   // Books deadline/heartbeat monitor (FR-INT-5/7/8): checks every 15 minutes, seeds its weekly scheduler jobs the first
   // time the books token exists, and notifies the books reviewers. Idle until the books feature is set up.
   const booksMonitor = new BooksMonitor({
@@ -3448,6 +3464,7 @@ async function main(): Promise<void> {
     mcpRegistryService,
     secretsService,
     inboxTriage,
+    phoneBrief,
     booksMonitor,
     secretCaptureService,
     setupRequiredAtBoot,
@@ -3494,6 +3511,7 @@ async function main(): Promise<void> {
   const shutdown = async (exitCode = 0) => {
     logger.info('Shutting down...');
     inboxTriage.stop();
+    phoneBriefScheduler.stop();
     booksMonitor.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace

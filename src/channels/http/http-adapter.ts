@@ -146,6 +146,8 @@ export interface HttpAdapterConfig {
   /** Backs the /api/vault/* routes (secrets status + skill-secret entry). Mounted only
    *  alongside registryService, which scopes which secret names may be written. */
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
+  /** Backs GET /phone/brief, the Command Hub morning brief. Mounted only when the secrets vault is also available. */
+  phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
