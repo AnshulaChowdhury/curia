@@ -5,6 +5,7 @@
 // src/phone-inbox/nylas-mailbox.ts.
 
 import { NYLAS_REGIONS, type NylasRegion } from '../phone-inbox/nylas-mailbox.js';
+import { MailboxRateLimitedError } from '../phone-inbox/phone-inbox-service.js';
 import { TRIAGE_LABELS, marksRead, triageGroupOfLabel, type TriageCandidate, type TriageGroup } from './types.js';
 import type { TriageSource } from './watcher.js';
 
@@ -25,11 +26,16 @@ interface NylasList<T> { data?: T[]; next_cursor?: string }
 const LIST_LIMIT = 20;
 const PAGE_SIZE = 50;
 const MAX_PAGES = 8;
+/** Once the backlog since the start date is worked through, only mail this recent is listed (one cheap page per check). */
+const RECENT_WINDOW_SECONDS = 6 * 3600;
+const RECENT_MAX_PAGES = 2;
 const SNIPPET_MAX_CHARS = 400;
 const EXCLUDED = new Set(['SPAM', 'TRASH', 'DRAFT', 'SENT']);
 
 export class NylasTriageSource implements TriageSource {
   private readonly baseUrl: string;
+  /** False until one listing has read the whole window back to the start date with nothing left over. */
+  private caughtUp = false;
 
   constructor(
     readonly accountId: string,
@@ -49,10 +55,15 @@ export class NylasTriageSource implements TriageSource {
 
     const out: TriageCandidate[] = [];
     let cursor: string | undefined;
-    // Read or unread: every inbox message since `since`. Newest first, so page until enough new mail is found.
-    for (let page = 0; page < MAX_PAGES && out.length < LIST_LIMIT; page += 1) {
+    // Read or unread. The first listing (and every one after a restart) walks back to the start date to catch up on the
+    // backlog. After that only the last few hours are listed, so a steady 30-second check costs one small Nylas call
+    // instead of paging the whole window (Google rate-limits those reads).
+    const after = this.caughtUp ? Math.max(this.since, Math.floor(Date.now() / 1000) - RECENT_WINDOW_SECONDS) : this.since;
+    const maxPages = this.caughtUp ? RECENT_MAX_PAGES : MAX_PAGES;
+    let exhausted = false;
+    for (let page = 0; page < maxPages && out.length < LIST_LIMIT; page += 1) {
       const query = new URLSearchParams({ in: 'INBOX', limit: String(PAGE_SIZE) });
-      if (this.since > 0) query.set('received_after', String(this.since));
+      if (after > 0) query.set('received_after', String(after));
       if (cursor) query.set('page_token', cursor);
       const messages = await this.request<NylasList<NylasMessage>>('GET', `/messages?${query}`);
 
@@ -73,8 +84,13 @@ export class NylasTriageSource implements TriageSource {
         });
       }
       cursor = messages.next_cursor;
-      if (!cursor) break;
+      if (!cursor) {
+        exhausted = true;
+        break;
+      }
     }
+    // Caught up only when the whole window was read and nothing new is waiting beyond this pass.
+    if (exhausted && out.length < LIST_LIMIT) this.caughtUp = true;
     return out;
   }
 
@@ -109,6 +125,10 @@ export class NylasTriageSource implements TriageSource {
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
+    if (res.status === 429) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      throw new MailboxRateLimitedError(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
+    }
     // Status only: response bodies can hold mail text and are never logged or surfaced.
     if (!res.ok) throw new Error(`Nylas ${method} ${path.split('?')[0]} responded ${res.status}`);
     return (await res.json()) as T;

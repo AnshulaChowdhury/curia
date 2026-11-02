@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { MailboxRateLimitedError } from '../../../src/phone-inbox/phone-inbox-service.js';
 import { InboxWatcher, type SeenStore, type TriageSource } from '../../../src/inbox-triage/watcher.js';
 import type { PushGroup, TriageCandidate, TriageGroup, TriageVerdict } from '../../../src/inbox-triage/types.js';
 
@@ -138,5 +139,14 @@ describe('InboxWatcher', () => {
     await new InboxWatcher({ sources: [src], seen, logger, intervalMs: 1000, notifier: { notify: async () => {} }, classifier: { classify: async () => verdict('seen') } }).tick();
     expect(await skip!('old')).toBe(true);
     expect(await skip!('new')).toBe(false);
+  });
+
+  it('leaves a rate-limited mailbox alone until its cool-down ends', async () => {
+    const list = vi.fn(async (): Promise<TriageCandidate[]> => { throw new MailboxRateLimitedError(60); });
+    const src: TriageSource = { accountId: 'moonray', listUntagged: list, applyLabel: async () => {} };
+    const watcher = new InboxWatcher({ sources: [src], seen: memorySeen(), logger, intervalMs: 1000, notifier: { notify: async () => {} }, classifier: { classify: async () => verdict('seen') } });
+    await watcher.tick();
+    await watcher.tick();
+    expect(list).toHaveBeenCalledTimes(1);
   });
 });

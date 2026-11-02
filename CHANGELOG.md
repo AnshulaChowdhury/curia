@@ -39,6 +39,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Changed
 
 - **Inbox triage window** — labels every inbox email received since 1 Nov 2026, read or unread; read mail never pings the phone.
+- **Inbox triage load** — catches up on the backlog once, then lists recent mail only; a rate-limited mailbox pauses.
 - **Inbox triage memory** — classified ids now live in Postgres, so a redeploy no longer re-classifies mail.
 - **Knowledge Graph detail panel in dark mode** — values and linked names now use the main text colour instead of the muted grey, and linked names no longer render as stray cards.
 - **Triage labels** — Urgent, Needs a reply, FYI, no action needed; new Newsletter and Likely spam are marked read.

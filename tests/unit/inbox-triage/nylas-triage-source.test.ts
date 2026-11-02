@@ -153,4 +153,24 @@ describe('NylasTriageSource', () => {
     expect(out.map((c) => c.messageId)).toEqual(['new']);
     expect(urls[1]).toContain('page_token=p2');
   });
+
+  it('catches up on the whole window once, then lists only recent mail', async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes('/folders')) return json({ data: [{ id: 'INBOX', name: 'INBOX' }] });
+      urls.push(url);
+      return json({ data: [{ id: 'a', folders: ['INBOX'] }] });
+    }) as unknown as typeof fetch;
+    const source = new NylasTriageSource('moonray', 'k', 'g', fetchImpl, 'us', 1000);
+    await source.listUntagged();
+    await source.listUntagged();
+    expect(urls[0]).toContain('received_after=1000');
+    const recent = Number(new URL(urls[1]!).searchParams.get('received_after'));
+    expect(recent).toBeGreaterThan(Date.now() / 1000 - 6 * 3600 - 5);
+  });
+
+  it('throws a rate-limit error carrying the wait when Nylas answers 429', async () => {
+    const fetchImpl = (async () => new Response('{}', { status: 429, headers: { 'retry-after': '42' } })) as unknown as typeof fetch;
+    await expect(new NylasTriageSource('moonray', 'k', 'g', fetchImpl).listUntagged()).rejects.toMatchObject({ retryAfterSeconds: 42 });
+  });
 });
