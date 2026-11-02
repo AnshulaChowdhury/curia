@@ -10,8 +10,23 @@ import type { FastifyInstance } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import { PhoneInboxUnavailableError, type PhoneInboxService } from '../../../phone-inbox/phone-inbox-service.js';
 
+/**
+ * The assistant's name for the phone's morning-brief row ("morning brief from <first name>"). One line, no control
+ * characters, at most 80 characters; null when there is nothing usable.
+ */
+export function cleanAssistantName(raw: string | null | undefined): string | null {
+  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
+  const flat = (raw ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return flat ? flat.slice(0, 80) : null;
+}
+
 export interface PhoneInboxRouteOptions {
   logger: Logger;
+  /**
+   * The executive assistant's full name from the office identity, sent as `assistantName` (null when unknown). When
+   * omitted the field is left out of the answer; the phone then falls back to "Curia".
+   */
+  getAssistantName?: () => string | null;
   /** The phone's token, read from the vault on each request; null when not configured. */
   getToken: () => Promise<string | null>;
   /** Builds the service from the vault's current Nylas secrets. */
@@ -26,7 +41,7 @@ function tokensMatch(provided: string, expected: string): boolean {
 }
 
 export async function phoneInboxRoutes(app: FastifyInstance, options: PhoneInboxRouteOptions): Promise<void> {
-  const { logger, getToken, getService } = options;
+  const { logger, getToken, getService, getAssistantName } = options;
 
   // Home refreshes every 15 minutes; 30/min leaves room for retries and still blocks guessing.
   app.get('/phone/inbox', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
@@ -44,7 +59,8 @@ export async function phoneInboxRoutes(app: FastifyInstance, options: PhoneInbox
     try {
       const inbox = await (await getService()).build();
       // Email metadata: keep it out of any shared cache.
-      return reply.header('Cache-Control', 'no-store').send(inbox);
+      const body = getAssistantName ? { ...inbox, assistantName: cleanAssistantName(getAssistantName()) } : inbox;
+      return reply.header('Cache-Control', 'no-store').send(body);
     } catch (err) {
       if (err instanceof PhoneInboxUnavailableError) {
         return reply.status(502).send({ error: 'Mailbox unavailable' });
