@@ -3,6 +3,7 @@ import { MobileMenuContext } from '../context/MobileMenu.js';
 import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
+import { Link } from '@tanstack/react-router';
 import { useTheme } from '../hooks/useTheme.js';
 
 type McpState = 'uninstalled' | 'installed' | 'enabled';
@@ -282,6 +283,10 @@ export default function McpToolsPage() {
             <div style={{ padding: 32, color: 'var(--app-destructive)', fontSize: 13 }}>{loadError}</div>
           ) : (
             <>
+              <p className="settings-page-sub" style={{ margin: '12px 24px 0' }}>
+                MCP Skills lists skills projected from MCP servers, such as google-workspace. Skill bundles that ship with
+                Curia, such as <strong>books</strong>, are on the <Link to="/tools" style={{ color: 'var(--app-teal)' }}>Tools page</Link>.
+              </p>
               <div className="records-toolbar">
                 <div className="records-toolbar-left">
                   {(['all', 'enabled', 'installed', 'uninstalled'] as const).map(v => (

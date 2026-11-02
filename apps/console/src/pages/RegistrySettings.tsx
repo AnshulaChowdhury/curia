@@ -6,7 +6,7 @@ import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
 // Types + row-tree builder live in registry-rows.ts, shared with its unit tests
 // (mirrors src/registry/types.ts RegistryEntry).
-import { buildRows, collateralPins, formatCapabilities, registryPathSegment, uninstallBlockedReason, type RegistryEntry, type DerivedState, type Row } from './registry-rows.js';
+import { buildRows, bundleGap, bundleGapMessage, collateralPins, enableWithBundlesPrompt, formatCapabilities, registryPathSegment, uninstallBlockedReason, type RegistryEntry, type DerivedState, type Row } from './registry-rows.js';
 
 // Map each DerivedState to one of the existing .status-pill modifier classes
 // (app.css) so no new CSS is needed:
@@ -168,6 +168,32 @@ function RegistryDrawer({ entry, row, agents, onClose, onChanged }: {
     }
   }, [entry.name, entry.kind, onChanged]);
 
+  // An agent whose skill bundles are off boots with no tools from them. Enabling it asks first, then enables the bundles
+  // too (?with_bundles=true); the server does that before the agent, so a bundle that cannot be enabled leaves it off.
+  const enableAgent = (suffix: '/enable' | '/install-enable') => {
+    const prompt = enableWithBundlesPrompt(entry);
+    if (prompt === null) { void act('POST', suffix); return; }
+    if (window.confirm(prompt)) void act('POST', `${suffix}?with_bundles=true`);
+  };
+
+  // The same fix for an agent that is already enabled: enable the bundles it pins.
+  const gap = bundleGap(entry);
+  const enableBundles = useCallback(async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      for (const bundle of gap) {
+        const res = await apiFetch(`/api/registry/skills/${encodeURIComponent(bundle)}/install-enable`, { method: 'POST' });
+        if (!res.ok) throw new Error(`${bundle}: ${await errorMessage(res)}`);
+      }
+      onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Action failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [gap, onChanged]);
+
   // Non-null when the server would refuse this uninstall (an enabled bundle). Drives both
   // the disabled state and the explanatory copy below the action row.
   const uninstallBlocked = uninstallBlockedReason(entry);
@@ -258,6 +284,15 @@ function RegistryDrawer({ entry, row, agents, onClose, onChanged }: {
 
           {entry.manifestError && (
             <p className="autonomy-error">Manifest error: {entry.manifestError}</p>
+          )}
+          {bundleGapMessage(entry) && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'flex-start' }}>
+              <p className="autonomy-error" style={{ margin: 0 }}>{bundleGapMessage(entry)} Takes effect on the next restart.</p>
+              {/* An enabled agent whose bundles are off: one button to turn them on */}
+              <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void enableBundles()}>
+                Enable {gap.length === 1 ? `the "${gap[0]}" bundle` : 'its bundles'}
+              </button>
+            </div>
           )}
           {err && <p className="autonomy-error">{err}</p>}
 
@@ -359,7 +394,7 @@ function RegistryDrawer({ entry, row, agents, onClose, onChanged }: {
               className="btn btn-primary btn-sm"
               disabled={busy || secretsBlock}
               title={secretsBlockTitle}
-              onClick={() => void act('POST', '/install-enable')}
+              onClick={() => (entry.kind === 'agent' ? enableAgent('/install-enable') : void act('POST', '/install-enable'))}
             >
               Install &amp; enable
             </button>
@@ -373,11 +408,12 @@ function RegistryDrawer({ entry, row, agents, onClose, onChanged }: {
             className="btn btn-primary btn-sm"
             disabled={busy || secretsBlock}
             title={secretsBlockTitle}
-            onClick={() => void act('POST', '/enable')}
+            onClick={() => (entry.kind === 'agent' ? enableAgent('/enable') : void act('POST', '/enable'))}
           >
             Enable
           </button>
         )}
+
 
         {/* Disable — only for currently-enabled entries */}
         {entry.state === 'enabled' && (
@@ -773,6 +809,11 @@ function RegistryPage({ kind }: { kind: 'tool' | 'agent' }) {
                                     {/* Extra warning on ghost: manifest is gone but DB row lingers */}
                                     {e.state}{e.state === 'ghost' ? ' ⚠' : ''}
                                   </span>
+                                  {bundleGap(e).length > 0 && (
+                                    <span className="status-pill blocked" style={{ marginLeft: 6 }} title={bundleGapMessage(e) ?? undefined}>
+                                      ⚠ needs {bundleGap(e).join(', ')}
+                                    </span>
+                                  )}
                                 </td>
                                 {kind === 'agent' ? (
                                   <>

@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Agents warn about skill bundles that are off** — Agents page flags them; enabling an agent offers to enable its bundles.
 - **Books specialist** — the Digital EA can ask a read-only `books` agent about cash, review queue and uploads (ADR-060).
 - **Job names** — name a scheduled job on the Jobs page; the books reminders are now named (migration 116).
 - **Sort unsorted mail from the phone** — `GET`/`POST /phone/triage/review`: one card per email triage could not sort, tap a category.
@@ -38,6 +39,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
+- **MCP Skills page** — now points to the Tools page, where bundles such as books live.
 - **QuickBooks connection** — built once in `index.ts` and shared, since QuickBooks rotates refresh tokens on every use.
 
 - **Inbox triage window** — labels every inbox email received since 1 Nov 2026, read or unread; read mail never pings the phone.
