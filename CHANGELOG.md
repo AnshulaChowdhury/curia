@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Accounting Knowledge Graph coverage** — shows how many chart-of-accounts categories no rule can assign, how many wait for confirmation, and a list of the ones needing a decision. Needs the books agent's coverage field in the snapshot (books PR #8).
 
 - **`/phone/inbox` `assistantName`** — the assistant's name from the office identity, for the phone's morning-brief row.
 - **Accounting section for the Morning Brief** — cash in bank, liabilities, accounts receivable, RBC transactions and how many are matched in QuickBooks, plus `GET /phone/books/review` with cards for the transactions that need the owner (phone token, read-only).

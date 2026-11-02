@@ -18,7 +18,7 @@ import { KG_EDGE_TYPES, KG_NODE_TYPES, ZoomLevelClass } from './kg-graph-view.js
 import { createLayoutClient } from './kg-layout-client.js';
 import type { LayoutClient } from './kg-layout-client.js';
 import { GraphSelector } from './GraphSelector.js';
-import { neighbours, nodeRows, normaliseSnapshot, subModel, typeCounts, typeLabel, visibleIds } from './accounting-graph.js';
+import { coverageCounts, needsAttention, neighbours, nodeRows, normaliseSnapshot, subModel, typeCounts, typeLabel, visibleIds } from './accounting-graph.js';
 import type { AccountingGraphResponse } from './accounting-graph.js';
 
 // The accounting rules graph: a read-only snapshot pushed by the books agent (ADR-059), drawn with the same
@@ -61,6 +61,7 @@ function AccountingGraphInner() {
   const [filter, setFilter] = useState<KgFilter>(emptyFilter);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [status, setStatus] = useState('');
+  const [attentionOnly, setAttentionOnly] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset['mobileSidebar'] = mobileOpen ? 'open' : '';
@@ -139,6 +140,7 @@ function AccountingGraphInner() {
   const selected = selectedId ? model.nodes.get(selectedId) ?? null : null;
   const options = typeCounts(model);
   const filterActive = isFilterActive(filter);
+  const coverage = coverageCounts(model);
 
   function selectNode(id: string) {
     setSelectedId(id);
@@ -201,6 +203,24 @@ function AccountingGraphInner() {
                     ))}
                   </fieldset>
                 </details>
+                {coverage && (
+                  <div className="kg-coverage" role="status">
+                    <div className="kg-coverage-title">Category coverage</div>
+                    <div className="kg-coverage-line" data-testid="coverage-uncovered">
+                      <strong>{coverage.uncovered}</strong> uncovered
+                    </div>
+                    <div className="kg-coverage-line" data-testid="coverage-proposed">
+                      <strong>{coverage.proposed}</strong> awaiting confirmation
+                    </div>
+                    <div className="kg-coverage-line">
+                      <strong>{coverage.covered}</strong> of {coverage.total} covered by a rule, a bank account or a confirmed manual mark
+                    </div>
+                    <label className="kg-filter-option">
+                      <input type="checkbox" checked={attentionOnly} onChange={() => setAttentionOnly(v => !v)} />
+                      <span className="kg-filter-option-name">List only the ones needing a decision</span>
+                    </label>
+                  </div>
+                )}
                 <p className="kg-accounting-note">
                   Rules are rounded squares coloured by what they assign. A dashed outline is a proposed rule; a struck-through label is a retired one.
                 </p>
@@ -209,7 +229,7 @@ function AccountingGraphInner() {
                 </p>
                 <div className="kg-sidebar-list">
                   {[...model.nodes.values()]
-                    .filter(n => (!text.trim() || visibleIds(model, text)?.has(n.id)) && (filter.types.size === 0 || filter.types.has(n.type)))
+                    .filter(n => (!text.trim() || visibleIds(model, text)?.has(n.id)) && (filter.types.size === 0 || filter.types.has(n.type)) && (!attentionOnly || needsAttention(n)))
                     .slice(0, 200)
                     .map(n => (
                       <button key={n.id} className="kg-node-card" onClick={() => selectNode(n.id)} title={`Show ${n.label}`}>
