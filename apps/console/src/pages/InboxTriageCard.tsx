@@ -6,7 +6,6 @@ import ConnectionCard from './ConnectionCard.js';
 interface TriageSettings {
   enabled: boolean;
   ntfyUrl: string;
-  ntfyTopic: string;
   hasToken: boolean;
   minConfidence: number | null;
   nylasConfigured: boolean;
@@ -29,7 +28,6 @@ export default function InboxTriageCard() {
   const [saved, setSaved] = useState<TriageSettings | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [url, setUrl] = useState('');
-  const [topic, setTopic] = useState('');
   const [token, setToken] = useState('');
   const [confidence, setConfidence] = useState(DEFAULT_CONFIDENCE);
   const [busy, setBusy] = useState(false);
@@ -39,7 +37,6 @@ export default function InboxTriageCard() {
     setSaved(s);
     setEnabled(s.enabled);
     setUrl(s.ntfyUrl);
-    setTopic(s.ntfyTopic);
     setConfidence(s.minConfidence === null ? DEFAULT_CONFIDENCE : String(s.minConfidence));
     setToken('');
   }
@@ -67,7 +64,7 @@ export default function InboxTriageCard() {
     setBusy(true);
     setMessage(null);
     try {
-      const body: Record<string, unknown> = { enabled, ntfyUrl: url, ntfyTopic: topic, minConfidence: parsed, ...extra };
+      const body: Record<string, unknown> = { enabled, ntfyUrl: url, minConfidence: parsed, ...extra };
       if (token !== '') body['ntfyToken'] = token; // omitted = keep the stored token
       const res = await apiFetch('/api/connections/inbox-triage', {
         method: 'PUT',
@@ -100,7 +97,7 @@ export default function InboxTriageCard() {
 
   const status = !saved ? '' : saved.running ? 'Running' : saved.enabled ? 'Not running' : 'Off';
   const dirty = saved !== null && (
-    enabled !== saved.enabled || url !== saved.ntfyUrl || topic !== saved.ntfyTopic || token !== '' ||
+    enabled !== saved.enabled || url !== saved.ntfyUrl || token !== '' ||
     confidence !== (saved.minConfidence === null ? DEFAULT_CONFIDENCE : String(saved.minConfidence))
   );
 
@@ -127,15 +124,10 @@ export default function InboxTriageCard() {
           Triage new mail in real time
         </label>
         <div className="form-grid">
-          <div className="form-field">
-            <label htmlFor="triage-url">ntfy server</label>
-            <input id="triage-url" type="text" placeholder="https://ntfy.example.com" value={url} disabled={!saved || busy}
-              onChange={e => setUrl(e.target.value)} autoComplete="off" />
-          </div>
-          <div className="form-field">
-            <label htmlFor="triage-topic">Topic</label>
-            <input id="triage-topic" type="text" placeholder="curia-mail" value={topic} disabled={!saved || busy}
-              onChange={e => setTopic(e.target.value)} autoComplete="off" />
+          <div className="form-field" style={{ gridColumn: '1 / -1' }}>
+            <label htmlFor="triage-url">ntfy topic address</label>
+            <input id="triage-url" type="text" placeholder="https://ntfy.example.com/curia-mail" value={url} disabled={!saved || busy}
+              onChange={e => setUrl(e.target.value)} autoComplete="off" spellCheck={false} />
           </div>
           <div className="form-field">
             <label htmlFor="triage-token">Access token (optional)</label>
@@ -153,7 +145,7 @@ export default function InboxTriageCard() {
           <button type="button" className="btn btn-primary" disabled={!saved || busy || !dirty} onClick={() => void save()}>
             Save
           </button>
-          <button type="button" className="btn btn-secondary" disabled={!saved || busy || dirty || !saved.ntfyUrl || !saved.ntfyTopic}
+          <button type="button" className="btn btn-secondary" disabled={!saved || busy || dirty || !saved.ntfyUrl}
             onClick={() => void sendTest()} title={dirty ? 'Save first' : undefined}>
             Send test push
           </button>

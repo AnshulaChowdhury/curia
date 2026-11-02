@@ -10,17 +10,16 @@ const PRIORITY: Record<TriageGroup, string> = { urgent: '4', drafted: '2', seen:
 
 export class NtfyNotifier implements TriageNotifier {
   constructor(
-    private readonly serverUrl: string,
-    private readonly topic: string,
+    /** The full topic address, e.g. https://ntfy.example.com/curia-mail. */
+    private readonly topicUrl: string,
     private readonly token: string | null,
     private readonly fetchImpl: typeof fetch = fetch,
   ) {}
 
   async notify(group: TriageGroup): Promise<void> {
-    const url = `${this.serverUrl.replace(/\/+$/, '')}/${encodeURIComponent(this.topic)}`;
     const headers: Record<string, string> = { Priority: PRIORITY[group], Title: 'inbox' };
     if (this.token) headers.Authorization = `Bearer ${this.token}`;
-    const res = await this.fetchImpl(url, { method: 'POST', headers, body: 'mail' });
+    const res = await this.fetchImpl(this.topicUrl, { method: 'POST', headers, body: 'mail' });
     // Only the status is reported; the response body is not needed.
     if (!res.ok) throw new Error(`ntfy responded ${res.status}`);
   }

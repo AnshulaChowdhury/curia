@@ -52,16 +52,15 @@ describe('inbox triage settings routes', () => {
     await build(s);
     const res = await app.inject({
       method: 'PUT', url: URL_, headers: COOKIE,
-      payload: { enabled: true, ntfyUrl: ' https://ntfy.example.com ', ntfyTopic: 'curia-mail', ntfyToken: 'tk_secret', minConfidence: 0.7 },
+      payload: { enabled: true, ntfyUrl: ' https://ntfy.example.com/curia-mail ', ntfyToken: 'tk_secret', minConfidence: 0.7 },
     });
     expect(res.statusCode).toBe(200);
     expect(s.vault.get('inbox_triage_enabled')).toBe('true');
-    expect(s.vault.get('inbox_triage_ntfy_url')).toBe('https://ntfy.example.com');
-    expect(s.vault.get('inbox_triage_ntfy_topic')).toBe('curia-mail');
+    expect(s.vault.get('inbox_triage_ntfy_url')).toBe('https://ntfy.example.com/curia-mail');
     expect(s.vault.get('inbox_triage_ntfy_token')).toBe('tk_secret');
     expect(s.vault.get('inbox_triage_min_confidence')).toBe('0.7');
     expect(s.controller.reload).toHaveBeenCalledTimes(1);
-    expect(res.json()).toMatchObject({ enabled: true, ntfyTopic: 'curia-mail', hasToken: true, minConfidence: 0.7, running: true });
+    expect(res.json()).toMatchObject({ enabled: true, ntfyUrl: 'https://ntfy.example.com/curia-mail', hasToken: true, minConfidence: 0.7, running: true });
     expect(res.body).not.toContain('tk_secret');
     const got = await app.inject({ method: 'GET', url: URL_, headers: COOKIE });
     expect(got.body).not.toContain('tk_secret');
@@ -70,7 +69,7 @@ describe('inbox triage settings routes', () => {
   it('keeps the stored token when it is omitted, and clears it when sent empty', async () => {
     const s = setup({ seed: { inbox_triage_ntfy_token: 'tk_old' } });
     await build(s);
-    await app.inject({ method: 'PUT', url: URL_, headers: COOKIE, payload: { ntfyTopic: 'a' } });
+    await app.inject({ method: 'PUT', url: URL_, headers: COOKIE, payload: { minConfidence: 0.5 } });
     expect(s.vault.get('inbox_triage_ntfy_token')).toBe('tk_old');
     const res = await app.inject({ method: 'PUT', url: URL_, headers: COOKIE, payload: { ntfyToken: '' } });
     expect(s.vault.has('inbox_triage_ntfy_token')).toBe(false);
@@ -82,8 +81,8 @@ describe('inbox triage settings routes', () => {
     [{ ntfyUrl: 'ftp://x.example.com' }],
     [{ ntfyUrl: 'https://user:pw@ntfy.example.com' }],
     [{ ntfyUrl: 'not a url' }],
-    [{ ntfyTopic: 'has space' }],
-    [{ ntfyTopic: '../etc' }],
+    [{ ntfyUrl: 'https://ntfy.example.com' }],
+    [{ ntfyUrl: 'https://ntfy.example.com/' }],
     [{ minConfidence: 0 }],
     [{ minConfidence: 1.5 }],
     [{ minConfidence: '0.5' }],
@@ -112,7 +111,7 @@ describe('inbox triage settings routes', () => {
     await app.close();
 
     const fetchImpl = vi.fn(async () => new Response('', { status: 200 })) as unknown as typeof fetch;
-    const ok = setup({ fetchImpl, seed: { inbox_triage_ntfy_url: 'https://ntfy.example.com', inbox_triage_ntfy_topic: 'curia-mail', inbox_triage_ntfy_token: 'tk' } });
+    const ok = setup({ fetchImpl, seed: { inbox_triage_ntfy_url: 'https://ntfy.example.com/curia-mail', inbox_triage_ntfy_token: 'tk' } });
     await build(ok);
     const res = await app.inject({ method: 'POST', url: `${URL_}/test`, headers: COOKIE });
     expect(res.json()).toEqual({ ok: true });
@@ -122,7 +121,7 @@ describe('inbox triage settings routes', () => {
     await app.close();
 
     const failing = vi.fn(async () => new Response('', { status: 403 })) as unknown as typeof fetch;
-    const bad = setup({ fetchImpl: failing, seed: { inbox_triage_ntfy_url: 'https://ntfy.example.com', inbox_triage_ntfy_topic: 'curia-mail' } });
+    const bad = setup({ fetchImpl: failing, seed: { inbox_triage_ntfy_url: 'https://ntfy.example.com/curia-mail' } });
     await build(bad);
     const fail = await app.inject({ method: 'POST', url: `${URL_}/test`, headers: COOKIE });
     expect(fail.statusCode).toBe(502);

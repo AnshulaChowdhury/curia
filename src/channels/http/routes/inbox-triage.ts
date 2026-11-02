@@ -27,19 +27,18 @@ export interface InboxTriageRouteOptions {
 interface PutBody {
   enabled?: unknown;
   ntfyUrl?: unknown;
-  ntfyTopic?: unknown;
   /** Omitted = keep the stored token; "" = clear it; otherwise replace it. */
   ntfyToken?: unknown;
   minConfidence?: unknown;
 }
 
-const TOPIC_RX = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_TOKEN = 512;
 
-function validUrl(value: string): boolean {
+/** An http(s) topic address with a topic in the path and no embedded credentials. */
+function validTopicUrl(value: string): boolean {
   try {
     const u = new URL(value);
-    return (u.protocol === 'https:' || u.protocol === 'http:') && !u.username && !u.password;
+    return (u.protocol === 'https:' || u.protocol === 'http:') && !u.username && !u.password && u.pathname.length > 1;
   } catch {
     return false;
   }
@@ -57,7 +56,6 @@ export async function inboxTriageRoutes(app: FastifyInstance, options: InboxTria
     return {
       enabled: (await read(K.enabled)).toLowerCase() === 'true',
       ntfyUrl: await read(K.ntfyUrl),
-      ntfyTopic: await read(K.ntfyTopic),
       hasToken: (await read(K.ntfyToken)) !== '',
       minConfidence: Number.isFinite(confidence) && confidence > 0 && confidence <= 1 ? confidence : null,
       nylasConfigured: (await read('nylas_api_key')) !== '',
@@ -76,11 +74,8 @@ export async function inboxTriageRoutes(app: FastifyInstance, options: InboxTria
     const bad = (error: string) => reply.status(400).send({ error });
 
     if (b.enabled !== undefined && typeof b.enabled !== 'boolean') return bad('enabled must be true or false');
-    if (b.ntfyUrl !== undefined && (typeof b.ntfyUrl !== 'string' || (b.ntfyUrl.trim() !== '' && !validUrl(b.ntfyUrl.trim())))) {
-      return bad('ntfy server must be an http(s) address without a username or password');
-    }
-    if (b.ntfyTopic !== undefined && (typeof b.ntfyTopic !== 'string' || (b.ntfyTopic.trim() !== '' && !TOPIC_RX.test(b.ntfyTopic.trim())))) {
-      return bad('topic may use letters, numbers, - and _ (up to 64)');
+    if (b.ntfyUrl !== undefined && (typeof b.ntfyUrl !== 'string' || (b.ntfyUrl.trim() !== '' && !validTopicUrl(b.ntfyUrl.trim())))) {
+      return bad('ntfy address must be an http(s) topic address like https://ntfy.example.com/curia-mail, without a username or password');
     }
     if (b.ntfyToken !== undefined && (typeof b.ntfyToken !== 'string' || b.ntfyToken.length > MAX_TOKEN)) {
       return bad('token is too long');
@@ -92,7 +87,6 @@ export async function inboxTriageRoutes(app: FastifyInstance, options: InboxTria
 
     if (b.enabled !== undefined) await secrets.set(K.enabled, b.enabled ? 'true' : 'false');
     if (typeof b.ntfyUrl === 'string') await secrets.set(K.ntfyUrl, b.ntfyUrl.trim());
-    if (typeof b.ntfyTopic === 'string') await secrets.set(K.ntfyTopic, b.ntfyTopic.trim());
     if (typeof b.ntfyToken === 'string') {
       if (b.ntfyToken === '') await secrets.delete(K.ntfyToken);
       else await secrets.set(K.ntfyToken, b.ntfyToken);
@@ -114,10 +108,9 @@ export async function inboxTriageRoutes(app: FastifyInstance, options: InboxTria
   app.post('/api/connections/inbox-triage/test', TEST_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
     const url = await read(K.ntfyUrl);
-    const topic = await read(K.ntfyTopic);
-    if (!url || !topic) return reply.status(400).send({ error: 'Save an ntfy server and topic first.' });
+    if (!url) return reply.status(400).send({ error: 'Save the ntfy address first.' });
     try {
-      await new NtfyNotifier(url, topic, (await read(K.ntfyToken)) || null, fetchImpl).notify('seen');
+      await new NtfyNotifier(url, (await read(K.ntfyToken)) || null, fetchImpl).notify('seen');
       return reply.send({ ok: true });
     } catch (err) {
       // The notifier's message carries the HTTP status only; never echo the URL or token.
