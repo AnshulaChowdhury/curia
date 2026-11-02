@@ -64,6 +64,8 @@ import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
+import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
+import { ContactsImportToken } from '../../contacts-import/import-token.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
@@ -697,6 +699,18 @@ export class HttpAdapter implements Channel {
         logger,
         secrets: this.config.secretsService,
         controller: this.config.inboxTriage,
+        webAppBootstrapSecret,
+        sessions,
+      });
+    }
+
+    // Contacts cards on the connections page: the Matrix bridges' addresses and secrets (read-only contact lists) and the
+    // Mac mini's import token. Values go to the encrypted vault; secrets are write-only.
+    if (this.config.secretsService && webAppBootstrapSecret) {
+      await this.app.register(contactsConnectionsRoutes, {
+        logger,
+        secrets: this.config.secretsService,
+        importToken: new ContactsImportToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,
       });

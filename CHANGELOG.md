@@ -19,6 +19,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Real-time inbox triage** — new mail is classified within ~30s, labelled, and wakes the phone via ntfy. Off by default.
 - **Inbox triage settings** — a form under API connections saves ntfy details to the vault, restarts the watcher, sends a test push.
 - **API connection cards** — start collapsed and expand on click, with a chevron in each header.
+- **Matrix bridges card** — save each bridge's private address and secret; Test shows contact counts only.
+- **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
 
