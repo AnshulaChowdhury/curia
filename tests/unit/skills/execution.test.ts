@@ -336,6 +336,42 @@ describe('ExecutionLayer', () => {
     }
   });
 
+  describe('a specialist\'s read-only tools from a delegation or a scheduled job (books incident, 2026-11-02)', () => {
+    // The books tools were declared `elevated`, so the gate refused every call the books agent made from a scheduled job
+    // ("Elevated skill blocked: not a live principal turn"). A scheduled or delegated turn carries the principal's
+    // lineage but never the live-turn signal. Reproduce that turn exactly: principal originator, no liveTurn, agent 'books'.
+    const scheduledTurn = {
+      agentId: 'books',
+      taskMetadata: {
+        originator: {
+          contactId: 'primary-user', systemRole: 'principal' as const, channel: 'web', initiatedAt: new Date().toISOString(),
+        },
+      },
+    };
+    const caller = { contactId: 'primary-user', role: null, channel: 'web' };
+    const handler: ToolHandler = { execute: async () => ({ success: true, data: 'read' }) };
+
+    it('refuses an elevated tool, which is why they must not be elevated', async () => {
+      registry.register(makeManifest({ name: 'books-like', sensitivity: 'elevated', allowed_callers: ['books'] }), handler);
+      const result = await execution.invoke('books-like', {}, caller, scheduledTurn);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain('live principal turn');
+    });
+
+    it('runs a normal read-only tool for the agent it names', async () => {
+      registry.register(makeManifest({ name: 'books-like', sensitivity: 'normal', allowed_callers: ['books'] }), handler);
+      const result = await execution.invoke('books-like', {}, caller, scheduledTurn);
+      expect(result.success).toBe(true);
+    });
+
+    it('still keeps every other agent out of it', async () => {
+      registry.register(makeManifest({ name: 'books-like', sensitivity: 'normal', allowed_callers: ['books'] }), handler);
+      const result = await execution.invoke('books-like', {}, caller, { ...scheduledTurn, agentId: 'research-analyst' });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain('restricted to agents: books');
+    });
+  });
+
   describe('elevated skill caller verification', () => {
     // #1126: the elevated-skill gate requires a LIVE PRINCIPAL TURN — the metadata must carry
     // a principal originator, and the invoke options must carry the dispatcher-stamped `liveTurn`
