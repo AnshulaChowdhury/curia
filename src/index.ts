@@ -249,6 +249,11 @@ import { McpRegistryService } from './registry/mcp-registry-service.js';
 import { reconcileMcpRegistry } from './registry/mcp-reconcile.js';
 import { HealthService } from './health/health-service.js';
 import { CanarySchedule } from './health/canary-schedule.js';
+import { BooksMonitor } from './books/monitor.js';
+import { MonitorStore } from './books/monitor-store.js';
+import { BooksNotifier } from './books/notifier.js';
+import { DriveInbox } from './books/drive-inbox.js';
+import { BooksToken } from './quickbooks/books-token.js';
 
 async function main(): Promise<void> {
   // Captured at the very start of main() so the wizard's post-setup polling
@@ -3198,6 +3203,18 @@ async function main(): Promise<void> {
     logger.error({ err }, 'inbox-triage failed to start; the 15-minute sweep still runs');
   }
 
+  // Books deadline/heartbeat monitor (FR-INT-5/7/8): checks every 15 minutes, seeds its weekly scheduler jobs the first
+  // time the books token exists, and notifies the books reviewers. Idle until the books feature is set up.
+  const booksMonitor = new BooksMonitor({
+    store: new MonitorStore(pool),
+    notifier: new BooksNotifier(secretsService, logger),
+    driveInbox: new DriveInbox(secretsService),
+    schedulerService,
+    booksToken: new BooksToken(secretsService),
+    logger,
+  });
+  booksMonitor.start();
+
   // Reaction → approval mapper (#1479): channel-agnostic inbound.reaction handling.
   // Registered after ExecutionLayer so approve can re-invoke the blocked skill.
   const reactionIntentsConfig = yamlConfig.autonomy?.reaction_intents;
@@ -3431,6 +3448,7 @@ async function main(): Promise<void> {
     mcpRegistryService,
     secretsService,
     inboxTriage,
+    booksMonitor,
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
@@ -3476,6 +3494,7 @@ async function main(): Promise<void> {
   const shutdown = async (exitCode = 0) => {
     logger.info('Shutting down...');
     inboxTriage.stop();
+    booksMonitor.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace
     // before Signal, Slack, and the pool close (#2254).
