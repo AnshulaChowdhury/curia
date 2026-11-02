@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api.js';
+import ConnectionCard from './ConnectionCard.js';
 
 // Mirrors GET /api/connections/inbox-triage (src/channels/http/routes/inbox-triage.ts). The ntfy token is never returned.
 interface TriageSettings {
@@ -104,17 +105,13 @@ export default function InboxTriageCard() {
   );
 
   return (
-    <section className="settings-section">
-      <div className="settings-section-head">
-        <h3 className="settings-section-title">
-          Inbox triage{' '}
-          {status && <span className={`status-pill${saved?.running ? ' confirmed' : saved?.enabled ? ' provisional' : ''}`}>{status}</span>}
-        </h3>
-        <p className="settings-section-sub">
-          Sorts new mail into Urgent, Needs reply or FYI within about 30 seconds and pings your phone through ntfy.
-          Values are stored in Curia's encrypted vault; the token is never shown again after saving.
-        </p>
-      </div>
+    <ConnectionCard
+      title={<>
+        Inbox triage{' '}
+        {status && <span className={`status-pill${saved?.running ? ' confirmed' : saved?.enabled ? ' provisional' : ''}`}>{status}</span>}
+      </>}
+      sub="Sorts new mail into Urgent, Needs reply or FYI within about 30 seconds and pings your phone through ntfy. Values are stored in Curia's encrypted vault; the token is never shown again after saving."
+    >
       <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 14, fontSize: 13 }}>
         {saved && !saved.nylasConfigured && (
           <div style={{ color: 'var(--app-destructive)' }}>Email is not connected yet (no Nylas key), so there is nothing to triage.</div>
@@ -170,6 +167,6 @@ export default function InboxTriageCard() {
           )}
         </div>
       </div>
-    </section>
+    </ConnectionCard>
   );
 }

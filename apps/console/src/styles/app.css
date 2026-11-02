@@ -1059,6 +1059,19 @@ a.dash-activity-headline:hover { text-decoration: underline; }
   font-size: 12px; color: var(--app-fg-muted);
 }
 
+/* Collapsible API connection cards: the header is a button; the body shows on expand. */
+.connection-card-toggle {
+  display: flex; align-items: center; gap: 12px;
+  width: 100%; text-align: left;
+  background: none; border: 0; border-bottom: 1px solid var(--app-border);
+  font: inherit; color: inherit; cursor: pointer;
+}
+.connection-card-toggle:hover { background: var(--app-muted); }
+.connection-card-toggle:focus-visible { outline: 2px solid var(--app-ring, currentColor); outline-offset: -2px; }
+.connection-card-toggle.is-collapsed { border-bottom-color: transparent; }
+.connection-card-heading { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.connection-card-heading .settings-section-title { margin: 0; }
+
 /* ── 11. Autonomy view ───────────────────────────────────────────────── */
 .autonomy-current {
   display: flex; align-items: baseline; gap: 12px;

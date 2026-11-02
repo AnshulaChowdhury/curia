@@ -4,6 +4,7 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import ConnectionCard from './ConnectionCard.js';
 import InboxTriageCard from './InboxTriageCard.js';
 
 // Mirrors GET /api/connections (src/channels/http/routes/quickbooks.ts). Secrets and tokens are never returned.
@@ -89,17 +90,15 @@ function QuickbooksCard({ c, reload }: { c: Connection; reload: () => Promise<vo
 
   const muted = { color: 'var(--app-fg-muted)' } as const;
   return (
-    <section className="settings-section">
-      <div className="settings-section-head">
-        <h3 className="settings-section-title">
-          {c.name}{' '}
-          <span className={`status-pill${c.connected ? ' confirmed' : c.configured ? ' provisional' : ''}`}>
-            {c.connected ? 'Connected' : c.configured ? 'Not connected' : 'Not set up'}
-          </span>
-        </h3>
-        <p className="settings-section-sub">{c.description}</p>
-      </div>
-
+    <ConnectionCard
+      title={<>
+        {c.name}{' '}
+        <span className={`status-pill${c.connected ? ' confirmed' : c.configured ? ' provisional' : ''}`}>
+          {c.connected ? 'Connected' : c.configured ? 'Not connected' : 'Not set up'}
+        </span>
+      </>}
+      sub={c.description}
+    >
       <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 }}>
         {message && <div style={{ color: message.error ? 'var(--app-destructive)' : 'var(--app-fg)' }}>{message.text}</div>}
 
@@ -183,7 +182,7 @@ function QuickbooksCard({ c, reload }: { c: Connection; reload: () => Promise<vo
           {c.booksTokenSet && !newToken && <span style={{ ...muted, marginLeft: 10 }}>A token is set.</span>}
         </div>
       </div>
-    </section>
+    </ConnectionCard>
   );
 }
 
