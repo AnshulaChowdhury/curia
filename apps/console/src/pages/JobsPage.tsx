@@ -898,7 +898,7 @@ export default function JobsPage() {
                           >
                             <td>
                               <span className="cell-primary">{j.name || j.agentId}</span>
-                              {j.name && <div className="cell-secondary">{j.agentId}</div>}
+                              {j.name && <div className="cell-secondary">agent: {j.agentId}</div>}
                             </td>
                             <td>
                               <span className={`status-pill ${j.status}`}>{j.status}</span>
