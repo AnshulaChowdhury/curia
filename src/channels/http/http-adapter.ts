@@ -149,6 +149,8 @@ export interface HttpAdapterConfig {
   /** Backs the /api/vault/* routes (secrets status + skill-secret entry). Mounted only
    *  alongside registryService, which scopes which secret names may be written. */
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
+  /** The process's one QuickBooks connection (ADR-060). Built here when absent, which only tests rely on. */
+  qboConnection?: import('../../quickbooks/qbo-connection.js').QboConnection;
   /** Backs GET /phone/brief, the Command Hub morning brief. Mounted only when the secrets vault is also available. */
   phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
   /** Unsorted mail for the phone's review cards (GET/POST /phone/triage/review). */
@@ -746,7 +748,7 @@ export class HttpAdapter implements Channel {
     if (this.config.secretsService) {
       await this.app.register(quickbooksRoutes, {
         logger,
-        connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
+        connection: this.config.qboConnection ?? new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
         booksToken: new BooksToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,

@@ -311,6 +311,7 @@ export class ExecutionLayer {
   private approvalDelivery?: import('../autonomy/approval-delivery.js').ApprovalDelivery;
   private auditLogRepo?: import('../audit/audit-log-repo.js').AuditLogRepo;
   private diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
+  private booksReader?: import('../books/books-reader.js').BooksReader;
   private taskRepo?: import('../db/task-repo.js').TaskRepo;
   private workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
   /** Backs the 'voiceSessions' capability (#2347). */
@@ -395,6 +396,7 @@ export class ExecutionLayer {
     approvalDelivery?: import('../autonomy/approval-delivery.js').ApprovalDelivery;
     auditLogRepo?: import('../audit/audit-log-repo.js').AuditLogRepo;
     diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
+    booksReader?: import('../books/books-reader.js').BooksReader;
     taskRepo?: import('../db/task-repo.js').TaskRepo;
     workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
     /** Backs the 'voiceSessions' capability (#2347). */
@@ -457,6 +459,7 @@ export class ExecutionLayer {
     this.approvalDelivery = options?.approvalDelivery;
     this.auditLogRepo = options?.auditLogRepo;
     this.diagnosticsRepo = options?.diagnosticsRepo;
+    this.booksReader = options?.booksReader;
     this.taskRepo = options?.taskRepo;
     this.workingDocsRepo = options?.workingDocsRepo;
     this.voiceSessions = options?.voiceSessions;
@@ -514,6 +517,7 @@ export class ExecutionLayer {
       approvalDelivery: this.approvalDelivery,
       auditLogRepo: this.auditLogRepo,
       diagnosticsRepo: this.diagnosticsRepo,
+      booksReader: this.booksReader,
       taskRepo: this.taskRepo,
       workingDocs: this.workingDocsRepo,
       voiceSessions: this.voiceSessions,

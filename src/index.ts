@@ -261,6 +261,10 @@ import { MonitorStore } from './books/monitor-store.js';
 import { BooksNotifier } from './books/notifier.js';
 import { DriveInbox } from './books/drive-inbox.js';
 import { BooksToken } from './quickbooks/books-token.js';
+import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.js';
+import { BooksReader } from './books/books-reader.js';
+import { BatchStore } from './books/batch-store.js';
+import { UploadStore } from './books/upload-store.js';
 
 async function main(): Promise<void> {
   // Captured at the very start of main() so the wizard's post-setup polling
@@ -1665,6 +1669,17 @@ async function main(): Promise<void> {
   // Read-only ops/agent-state reads for the (opt-in) diagnostics agent — #1356.
   const diagnosticsRepo = new DiagnosticsRepo(pool, logger);
 
+  // The one QuickBooks connection in this process: QuickBooks rotates the refresh token on every refresh, so the books
+  // routes (HttpAdapter) and the books specialist's read facade must share it. (ADR-060)
+  const qboConnection = new QboConnection(qboSettingsFromEnv(), secretsService, logger);
+  const booksReader = new BooksReader({
+    batches: new BatchStore(pool),
+    uploads: new UploadStore(pool),
+    monitor: new MonitorStore(pool),
+    qbo: qboConnection,
+    logger,
+  });
+
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
   // #2322: parked agendas and the post-call pipeline share this store.
@@ -2637,7 +2652,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
@@ -3448,6 +3463,7 @@ async function main(): Promise<void> {
   });
 
   const httpAdapter = new HttpAdapter({
+    qboConnection,
     bus,
     logger,
     pool,
