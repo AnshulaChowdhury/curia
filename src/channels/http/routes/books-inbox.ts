@@ -21,6 +21,7 @@ import { DriveFileError, DriveSettingsError, type DriveInbox } from '../../../bo
 import type { UploadStore } from '../../../books/upload-store.js';
 import { booksAuth } from '../books-auth.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
+import { isUuid } from '../../../util/uuid.js';
 
 export interface BooksInboxRouteOptions {
   logger: Logger;
@@ -32,7 +33,6 @@ export interface BooksInboxRouteOptions {
 }
 
 const FILE_ID = /^[\w-]{10,100}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export async function booksInboxRoutes(app: FastifyInstance, options: BooksInboxRouteOptions): Promise<void> {
   const { logger, driveInbox, uploads, booksToken, webAppBootstrapSecret, sessions } = options;
@@ -86,7 +86,7 @@ export async function booksInboxRoutes(app: FastifyInstance, options: BooksInbox
     if (!(await authorised(request, reply))) return reply;
     if (!FILE_ID.test(request.params.id)) return reply.status(400).send({ error: 'Bad file id' });
     try {
-      const bytes = UUID.test(request.params.id)
+      const bytes = isUuid(request.params.id)
         ? (await uploads.read(request.params.id))?.bytes
         : (await driveInbox.read(request.params.id)).bytes;
       if (!bytes) return reply.status(404).send({ error: 'No such file' });
@@ -101,7 +101,7 @@ export async function booksInboxRoutes(app: FastifyInstance, options: BooksInbox
     if (!(await authorised(request, reply))) return reply;
     if (!FILE_ID.test(request.params.id)) return reply.status(400).send({ error: 'Bad file id' });
     try {
-      if (UUID.test(request.params.id)) {
+      if (isUuid(request.params.id)) {
         if (!(await uploads.markProcessed(request.params.id))) return reply.status(404).send({ error: 'No such file' });
         logger.info({ uploadId: request.params.id }, 'books: uploaded bank file recorded; its bytes were deleted');
       } else {
@@ -153,7 +153,7 @@ export async function booksInboxRoutes(app: FastifyInstance, options: BooksInbox
 
   app.delete<{ Params: { id: string } }>('/api/books/uploads/:id', RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
-    if (!UUID.test(request.params.id)) return reply.status(400).send({ error: 'Bad file id' });
+    if (!isUuid(request.params.id)) return reply.status(400).send({ error: 'Bad file id' });
     if (!(await uploads.remove(request.params.id))) return reply.status(404).send({ error: 'That file is not waiting any more' });
     return reply.header('Cache-Control', 'no-store').send({ ok: true });
   });
