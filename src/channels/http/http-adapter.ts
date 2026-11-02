@@ -73,6 +73,7 @@ import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
+import { contactsSourcesRoutes } from './routes/contacts-sources.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
@@ -816,6 +817,17 @@ export class HttpAdapter implements Channel {
         logger,
         secrets: this.config.secretsService,
         importToken: new ContactsImportToken(this.config.secretsService),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // The Contacts page "Sources" drawer: which mailboxes and bridges the import will read, and each mailbox's
+      // Work/Personal category as reported by Command Hub. Read-only; nothing is fetched from Nylas or a bridge.
+      const sourcesSecrets = this.config.secretsService;
+      await this.app.register(contactsSourcesRoutes, {
+        logger,
+        secrets: sourcesSecrets,
+        categories: new PgMailboxCategoryStore(pool),
+        loadMailboxes: () => loadPhoneInboxAccounts(sourcesSecrets),
         webAppBootstrapSecret,
         sessions,
       });
