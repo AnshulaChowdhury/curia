@@ -32,7 +32,7 @@ an email. `/phone/inbox` itself still never returns bodies.
 
 ## The morning brief (`GET /phone/brief`)
 `{ date, generatedAt, signalNumber, sections: [{ id, items: [{ text?, from?, subject? }] }] }`, for the Command Hub Home row.
-Sections are `accounting`, `contacts`, `newsletters`, always in that order, only those with items, at most 10 items each, text
+Sections are `accounting`, `contacts`, `newsletters`, `unsorted`, always in that order, only those with items, at most 10 items each, text
 at most 280 characters, plain text. `204` when there is nothing to report; `404` with no token. It never serves a previous
 day's brief.
 - **Built once a day** at 06:30 in the configured timezone (`TIMEZONE`, default America/Toronto) by `PhoneBriefScheduler`, and
@@ -42,13 +42,26 @@ day's brief.
 - **Newsletters:** yesterday's mail (local day) that triage labelled `Newsletter`, newest first. Each item has sender, subject and a
   one-to-two sentence summary written by the fast model from the email's text (the only place email text leaves Curia for the
   brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only.
+- **Unsorted:** mail triage could not sort (the classifier said `none`, the call failed, or the label could not be written), one
+  item per email with sender, subject and why. Not limited to yesterday: it lists everything still waiting, until the owner sorts it.
 - **Other sections** are supplied by their owners: `PhoneBriefService.registerSource({ id, items(ctx) })` with `ctx.yesterday`
   as the local-day window. A source that throws loses only its own section. Counts only for accounting and contacts (no amounts,
   bank text or contact details).
 - The same `phone_inbox_token` as the other phone routes.
 
+## Sorting unsorted mail from the phone (`/phone/triage/review`)
+Triage looks at every inbox email received since 2026-11-01 (local), read or unread. Mail it cannot sort stays unlabelled and is kept
+in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once resolved).
+- `GET /phone/triage/review` → `{ generatedAt, count, cards: [{ id, account, messageId, threadId, from, subject, preview, receivedAt,
+  reason: "none"|"failed", options: [{ group, label }] }] }`, newest first, at most 50. `options` are always `urgent`, `drafted`,
+  `seen`, `newsletter`, `spam` (labels as in Gmail: Urgent, Needs a reply, FYI no action needed, Newsletter, Likely spam) and `dismiss`.
+- `POST /phone/triage/review` with `{ account, messageId, group }` applies that label in the mailbox (newsletter and spam are also
+  marked read) and removes the card; `group: "dismiss"` removes it and leaves the mail alone. `{ ok, id, remaining }` on success;
+  400 bad input, 404 not waiting (so a double tap does nothing), 502 the mailbox write failed (card stays), 503 mailbox not connected.
+- Mail the owner had already read before triage saw it is labelled but never pings the phone.
+
 ## Auth
-One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message` and `/phone/brief` (owner's decision,
+One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review` and `/phone/triage/review` (owner's decision,
 2026-11-02). Because it now also unlocks email text, treat it as sensitive: a leaked token exposes the text of any email you
 can name by thread id. It sits outside `/api`, so `api_token` does not work here and the phone token works on nothing else.
 With no token in the vault the phone routes answer 404.

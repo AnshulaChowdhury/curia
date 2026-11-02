@@ -1,6 +1,6 @@
 // nylas-triage-source.ts — one Nylas mailbox as a TriageSource.
 //
-// Reads unread inbox mail that carries no triage label, with a short preview but never a body, and writes only
+// Reads inbox mail (read or unread, since a start date) that carries no triage label, with a short preview but never a body, and writes only
 // the triage label, plus "read" for newsletter and spam mail (FR-ETW-5). Uses fetch directly, like
 // src/phone-inbox/nylas-mailbox.ts.
 
@@ -17,10 +17,14 @@ interface NylasMessage {
   date?: number;
   from?: Array<{ name?: string; email?: string }>;
   folders?: string[];
+  unread?: boolean;
 }
-interface NylasList<T> { data?: T[] }
+interface NylasList<T> { data?: T[]; next_cursor?: string }
 
+/** Most new candidates one listing returns, and how many Nylas pages it will read to find them. */
 const LIST_LIMIT = 20;
+const PAGE_SIZE = 50;
+const MAX_PAGES = 8;
 const SNIPPET_MAX_CHARS = 400;
 const EXCLUDED = new Set(['SPAM', 'TRASH', 'DRAFT', 'SENT']);
 
@@ -33,30 +37,43 @@ export class NylasTriageSource implements TriageSource {
     grantId: string,
     private readonly fetchImpl: typeof fetch = fetch,
     region: NylasRegion = 'us',
+    /** Unix seconds. Mail received before this is never triaged. */
+    private readonly since: number = 0,
   ) {
     this.baseUrl = `${NYLAS_REGIONS[region]}/v3/grants/${encodeURIComponent(grantId)}`;
   }
 
-  async listUntagged(): Promise<TriageCandidate[]> {
+  async listUntagged(isKnown?: (messageId: string) => Promise<boolean>): Promise<TriageCandidate[]> {
     const folders = await this.request<NylasList<NylasFolder>>('GET', '/folders');
     const nameById = new Map((folders.data ?? []).map((f) => [f.id, f.name ?? ''] as const));
-    const query = new URLSearchParams({ in: 'INBOX', unread: 'true', limit: String(LIST_LIMIT) });
-    const messages = await this.request<NylasList<NylasMessage>>('GET', `/messages?${query}`);
 
     const out: TriageCandidate[] = [];
-    for (const m of messages.data ?? []) {
-      const names = (m.folders ?? []).map((id) => nameById.get(id) ?? id);
-      if (names.some((n) => EXCLUDED.has(n.toUpperCase()))) continue;
-      if (names.some((n) => triageGroupOfLabel(n) !== null)) continue; // already tagged (current or earlier label names)
-      out.push({
-        accountId: this.accountId,
-        messageId: m.id,
-        threadId: m.thread_id ?? '',
-        from: m.from?.[0]?.name || m.from?.[0]?.email || '',
-        subject: m.subject ?? '',
-        snippet: (m.snippet ?? '').slice(0, SNIPPET_MAX_CHARS),
-        receivedAt: m.date ?? 0,
-      });
+    let cursor: string | undefined;
+    // Read or unread: every inbox message since `since`. Newest first, so page until enough new mail is found.
+    for (let page = 0; page < MAX_PAGES && out.length < LIST_LIMIT; page += 1) {
+      const query = new URLSearchParams({ in: 'INBOX', limit: String(PAGE_SIZE) });
+      if (this.since > 0) query.set('received_after', String(this.since));
+      if (cursor) query.set('page_token', cursor);
+      const messages = await this.request<NylasList<NylasMessage>>('GET', `/messages?${query}`);
+
+      for (const m of messages.data ?? []) {
+        const names = (m.folders ?? []).map((id) => nameById.get(id) ?? id);
+        if (names.some((n) => EXCLUDED.has(n.toUpperCase()))) continue;
+        if (names.some((n) => triageGroupOfLabel(n) !== null)) continue; // already tagged (current or earlier label names)
+        if (isKnown && (await isKnown(m.id))) continue; // handled before; "none" mail stays untagged but is not asked about again
+        out.push({
+          accountId: this.accountId,
+          messageId: m.id,
+          threadId: m.thread_id ?? '',
+          from: m.from?.[0]?.name || m.from?.[0]?.email || '',
+          subject: m.subject ?? '',
+          snippet: (m.snippet ?? '').slice(0, SNIPPET_MAX_CHARS),
+          receivedAt: m.date ?? 0,
+          unread: m.unread !== false,
+        });
+      }
+      cursor = messages.next_cursor;
+      if (!cursor) break;
     }
     return out;
   }

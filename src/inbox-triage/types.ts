@@ -50,7 +50,7 @@ export function triageGroupOfLabel(name: string): TriageGroup | null {
   return null;
 }
 
-/** One unread, untagged message the classifier is asked about. Text is untrusted data. */
+/** One untagged message the classifier is asked about. Text is untrusted data. */
 export interface TriageCandidate {
   accountId: string;
   messageId: string;
@@ -61,6 +61,8 @@ export interface TriageCandidate {
   snippet: string;
   /** Unix seconds. */
   receivedAt: number;
+  /** False when the owner has already read it: it is still labelled, but never wakes the phone. Absent = unknown = unread. */
+  unread?: boolean;
 }
 
 export interface TriageVerdict {

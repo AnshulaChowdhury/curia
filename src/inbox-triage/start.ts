@@ -16,19 +16,24 @@ import { PHONE_INBOX_ACCOUNT_IDS } from '../phone-inbox/phone-inbox-service.js';
 import { AgentClassifier } from './agent-classifier.js';
 import { NtfyNotifier } from './ntfy-notifier.js';
 import { NylasTriageSource } from './nylas-triage-source.js';
-import { PersistedSeenStore, type KeyValueStore } from './seen-store.js';
-import { InboxWatcher, type SeenStore, type TriageNotifier } from './watcher.js';
+import { startOfLocalDay } from '../phone-brief/local-time.js';
+import type { PgTriageStore } from './item-store.js';
+import { InboxWatcher, type TriageNotifier } from './watcher.js';
 
 const POLL_INTERVAL_MS = 30_000;
 const CLASSIFY_TIMEOUT_MS = 60_000;
 const DEFAULT_MIN_CONFIDENCE = 0.6;
+/** Triage covers mail received on or after this local date, read or not (the owner's decision, 2026-11-02). */
+export const TRIAGE_FROM_DATE = '2026-11-01';
 
 export interface InboxTriageDeps {
   bus: EventBus;
   logger: Logger;
   secrets: Pick<SecretsService, 'get'>;
-  /** Durable store for classified ids. Without one, ids are remembered only until restart. */
-  store: KeyValueStore | undefined;
+  /** Remembers classified ids across restarts and keeps the unsorted mail for review from the phone. */
+  items: PgTriageStore;
+  /** IANA timezone that decides where TRIAGE_FROM_DATE starts. */
+  timezone: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -47,7 +52,7 @@ export const TRIAGE_SECRET_KEYS = {
 
 /** Returns the running watcher, or null when triage is off or not fully configured. */
 export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningInboxTriage | null> {
-  const { bus, logger, secrets, store, fetchImpl = fetch } = deps;
+  const { bus, logger, secrets, items, timezone, fetchImpl = fetch } = deps;
   const read = async (key: string): Promise<string | null> => (await secrets.get(key))?.trim() || null;
 
   if ((await read('inbox_triage_enabled'))?.toLowerCase() !== 'true') {
@@ -63,10 +68,11 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
   }
   const region = regionSetting as NylasRegion; // checked against NYLAS_REGIONS above
 
+  const since = Math.floor(startOfLocalDay(TRIAGE_FROM_DATE, timezone) / 1000);
   const sources: NylasTriageSource[] = [];
   for (const id of PHONE_INBOX_ACCOUNT_IDS) {
     const grant = await read(`phone_inbox_grant_${id.replace('-', '_')}`);
-    if (grant) sources.push(new NylasTriageSource(id, apiKey, grant, fetchImpl, region));
+    if (grant) sources.push(new NylasTriageSource(id, apiKey, grant, fetchImpl, region, since));
   }
   if (sources.length === 0) {
     logger.warn('inbox-triage: off (no phone_inbox_grant_* secret is set)');
@@ -85,20 +91,12 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
     ? minConfidenceRaw
     : DEFAULT_MIN_CONFIDENCE;
 
-  let seen: SeenStore;
-  if (store) {
-    seen = new PersistedSeenStore(store);
-  } else {
-    logger.warn('inbox-triage: no config store, so classified ids are forgotten on restart');
-    const ids = new Set<string>();
-    seen = { has: async (k) => ids.has(k), add: async (k) => { ids.add(k); } };
-  }
-
   const watcher = new InboxWatcher({
     sources,
     classifier: new AgentClassifier({ bus, logger, minConfidence, timeoutMs: CLASSIFY_TIMEOUT_MS }),
     notifier,
-    seen,
+    seen: items,
+    outcomes: items,
     logger,
     intervalMs: POLL_INTERVAL_MS,
   });
@@ -106,4 +104,18 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
   const accounts = sources.map((s) => s.accountId);
   logger.info({ accounts }, 'inbox-triage: started');
   return { stop: () => watcher.stop(), accounts };
+}
+
+/** One mailbox for writing a label from the phone's review cards; null when it has no grant or Nylas is not set up. */
+export async function loadTriageSource(
+  secrets: Pick<SecretsService, 'get'>,
+  accountId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<NylasTriageSource | null> {
+  if (!(PHONE_INBOX_ACCOUNT_IDS as readonly string[]).includes(accountId)) return null;
+  const apiKey = (await secrets.get('nylas_api_key'))?.trim();
+  const regionSetting = (await secrets.get('nylas_region'))?.trim().toLowerCase() || 'us';
+  const grant = (await secrets.get(`phone_inbox_grant_${accountId.replace('-', '_')}`))?.trim();
+  if (!apiKey || !grant || !(regionSetting in NYLAS_REGIONS)) return null;
+  return new NylasTriageSource(accountId, apiKey, grant, fetchImpl, regionSetting as NylasRegion); // region checked above
 }

@@ -4,12 +4,14 @@
 // anywhere is logged and skipped. The 15-minute ceo-inbox sweep still sees the mail, so nothing is lost.
 
 import type { Logger } from '../logger.js';
+import type { OutcomeRecorder, TriageOutcome } from './item-store.js';
 import { isPushGroup, type PushGroup, type TriageCandidate, type TriageGroup, type TriageVerdict } from './types.js';
 
 /** One connected mailbox. Reads untagged unread mail; writes only the triage label (FR-ETW-5). */
 export interface TriageSource {
   readonly accountId: string;
-  listUntagged(): Promise<TriageCandidate[]>;
+  /** Untagged mail in the triage window, read or unread. `isKnown` lets the source skip mail already handled. */
+  listUntagged(isKnown?: (messageId: string) => Promise<boolean>): Promise<TriageCandidate[]>;
   applyLabel(messageId: string, group: TriageGroup): Promise<void>;
 }
 
@@ -32,6 +34,8 @@ export interface InboxWatcherConfig {
   classifier: Classifier;
   notifier: TriageNotifier;
   seen: SeenStore;
+  /** Told how each message ended, so unsorted mail can be reviewed from the phone. Optional. */
+  outcomes?: OutcomeRecorder;
   logger: Logger;
   intervalMs: number;
   /** Most messages classified per tick, per account. Bounds cost if a backlog appears. */
@@ -77,7 +81,7 @@ export class InboxWatcher {
     const { logger, seen, classifier, notifier } = this.config;
     let candidates: TriageCandidate[];
     try {
-      candidates = await source.listUntagged();
+      candidates = await source.listUntagged((messageId) => seen.has(`${source.accountId}:${messageId}`));
     } catch (err) {
       // FR-ETW-3: retry on the next tick; the sweep covers the gap.
       logger.warn({ err, accountId: source.accountId }, 'inbox-triage: could not list new mail');
@@ -100,16 +104,22 @@ export class InboxWatcher {
         verdict = await classifier.classify(candidate);
       } catch (err) {
         logger.warn({ err, accountId: candidate.accountId, messageId: candidate.messageId }, 'inbox-triage: classification failed');
+        await this.report(candidate, 'failed');
         continue;
       }
-      if (verdict.group === 'none') continue;
+      if (verdict.group === 'none') {
+        await this.report(candidate, 'none');
+        continue;
+      }
 
       try {
         await source.applyLabel(candidate.messageId, verdict.group);
       } catch (err) {
         logger.warn({ err, accountId: candidate.accountId, messageId: candidate.messageId }, 'inbox-triage: could not apply the label');
+        await this.report(candidate, 'failed');
         continue;
       }
+      await this.report(candidate, 'tagged');
       logger.info(
         { accountId: candidate.accountId, group: verdict.group, confidence: verdict.confidence, unsure: verdict.unsure },
         'inbox-triage: message tagged',
@@ -117,12 +127,25 @@ export class InboxWatcher {
 
       // Newsletter and spam are labelled and marked read, never pushed.
       if (!isPushGroup(verdict.group)) continue;
+      // Mail the owner already read is labelled but never wakes the phone.
+      if (candidate.unread === false) continue;
       try {
         await notifier.notify(verdict.group);
       } catch (err) {
         // FR-ETP-3: a push failure never blocks tagging.
         logger.warn({ err, group: verdict.group }, 'inbox-triage: push failed');
       }
+    }
+  }
+
+  /** Tells the recorder how a message ended. A recorder failure is logged and never stops the pass. */
+  private async report(candidate: TriageCandidate, outcome: TriageOutcome): Promise<void> {
+    const { outcomes, logger } = this.config;
+    if (!outcomes) return;
+    try {
+      await outcomes.record(candidate, outcome);
+    } catch (err) {
+      logger.warn({ err, accountId: candidate.accountId, messageId: candidate.messageId, outcome }, 'inbox-triage: could not record the outcome');
     }
   }
 }

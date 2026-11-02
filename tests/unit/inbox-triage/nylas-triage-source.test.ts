@@ -123,4 +123,34 @@ describe('NylasTriageSource', () => {
     await expect(new NylasTriageSource('moonray', 'k', 'g', fetchImpl).listUntagged()).rejects.toThrow(/500/);
     await expect(new NylasTriageSource('moonray', 'k', 'g', fetchImpl).listUntagged()).rejects.not.toThrow(/secret/);
   });
+
+  it('includes mail the owner already read, marks it, and starts at the cut-off date', async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      urls.push(url);
+      if (url.includes('/folders')) return json({ data: [{ id: 'INBOX', name: 'INBOX' }] });
+      return json({ data: [{ id: 'r', folders: ['INBOX'], unread: false }, { id: 'u', folders: ['INBOX'], unread: true }] });
+    }) as unknown as typeof fetch;
+    const out = await new NylasTriageSource('moonray', 'k', 'g', fetchImpl, 'us', 1_793_505_600).listUntagged();
+    expect(out.map((c) => [c.messageId, c.unread])).toEqual([['r', false], ['u', true]]);
+    const listing = urls.find((u) => u.includes('/messages'))!;
+    expect(listing).toContain('received_after=1793505600');
+    expect(listing).not.toContain('unread=');
+  });
+
+  it('reads further pages when the newest mail is all handled, and skips known ids', async () => {
+    const pages = [
+      { data: [{ id: 'k1', folders: ['INBOX'] }, { id: 'k2', folders: ['INBOX'] }], next_cursor: 'p2' },
+      { data: [{ id: 'new', folders: ['INBOX'] }] },
+    ];
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes('/folders')) return json({ data: [{ id: 'INBOX', name: 'INBOX' }] });
+      urls.push(url);
+      return json(pages.shift());
+    }) as unknown as typeof fetch;
+    const out = await new NylasTriageSource('moonray', 'k', 'g', fetchImpl).listUntagged(async (id) => id.startsWith('k'));
+    expect(out.map((c) => c.messageId)).toEqual(['new']);
+    expect(urls[1]).toContain('page_token=p2');
+  });
 });

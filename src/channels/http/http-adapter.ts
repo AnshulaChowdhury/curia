@@ -63,6 +63,9 @@ import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
+import { phoneBriefRoutes } from './routes/phone-brief.js';
+import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { loadTriageSource } from '../../inbox-triage/start.js';
 import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
@@ -148,6 +151,8 @@ export interface HttpAdapterConfig {
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
   /** Backs GET /phone/brief, the Command Hub morning brief. Mounted only when the secrets vault is also available. */
   phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
+  /** Unsorted mail for the phone's review cards (GET/POST /phone/triage/review). */
+  triageItems?: import('../../inbox-triage/item-store.js').PgTriageStore;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
@@ -707,6 +712,23 @@ export class HttpAdapter implements Channel {
         getToken: () => secrets.get('phone_inbox_token'),
         batches: new BatchStore(pool),
       });
+      // The morning brief. Same token as /phone/inbox.
+      if (this.config.phoneBrief) {
+        await this.app.register(phoneBriefRoutes, {
+          logger,
+          getToken: () => secrets.get('phone_inbox_token'),
+          service: this.config.phoneBrief,
+        });
+      }
+      // Mail triage could not sort, as cards the owner can categorise from the phone.
+      if (this.config.triageItems) {
+        await this.app.register(phoneTriageRoutes, {
+          logger,
+          getToken: () => secrets.get('phone_inbox_token'),
+          store: this.config.triageItems,
+          getSource: (account) => loadTriageSource(secrets, account),
+        });
+      }
     }
     // Telnyx SMS webhook — always mounted; SmsAdapter installs the handler on start.
     // Authenticates via Ed25519 (bearer-exempt above). Returns 503 when SMS is not started.

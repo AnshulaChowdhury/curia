@@ -68,6 +68,8 @@ import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
 import { InboxTriageController } from './inbox-triage/controller.js';
+import { PgTriageStore } from './inbox-triage/item-store.js';
+import { UnsortedBriefSource } from './phone-brief/unsorted-source.js';
 import { PgBriefStore } from './phone-brief/brief-store.js';
 import { PhoneBriefService } from './phone-brief/brief-service.js';
 import { PhoneBriefScheduler } from './phone-brief/scheduler.js';
@@ -3195,11 +3197,13 @@ async function main(): Promise<void> {
 
   // Real-time inbox triage: off unless the vault says `inbox_triage_enabled` = "true".
   // Started after the scheduler so the email-classifier agent's tasks have a runtime to run in.
+  const triageItems = new PgTriageStore(pool);
   const inboxTriage = new InboxTriageController({
     bus,
     logger,
     secrets: secretsService,
-    store: entityMemory ? new ConfigStore(entityMemory, logger) : undefined,
+    items: triageItems,
+    timezone: config.timezone,
   });
   try {
     await inboxTriage.reload();
@@ -3216,6 +3220,7 @@ async function main(): Promise<void> {
     summarizer: new InfraLlmSummarizer(infraLlmService.scoped({ toolName: 'phone-brief' })),
     logger,
   }));
+  phoneBrief.registerSource(new UnsortedBriefSource(triageItems));
   const phoneBriefScheduler = new PhoneBriefScheduler(phoneBrief, logger, config.timezone);
   phoneBriefScheduler.start();
 
@@ -3464,6 +3469,7 @@ async function main(): Promise<void> {
     mcpRegistryService,
     secretsService,
     inboxTriage,
+    triageItems,
     phoneBrief,
     booksMonitor,
     secretCaptureService,
