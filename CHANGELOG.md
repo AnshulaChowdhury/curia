@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Accounting section for the Morning Brief** — cash in bank, liabilities, accounts receivable, RBC transactions and how many are matched in QuickBooks, plus `GET /phone/books/review` with cards for the transactions that need the owner (phone token, read-only).
 - **Upload bank files on the Books page** — drop the week's .qbo/.ofx/.csv files on the Books page; the books run takes them from Curia (no Google Drive needed). Files are checked, stored until recorded, then their contents are deleted.
 - **Urgent test push** — Inbox triage settings gets a button that sends the same push urgent mail does.
 - **`GET /phone/message`** — plain text of one email for the phone's email page; shares the `/phone/inbox` token.

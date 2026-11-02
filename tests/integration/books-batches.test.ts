@@ -158,4 +158,27 @@ describeIf('books batches', () => {
     await store.editRow(id, 'r1', { payee: evil.slice(0, 150) });
     expect((await pool.query('SELECT count(*)::int AS n FROM books_batches')).rows[0].n).toBeGreaterThan(0);
   });
+
+  it('Morning Brief: counts the newest batch, and finds the rows that need the owner', async () => {
+    const id = newBatch();
+    await store.upsertBatch(id, {}, [
+      row('a', { qbo_status: 'already booked' }), row('b', { qbo_status: 'MISSING' }), row('c', { qbo_status: 'MISSING' }),
+      row('d', { qbo_status: 'TIMING' }), row('e', { qbo_status: 'MISSING', category: undefined, description: 'MYSTERY VENDOR', date: '2026-12-31' }),
+    ]);
+    const before = await store.reviewCount();
+    // the newest batch is the one just pushed: 5 rows, 2 matched (already booked + timing)
+    expect(await store.latestBatchCounts()).toMatchObject({ batchId: id, total: 5, matched: 2 });
+    await store.decide(id, ['b', 'c'], 'approved');
+    await store.recordResults(id, { b: { status: 'posted', qbo_id: '9', entity: 'Purchase' }, c: { status: 'failed', message: 'Account is missing' } });
+    // b is posted (counts as matched, leaves review), c failed (back with the owner), a, d, e are undecided
+    expect(await store.latestBatchCounts()).toMatchObject({ total: 5, matched: 3 });
+    const cards = await store.reviewCards(200);
+    const mine = cards.filter(c => c.batchId === id.slice(0, 8));
+    expect(mine.map(c => c.id).sort()).toEqual(['a', 'c', 'd', 'e']);
+    expect(mine[0]!.id).toBe('e');                                                 // newest transaction date first
+    expect(mine.find(c => c.id === 'c')!.reasons).toEqual(['Could not be posted: Account is missing']);
+    expect(mine.find(c => c.id === 'e')!.reasons).toEqual(['Needs a category']);
+    expect(await store.reviewCount()).toBe(before - 1);                             // b was posted and left review; c failed and is still counted
+    expect(await store.reviewCards(1)).toHaveLength(1);
+  });
 });

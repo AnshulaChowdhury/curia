@@ -37,6 +37,30 @@ export interface BatchRow {
   result: RowResult | null;
 }
 
+/** Latest bank files: how many transactions, and how many are matched to an entry already in QuickBooks. */
+export interface LatestBatchCounts {
+  batchId: string;
+  createdAt: string;
+  total: number;
+  matched: number;
+}
+
+/** One transaction waiting for the owner, shaped for the phone. Text comes from a bank file and is untrusted. */
+export interface ReviewCard {
+  id: string;
+  batchId: string;
+  date: string;
+  description: string;
+  amount: string;
+  account: string;
+  category: string | null;
+  categorySource: string | null;
+  taxCode: string | null;
+  location: string | null;
+  /** Why it needs the owner, in plain words (at most three). */
+  reasons: string[];
+}
+
 export interface BatchSummary {
   batch_id: string;
   created_at: string;
@@ -143,6 +167,45 @@ const toBatchRow = (r: RowRecord): BatchRow => ({
 
 const isPosted = (r: { result: RowResult | null }): boolean => r.result?.status === 'posted';
 
+const REVIEW_WHERE_COUNT = `SELECT count(*) AS n FROM books_batch_rows r
+  WHERE r.decision = 'pending' AND (r.result IS NULL OR r.result->>'status' IN ('failed', 'manual'))`;
+
+const text = (v: unknown, max: number): string | null => (typeof v === 'string' && v.trim() ? v.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max) : null);
+
+/** Account ids like "rbc-chequing-4530" become words with no digits. */
+function accountWords(id: unknown): string {
+  const words = String(id ?? '').split(/[-_\s]+/).filter(w => w && !/\d/.test(w)).map(w => (w.toLowerCase() === 'rbc' ? 'RBC' : w.toLowerCase()));
+  return words.length > 0 ? words.join(' ') : 'bank';
+}
+
+export function toReviewCard(batchId: string, rowId: string, row: Record<string, unknown>, result: RowResult | null): ReviewCard {
+  const reasons: string[] = [];
+  if (result && (result.status === 'failed' || result.status === 'manual')) {
+    reasons.push(result.status === 'manual' ? `Has to be entered by hand${result.message ? `: ${result.message}` : ''}` : `Could not be posted${result.message ? `: ${result.message}` : ''}`);
+  }
+  const flags = Array.isArray(row['flags']) ? row['flags'] : [];
+  for (const f of flags) {
+    const m = f && typeof f === 'object' ? text((f as Record<string, unknown>)['message'], 160) : null;
+    if (m) reasons.push(m);
+  }
+  const category = text(row['category'], 120);
+  if (!category && reasons.length === 0) reasons.push('Needs a category');
+  if (category && reasons.length === 0) reasons.push('Waiting for your approval');
+  return {
+    id: rowId,
+    batchId: batchId.slice(0, 8),
+    date: text(row['date'], 10) ?? '',
+    description: text(row['description'], 120) ?? '',
+    amount: text(row['amount'], 20) ?? '',
+    account: accountWords(row['account']),
+    category,
+    categorySource: text(row['category_source'], 40),
+    taxCode: text(row['tax_code'], 40),
+    location: text(row['location'], 60),
+    reasons: reasons.slice(0, 3).map(r => r.slice(0, 200)),
+  };
+}
+
 export class BatchStore {
   constructor(private readonly pool: DbPool) {}
 
@@ -191,6 +254,38 @@ export class BatchStore {
       rows: Number(r.total), pending: Number(r.pending), approved: Number(r.approved), skipped: Number(r.skipped),
       posted: Number(r.posted), failed: Number(r.failed), manual: Number(r.manual),
     }));
+  }
+
+  /** Counts for the newest batch (the latest bank files). Null when there is no batch yet. */
+  async latestBatchCounts(): Promise<LatestBatchCounts | null> {
+    const { rows } = await this.pool.query<{ batch_id: string; created_at: Date; total: string; matched: string }>(
+      `SELECT b.batch_id, b.created_at,
+              count(r.row_id) AS total,
+              count(*) FILTER (WHERE r.data->>'qbo_status' IN ('already booked', 'TIMING') OR r.result->>'status' = 'posted') AS matched
+         FROM books_batches b JOIN books_batch_rows r USING (batch_id)
+        WHERE b.batch_id = (SELECT batch_id FROM books_batches ORDER BY created_at DESC LIMIT 1)
+        GROUP BY b.batch_id, b.created_at`,
+    );
+    const r = rows[0];
+    return r ? { batchId: r.batch_id, createdAt: r.created_at.toISOString(), total: Number(r.total), matched: Number(r.matched) } : null;
+  }
+
+  /** Rows waiting for the owner: undecided, or approved but the books agent could not post them. */
+  async reviewCount(): Promise<number> {
+    const { rows } = await this.pool.query<{ n: string }>(REVIEW_WHERE_COUNT);
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  /** The cards for the phone's "transactions to review" page, newest transaction first. */
+  async reviewCards(limit = 50): Promise<ReviewCard[]> {
+    const { rows } = await this.pool.query<{ batch_id: string; row_id: string; data: Record<string, unknown>; edits: Record<string, string>; result: RowResult | null }>(
+      `SELECT r.batch_id, r.row_id, r.data, r.edits, r.result
+         FROM books_batch_rows r
+        WHERE r.decision = 'pending' AND (r.result IS NULL OR r.result->>'status' IN ('failed', 'manual'))
+        ORDER BY r.data->>'date' DESC, r.row_id LIMIT $1`,
+      [Math.max(1, Math.min(limit, 200))],
+    );
+    return rows.map(r => toReviewCard(r.batch_id, r.row_id, { ...r.data, ...r.edits }, r.result));
   }
 
   async getBatch(batchId: string): Promise<{ batch_id: string; created_at: string; status: string; report: Record<string, unknown>; rows: BatchRow[] }> {
