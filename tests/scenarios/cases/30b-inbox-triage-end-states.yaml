@@ -1,5 +1,5 @@
 # ceo-inbox, scheduled triage (#2025). Rules: agents/ceo-inbox.yaml, "Step 4: For each
-# message, triage" (4e's categories and 🚨 Urgent's escalation format, 4f "When in doubt",
+# message, triage" (4e's categories and Urgent's escalation format, 4f "When in doubt",
 # 4h "Execute final actions"), "Step 5: Settle each message's end-state" (archived or
 # marked read), the opening "you only create drafts, archive messages, apply labels, and
 # escalate urgent items" paragraph, and "Shadow drafting (during triage only)".
@@ -15,7 +15,7 @@ description: >
   principal's father is recovering from surgery. ceo-inbox escalates the term sheet to the
   coordinator on a bullpen thread in its urgent send-request format (Signal, immediate)
   and leaves it in the inbox marked read; archives the newsletter; and marks the personal
-  note read with the 📌 Seen label, leaving it in the inbox. It drafts no replies.
+  note read with the FYI, no action needed label, leaving it in the inbox. It drafts no replies.
 tags: [specialist-ceo-inbox, ceo-inbox, triage]
 agent: ceo-inbox
 timeout_seconds: 420
@@ -194,11 +194,11 @@ expected_behaviors:
       not_called: [ceo-inbox-draft-reply, ceo-inbox-draft-compose]
   - id: personal_labelled_seen
     weight: important
-    description: Labels the personal note 📌 Seen.
+    description: Labels the personal note FYI, no action needed.
     check:
       called: ceo-inbox-label
       with: { message_id: msg-30b-personal }
-      contains: { labels: Seen }
+      contains: { labels: FYI }
   - id: urgent_starred
     weight: nice-to-have
     description: Stars the urgent message.

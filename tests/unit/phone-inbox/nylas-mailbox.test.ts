@@ -15,7 +15,7 @@ describe('NylasMailbox', () => {
         return jsonResponse({
           data: [
             { id: 'INBOX', name: 'INBOX', unread_count: 4210 },
-            { id: 'Label_9', name: '🚨 Urgent' },
+            { id: 'Label_9', name: 'Urgent' },
             { id: 'Label_7', name: 'Receipts' },
           ],
         });
@@ -38,7 +38,7 @@ describe('NylasMailbox', () => {
 
     expect(snapshot.unreadCount).toBe(4210);
     expect(snapshot.messages).toEqual([
-      { id: 'm1', threadId: 't1', subject: 'Hi', fromName: 'Dana', fromEmail: 'dana@example.com', date: 1000, folderNames: ['INBOX', '🚨 Urgent'] },
+      { id: 'm1', threadId: 't1', subject: 'Hi', fromName: 'Dana', fromEmail: 'dana@example.com', date: 1000, folderNames: ['INBOX', 'Urgent'] },
     ]);
     // Bodies and snippets are never carried through, even if Nylas sends them.
     expect(JSON.stringify(snapshot)).not.toContain('SECRET');

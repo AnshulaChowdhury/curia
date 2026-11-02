@@ -3,7 +3,7 @@
 # agents/ceo-inbox.yaml, "Branch A — Calendar consult reply", steps 0 (load the thread),
 # 1 (reload the email), 5a-c (voice profile, memory-query anchored on sender and subject,
 # date-resolve) and 6 (draft with the slot strings verbatim as a counter-proposal, no
-# "pending your calendar" qualifier, ✍️ Drafted folder, archive).
+# "pending your calendar" qualifier, Needs a reply folder, archive).
 #
 # ceo-inbox parked Alice's email behind a consult; calendar's CONSULT REPLY on that thread
 # wakes it. Memory holds the principal's Calendly link for external contacts.
@@ -14,7 +14,7 @@ description: >
   held slots. Memory holds the principal's Calendly link, which they offer external
   contacts as an alternative. ceo-inbox recalls it, then drafts the reply with both slot
   strings exactly as calendar wrote them plus the link, moves the email from
-  ⏳ In Progress to ✍️ Drafted and archives it.
+  ⏳ In Progress to Needs a reply and archives it.
 tags: [specialist-ceo-inbox, ceo-inbox, resume-mode, scheduling, memory-recall]
 agent: ceo-inbox
 # On demand until #2126: some runs, on main as on the branch, repeat a bullpen reply with no
@@ -161,10 +161,10 @@ expected_behaviors:
       contains: { body: pending your calendar }
   - id: marked_drafted
     weight: important
-    description: Moves the email to ✍️ Drafted with ceo-inbox-update-folders.
+    description: Moves the email to Needs a reply with ceo-inbox-update-folders.
     check:
       called: ceo-inbox-update-folders
-      contains: { add_folders: Drafted }
+      contains: { add_folders: Needs a reply }
   - id: archived
     weight: important
     description: Archives the email once the draft exists.

@@ -3,7 +3,7 @@
 # src/agents/prompts/ceo-inbox-wake-guidance.ts after P2): when the consult thread holds a
 # CONSULT REPLY and no draft exists yet, run the consult-reply protocol (Branch A) with that
 # reply instead of the blind fallback: slot strings verbatim, no "pending your calendar"
-# qualifier, ✍️ Drafted, archive, and close the task.
+# qualifier, Needs a reply, archive, and close the task.
 #
 # The task's description (source_message_id, thread_id, consult_kind) is not in the wake
 # body; ceo-inbox reads it with task-list, stubbed here, and the progress note repeats it.
@@ -15,7 +15,7 @@ description: >
   specialist's CONSULT REPLY with two held slots, which never woke ceo-inbox, and there is
   no draft yet. ceo-inbox drafts the reply with both slot strings exactly as calendar wrote
   them (no "pending your calendar" qualifier, since holds are placed), moves the email to
-  ✍️ Drafted, archives it, and completes the task.
+  Needs a reply, archives it, and completes the task.
 tags: [specialist-ceo-inbox, ceo-inbox, task-wake, scheduling, consult-timeout, resume-mode]
 agent: ceo-inbox
 timeout_seconds: 300

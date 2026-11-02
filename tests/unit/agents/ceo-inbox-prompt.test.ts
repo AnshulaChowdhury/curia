@@ -49,7 +49,7 @@ function extractScheduledWakeSection(_prompt: string): string {
 
 function extractSchedulingConsultSection(prompt: string): string {
   const start = prompt.indexOf('### Scheduling-specific drafting rules');
-  const end = prompt.indexOf('**📌 Seen**');
+  const end = prompt.indexOf('**FYI, no action needed**');
   if (start === -1) throw new Error('Scheduling-specific drafting rules not found');
   if (end === -1 || end <= start)
     throw new Error('Scheduling section end not found after scheduling rules');
@@ -419,8 +419,10 @@ describe('ceo-inbox formal invite prompt — RSVP consult contract', () => {
     //          rules are edited as sections of a /shared/ document (#2339).
     // 0.24.1 = decision tagging reads `enabled` from a richer value, and toggling it keeps
     //          the other fields (#2339 follow-up: prod's value carries needs_decision).
+    // 0.25.0 = triage labels renamed: Urgent, Needs a reply, FYI, no action needed (was the
+    //          emoji-prefixed Urgent, Drafted, Seen).
     const config = loadAgentConfig(path.join(agentsDir, 'ceo-inbox.yaml'));
-    expect(config.version).toBe('0.24.1');
+    expect(config.version).toBe('0.25.0');
   });
 });
 

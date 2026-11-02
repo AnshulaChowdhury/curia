@@ -25,7 +25,7 @@ seed:
         ## Board mail
 
         - When: From the board (anyone @board.example.test)
-        - Do: Label BOARD and classify as 🚨 Urgent
+        - Do: Label BOARD and classify as Urgent
         - Status: active
 
         ## Substack newsletters

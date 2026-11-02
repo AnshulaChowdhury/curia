@@ -69,8 +69,8 @@ describe('buildDescription', () => {
   });
 
   it('appends the labels applied by a label tool', () => {
-    expect(buildDescription('ceo-inbox-label', { message_id: 'm-1', labels: ['🚨 Urgent', 'BOARD'] }))
-      .toBe('Label an email: 🚨 Urgent, BOARD');
+    expect(buildDescription('ceo-inbox-label', { message_id: 'm-1', labels: ['Urgent', 'BOARD'] }))
+      .toBe('Label an email: Urgent, BOARD');
     expect(buildDescription('email-label', { message_id: 'm-1', label: 'Receipts' }))
       .toBe('Label an email: Receipts');
   });

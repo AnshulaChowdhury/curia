@@ -89,7 +89,7 @@ export class CeoInboxListHandler implements ToolHandler {
       // and uses `has_more` to decide whether to schedule a self-wake. There
       // is no server-side watermark: the unread set IS the not-yet-triaged
       // set, because every triaged message is either archived
-      // (Cleared/Handled/Drafted) or marked read (Seen/Urgent/Stuck) and thus
+      // (Cleared/Handled/Needs a reply) or marked read (FYI/Urgent/Stuck) and thus
       // drops out of the unread-INBOX query for the next batch.
       //
       // Curia-self mail is removed after the fetch. When that empties a page,

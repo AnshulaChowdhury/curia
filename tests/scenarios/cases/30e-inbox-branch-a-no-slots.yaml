@@ -2,7 +2,7 @@
 # tests/smoke/cases/ceo-inbox-branch-a-no-slots.yaml (#1977). Rule: agents/ceo-inbox.yaml,
 # "Branch A — Calendar consult reply", step 7: recall (5a-c), draft with the `Nearest:`
 # slot strings verbatim and say in plain language that they fall outside the requested
-# window, ✍️ Drafted folder, archive.
+# window, Needs a reply folder, archive.
 name: inbox branch A no_slots offers nearest slots outside the window
 description: >
   ceo-inbox parked Diana Park's email asking for an intro call on two specific days next
@@ -153,10 +153,10 @@ expected_behaviors:
       for video over phone.
   - id: marked_drafted
     weight: important
-    description: Moves the email to ✍️ Drafted with ceo-inbox-update-folders.
+    description: Moves the email to Needs a reply with ceo-inbox-update-folders.
     check:
       called: ceo-inbox-update-folders
-      contains: { add_folders: Drafted }
+      contains: { add_folders: Needs a reply }
 failure_modes:
   - Skips memory-query and drafts without attempting recall
   - Paraphrases the Nearest slot strings instead of using them verbatim

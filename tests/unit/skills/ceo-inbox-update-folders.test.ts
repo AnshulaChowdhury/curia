@@ -95,7 +95,7 @@ const FOLDERS: FolderFixture[] = [
   { id: 'IMPORTANT', name: 'IMPORTANT' },
   { id: 'SPAM', name: 'SPAM' },
   { id: 'Label_43', name: '⏳ In Progress' },
-  { id: 'Label_39', name: '✍️ Drafted' },
+  { id: 'Label_39', name: 'Needs a reply' },
 ];
 
 describe('CeoInboxUpdateFoldersHandler', () => {
@@ -219,12 +219,12 @@ describe('CeoInboxUpdateFoldersHandler', () => {
     const { calls } = mockNylas({ folders: FOLDERS, messageFolders: ['INBOX'] });
 
     const result = await handler.execute(
-      makeCtx({ message_id: 'msg-1', add_folders: ['✍️ Drafted'] }),
+      makeCtx({ message_id: 'msg-1', add_folders: ['Needs a reply'] }),
     );
 
     expect(result.success).toBe(true);
     expect(calls.putFolders).toContain('Label_39');
-    expect(calls.putFolders).not.toContain('✍️ Drafted');
+    expect(calls.putFolders).not.toContain('Needs a reply');
     expect(calls.createdNames).toEqual([]);
   });
 
@@ -247,7 +247,7 @@ describe('CeoInboxUpdateFoldersHandler', () => {
     const result = await handler.execute(
       makeCtx({
         message_id: 'msg-1',
-        add_folders: ['✍️ Drafted'],
+        add_folders: ['Needs a reply'],
         remove_folders: ['⏳ In Progress'],
       }),
     );
@@ -300,7 +300,7 @@ describe('CeoInboxUpdateFoldersHandler', () => {
     });
 
     const result = await handler.execute(
-      makeCtx({ message_id: 'msg-1', add_folders: ['✍️ Drafted'] }),
+      makeCtx({ message_id: 'msg-1', add_folders: ['Needs a reply'] }),
     );
 
     expect(result.success).toBe(false);

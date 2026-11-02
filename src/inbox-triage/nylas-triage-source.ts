@@ -1,11 +1,11 @@
 // nylas-triage-source.ts — one Nylas mailbox as a TriageSource.
 //
-// Reads unread inbox mail that carries no triage label, with a short preview but never a body, and writes
-// exactly one thing: the triage label (FR-ETW-5). Uses fetch directly, like src/phone-inbox/nylas-mailbox.ts.
+// Reads unread inbox mail that carries no triage label, with a short preview but never a body, and writes only
+// the triage label, plus "read" for newsletter and spam mail (FR-ETW-5). Uses fetch directly, like
+// src/phone-inbox/nylas-mailbox.ts.
 
-import { groupOfLabel } from '../phone-inbox/phone-inbox-service.js';
 import { NYLAS_REGIONS, type NylasRegion } from '../phone-inbox/nylas-mailbox.js';
-import { TRIAGE_LABELS, type TriageCandidate, type TriageGroup } from './types.js';
+import { TRIAGE_LABELS, marksRead, triageGroupOfLabel, type TriageCandidate, type TriageGroup } from './types.js';
 import type { TriageSource } from './watcher.js';
 
 interface NylasFolder { id: string; name?: string }
@@ -47,7 +47,7 @@ export class NylasTriageSource implements TriageSource {
     for (const m of messages.data ?? []) {
       const names = (m.folders ?? []).map((id) => nameById.get(id) ?? id);
       if (names.some((n) => EXCLUDED.has(n.toUpperCase()))) continue;
-      if (names.some((n) => groupOfLabel(n) !== null)) continue; // already tagged
+      if (names.some((n) => triageGroupOfLabel(n) !== null)) continue; // already tagged (current or earlier label names)
       out.push({
         accountId: this.accountId,
         messageId: m.id,
@@ -63,7 +63,10 @@ export class NylasTriageSource implements TriageSource {
 
   async applyLabel(messageId: string, group: TriageGroup): Promise<void> {
     const folders = await this.request<NylasList<NylasFolder>>('GET', '/folders');
-    const existing = (folders.data ?? []).find((f) => groupOfLabel(f.name ?? '') === group);
+    // Reuse a label with exactly the current name (any case); an earlier-named label ("✍️ Drafted") is not reused,
+    // so the rename takes effect. The bare system folder "SPAM" can never match: the label is "Likely spam".
+    const wanted = TRIAGE_LABELS[group].toLowerCase();
+    const existing = (folders.data ?? []).find((f) => (f.name ?? '').trim().toLowerCase() === wanted);
     const labelId = existing
       ? existing.id
       : (await this.request<{ data: NylasFolder }>('POST', '/folders', { name: TRIAGE_LABELS[group] })).data.id;
@@ -71,8 +74,12 @@ export class NylasTriageSource implements TriageSource {
     // A message's folders are replaced as a whole, so keep the ones it already has.
     const message = await this.request<{ data: NylasMessage }>('GET', `/messages/${encodeURIComponent(messageId)}`);
     const current = message.data.folders ?? [];
-    if (current.includes(labelId)) return;
-    await this.request('PUT', `/messages/${encodeURIComponent(messageId)}`, { folders: [...current, labelId] });
+    const update: { folders?: string[]; unread?: boolean } = {};
+    if (!current.includes(labelId)) update.folders = [...current, labelId];
+    // Newsletter and spam leave the unread count; the mail stays in the inbox.
+    if (marksRead(group)) update.unread = false;
+    if (Object.keys(update).length === 0) return;
+    await this.request('PUT', `/messages/${encodeURIComponent(messageId)}`, update);
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

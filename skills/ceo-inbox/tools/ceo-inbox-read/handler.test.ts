@@ -87,14 +87,14 @@ describe('CeoInboxReadHandler', () => {
         }))
         .mockResolvedValueOnce(jsonResponse([
           { id: 'SPAM', name: 'SPAM' },
-          { id: 'Label_39', name: '✍️ Drafted' },
+          { id: 'Label_39', name: 'Needs a reply' },
         ]));
 
       const result = await handler.execute(buildCtx({ message_id: 'm1' }));
 
       expect(result.success).toBe(true);
       const data = (result as { data: { labels: string[] } }).data;
-      expect(data.labels).toEqual(['UNREAD', '✍️ Drafted']);
+      expect(data.labels).toEqual(['UNREAD', 'Needs a reply']);
       const folderUrl = new URL(mockFetch.mock.calls[1]![0] as string);
       expect(folderUrl.pathname.endsWith('/folders')).toBe(true);
     });
@@ -106,13 +106,13 @@ describe('CeoInboxReadHandler', () => {
       };
       mockFetch.mockImplementation(async (url: unknown) =>
         new URL(String(url)).pathname.endsWith('/folders')
-          ? jsonResponse([{ id: 'Label_39', name: '✍️ Drafted' }])
+          ? jsonResponse([{ id: 'Label_39', name: 'Needs a reply' }])
           : jsonResponse(message),
       );
 
       for (const id of ['m1', 'm2', 'm3']) {
         const result = await handler.execute(buildCtx({ message_id: id }));
-        expect((result as { data: { labels: string[] } }).data.labels).toEqual(['✍️ Drafted']);
+        expect((result as { data: { labels: string[] } }).data.labels).toEqual(['Needs a reply']);
       }
 
       const folderCalls = mockFetch.mock.calls.filter(([url]: unknown[]) => new URL(String(url)).pathname.endsWith('/folders'));

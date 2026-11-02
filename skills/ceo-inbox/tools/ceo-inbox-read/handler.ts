@@ -100,7 +100,7 @@ export class CeoInboxReadHandler implements ToolHandler {
 }
 
 // Gmail user labels come back as ids (`Label_39`). Map them to the folder
-// display name (`✍️ Drafted`) so a later run can see its own triage. An id
+// display name (`Needs a reply`) so a later run can see its own triage. An id
 // with no folder name (system tokens such as UNREAD) is returned unchanged.
 // A failed lookup must not fail the read — the body is already in hand.
 async function resolveLabelNames(

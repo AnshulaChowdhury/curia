@@ -4,7 +4,7 @@
 // anywhere is logged and skipped. The 15-minute ceo-inbox sweep still sees the mail, so nothing is lost.
 
 import type { Logger } from '../logger.js';
-import type { TriageCandidate, TriageGroup, TriageVerdict } from './types.js';
+import { isPushGroup, type PushGroup, type TriageCandidate, type TriageGroup, type TriageVerdict } from './types.js';
 
 /** One connected mailbox. Reads untagged unread mail; writes only the triage label (FR-ETW-5). */
 export interface TriageSource {
@@ -18,7 +18,7 @@ export interface Classifier {
 }
 
 export interface TriageNotifier {
-  notify(group: TriageGroup): Promise<void>;
+  notify(group: PushGroup): Promise<void>;
 }
 
 /** Remembers which messages were already classified, so a restart or an overlapping poll never repeats one. */
@@ -115,6 +115,8 @@ export class InboxWatcher {
         'inbox-triage: message tagged',
       );
 
+      // Newsletter and spam are labelled and marked read, never pushed.
+      if (!isPushGroup(verdict.group)) continue;
       try {
         await notifier.notify(verdict.group);
       } catch (err) {

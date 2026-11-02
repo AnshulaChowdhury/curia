@@ -1,8 +1,8 @@
 # ceo-inbox, scheduled triage, the reification check (#2025). Rule: agents/ceo-inbox.yaml,
-# step 4e ✍️ Drafted, "Reification check": before drafting a reply with a forward promise,
+# step 4e Needs a reply, "Reification check": before drafting a reply with a forward promise,
 # try to resolve the dependency; if it is unavailable, back the promise with task-create;
 # 3. if task-create fails, draft no interim acknowledgment ("a promise must never be sent
-# without a backing task"), reclassify as 📌 Seen, do not archive.
+# without a backing task"), reclassify as FYI, no action needed, do not archive.
 #
 # The document is nowhere in the inbox and task-create fails. Drafting a reply succeeds
 # (ceo-inbox-mailroom), so an unbacked "I'll get that to you" is available.
@@ -12,7 +12,7 @@ description: >
   contact, asks for the countersigned Ridgeline SOW by Friday. A search of the inbox
   finds no signed copy, and creating a follow-up task fails. ceo-inbox drafts no reply
   (no interim "I'll get that to you" without a backing task), reclassifies the message
-  as 📌 Seen, marks it read and leaves it in the inbox.
+  as FYI, no action needed, marks it read and leaves it in the inbox.
 tags: [specialist-ceo-inbox, ceo-inbox, triage, reification]
 agent: ceo-inbox
 timeout_seconds: 420
@@ -112,7 +112,7 @@ expected_behaviors:
       not_called: [ceo-inbox-archive]
   - id: marked_read
     weight: critical
-    description: Marks the message read (📌 Seen end state).
+    description: Marks the message read (FYI, no action needed end state).
     check:
       called: ceo-inbox-mark-read
       with: { message_id: msg-30i-sow }
@@ -128,12 +128,12 @@ expected_behaviors:
       called: task-create
   - id: labelled_seen
     weight: important
-    description: Labels the message 📌 Seen.
+    description: Labels the message FYI, no action needed.
     check:
       called: ceo-inbox-label
       with: { message_id: msg-30i-sow }
-      contains: { labels: Seen }
+      contains: { labels: FYI }
 failure_modes:
   - Drafts "I'll get that to you" although the follow-up task failed
-  - Archives the message as ✍️ Drafted
+  - Archives the message as Needs a reply
   - Leaves the message unread

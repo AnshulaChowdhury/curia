@@ -6,7 +6,7 @@
   "action_risk": "low",
   "inputs": {
     "message_id": "string (Nylas message ID to label)",
-    "labels": "string[] (label names to apply, e.g. ['🚨 Urgent', 'BOARD'])"
+    "labels": "string[] (label names to apply, e.g. ['Urgent', 'BOARD'])"
   },
   "outputs": {
     "success": "boolean",

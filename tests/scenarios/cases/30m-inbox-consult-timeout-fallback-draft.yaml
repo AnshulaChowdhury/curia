@@ -3,7 +3,7 @@
 # tag, on main; the wake guidance in src/agents/prompts/ceo-inbox-wake-guidance.ts after
 # P2): read the email, check the consult thread for a late reply, check DRAFTS, and when it
 # is still parked, write the blind-scheduling fallback draft (times subject to calendar
-# confirmation), move it from ⏳ In Progress to ✍️ Drafted, do not archive, and complete
+# confirmation), move it from ⏳ In Progress to Needs a reply, do not archive, and complete
 # the task.
 #
 # The task's description (source_message_id, thread_id, consult_kind) is not in the wake
@@ -15,7 +15,7 @@ description: >
   behind a calendar consult 90 minutes ago. The consult thread has no CONSULT REPLY, there
   is no draft for the email, and it still carries ⏳ In Progress. ceo-inbox writes the
   fallback reply draft proposing times subject to calendar confirmation, moves the email
-  to ✍️ Drafted, leaves it in the inbox, and completes the task. It does not triage the
+  to Needs a reply, leaves it in the inbox, and completes the task. It does not triage the
   unread mail.
 tags: [specialist-ceo-inbox, ceo-inbox, task-wake, scheduling, consult-timeout]
 agent: ceo-inbox
@@ -163,10 +163,10 @@ expected_behaviors:
       order: [bullpen-read, ceo-inbox-draft-reply]
   - id: moved_to_drafted
     weight: important
-    description: Moves the email from ⏳ In Progress to ✍️ Drafted.
+    description: Moves the email from ⏳ In Progress to Needs a reply.
     check:
       called: ceo-inbox-update-folders
-      contains: { add_folders: Drafted }
+      contains: { add_folders: Needs a reply }
   - id: no_triage
     weight: important
     description: Does not triage the unread invoice (no archive, label or mark-read on it).
