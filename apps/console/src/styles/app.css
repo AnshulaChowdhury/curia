@@ -2937,6 +2937,30 @@ table.records-table tbody tr.active td { background: transparent; }
   padding-right: 10px;
 }
 
+/* A neighbour's name in the detail panel: plain linked text, not a card. */
+.kg-neighbour-link {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  font: inherit;
+  text-align: left;
+  color: var(--app-fg);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.kg-neighbour-link:hover { text-decoration: underline; }
+
+/* Dark mode: the detail panel's values read in the main text colour, not the muted grey that is hard to read on dark. */
+[data-theme="dark"] .kg-detail-drawer .kg-props-table td,
+[data-theme="dark"] .kg-detail-drawer .kg-detail-field-value { color: var(--app-fg); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .kg-detail-drawer .kg-props-table td,
+  :root:not([data-theme="light"]) .kg-detail-drawer .kg-detail-field-value { color: var(--app-fg); }
+}
+
 /* Badge variants for KG node types (extend the existing badge styles) */
 .badge-kg-person        { background: color-mix(in srgb, var(--kg-person) 14%, transparent); color: var(--kg-person); border: 1px solid color-mix(in srgb, var(--kg-person) 35%, transparent); }
 .badge-kg-organization  { background: color-mix(in srgb, var(--kg-organization) 14%, transparent); color: var(--kg-organization); border: 1px solid color-mix(in srgb, var(--kg-organization) 35%, transparent); }

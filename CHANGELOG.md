@@ -33,6 +33,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Knowledge Graph detail panel in dark mode** — values and linked names now use the main text colour instead of the muted grey, and linked names no longer render as stray cards.
 - **Triage labels** — Urgent, Needs a reply, FYI, no action needed; new Newsletter and Likely spam are marked read.
 - **`ceo-inbox` labels** — renamed to match: Needs a reply and FYI, no action needed replace Drafted and Seen.
 - **Inbox triage push** — urgent mail sends `mail:urgent`, others `mail`, so Command Hub can notify only on urgent.
