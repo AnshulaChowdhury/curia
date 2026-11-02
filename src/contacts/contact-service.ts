@@ -149,6 +149,9 @@ export const CONTACT_REFERENCE_KEYS = [
   'originator_secret_capture_tokens',
   'originator_pending_delegations',
   'outbound_context_recipients',
+  'contact_import_sources',
+  'contact_import_labels',
+  'contact_import_labels_dropped',
 ] as const;
 export type ContactReferenceKey = (typeof CONTACT_REFERENCE_KEYS)[number];
 export type ContactReferenceCounts = Record<ContactReferenceKey, number>;
@@ -3370,6 +3373,35 @@ class PostgresContactBackend implements ContactServiceBackend {
                          ORDER BY ord), '[]'::jsonb)
                   FROM jsonb_array_elements(recipient_messages) WITH ORDINALITY AS t(m, ord))
         WHERE recipient_contact_ids @> ARRAY[$1::uuid]`,
+    );
+
+    // contact_import_sources (migration 112): which outside record became which contact. PK is the source key, so
+    // nothing can collide; re-pointing keeps a re-sent record updating the survivor, not creating a new contact.
+    counts.contact_import_sources = await run(
+      `UPDATE contact_import_sources SET contact_id = $2, updated_at = now() WHERE contact_id = $1`,
+    );
+
+    // contact_import_labels (migration 112): PK contact_id, so the survivor may already have a row. A person's
+    // decision is never lost: if the survivor has not decided and the secondary has, the decision moves over
+    // (label, time and channel together, as the table requires). A suggestion is kept from the survivor first.
+    // The secondary's row is then dropped if the survivor has one, or re-pointed if not.
+    await run(
+      `UPDATE contact_import_labels p
+       SET label = COALESCE(p.label, s.label),
+           decided_at = CASE WHEN p.label IS NULL THEN s.decided_at ELSE p.decided_at END,
+           decided_via = CASE WHEN p.label IS NULL THEN s.decided_via ELSE p.decided_via END,
+           suggested_label = COALESCE(p.suggested_label, s.suggested_label),
+           updated_at = now()
+       FROM contact_import_labels s
+       WHERE p.contact_id = $2 AND s.contact_id = $1`,
+    );
+    counts.contact_import_labels_dropped = await run(
+      `DELETE FROM contact_import_labels s
+       WHERE s.contact_id = $1
+         AND EXISTS (SELECT 1 FROM contact_import_labels p WHERE p.contact_id = $2)`,
+    );
+    counts.contact_import_labels = await run(
+      `UPDATE contact_import_labels SET contact_id = $2, updated_at = now() WHERE contact_id = $1`,
     );
 
     this.logger.debug({ fromContactId, toContactId, counts }, 'contacts: reattached contact references');

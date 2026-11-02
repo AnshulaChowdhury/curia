@@ -33,6 +33,8 @@ const CONTACT_REFERENCES_HANDLED_BY_MERGE: Record<string, string> = {
   'tasks.waiting_on_contact_id': 'reattachContactReferences',
   'voice_sessions.caller_contact_id': 'reattachContactReferences',
   'working_memory.sender_contact_id': 'reattachContactReferences',
+  'contact_import_sources.contact_id': 'reattachContactReferences',
+  'contact_import_labels.contact_id': 'reattachContactReferences',
 };
 
 /**
