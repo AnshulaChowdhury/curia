@@ -444,4 +444,43 @@ describe('Job routes', () => {
     expect(response.statusCode).toBe(400);
     expect(vi.mocked(scheduler.updateJob).mock.calls.length).toBe(calls);
   });
+
+  // -- run history --
+
+  describe('run history', () => {
+    const history = {
+      list: vi.fn().mockResolvedValue([{ runId: 'r1', outcome: 'completed' }]),
+      get: vi.fn().mockResolvedValue({ runId: 'r1', steps: [] }),
+    };
+    const histApp = Fastify();
+    beforeAll(async () => {
+      await histApp.register(cookie);
+      await histApp.register(jobRoutes, {
+        schedulerService: mockSchedulerService(), webAppBootstrapSecret: TEST_SECRET, sessions: new Map(),
+        contactService: mockContactService(), runHistory: history as never, logger: mockLogger,
+      });
+      await histApp.ready();
+    });
+    afterAll(async () => { await histApp.close(); });
+
+    it('lists runs and passes the limit through', async () => {
+      const res = await histApp.inject({ method: 'GET', url: '/api/jobs/job-1/runs?limit=5', headers: AUTH });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).runs).toEqual([{ runId: 'r1', outcome: 'completed' }]);
+      expect(history.list).toHaveBeenCalledWith('job-1', 5);
+      expect(res.headers['cache-control']).toBe('no-store');
+    });
+
+    it('returns one run, 404 when there is none, and refuses without the secret', async () => {
+      expect((await histApp.inject({ method: 'GET', url: '/api/jobs/job-1/runs/r1', headers: AUTH })).statusCode).toBe(200);
+      history.get.mockResolvedValueOnce(null);
+      expect((await histApp.inject({ method: 'GET', url: '/api/jobs/job-1/runs/nope', headers: AUTH })).statusCode).toBe(404);
+      expect((await histApp.inject({ method: 'GET', url: '/api/jobs/job-1/runs' })).statusCode).toBe(401);
+    });
+
+    it('is not registered when no run history is wired in', async () => {
+      const res = await app.inject({ method: 'GET', url: '/api/jobs/job-1/runs', headers: AUTH });
+      expect(res.statusCode).toBe(404);
+    });
+  });
 });

@@ -12,6 +12,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { normaliseJobName, type SchedulerService } from '../../../scheduler/scheduler-service.js';
+import type { JobRunHistory } from '../../../scheduler/job-run-history.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
 import type { Logger } from '../../../logger.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
@@ -28,6 +29,8 @@ export interface JobRouteOptions {
   // (#1127). The console is a principal-only surface; a job created here must be stamped principal-
   // originated, consistent with scheduler-create's principal path.
   contactService: ContactService;
+  /** Reads a job's run history from the audit log. Omit to leave the run-history routes unregistered. */
+  runHistory?: JobRunHistory;
   logger: Logger;
 }
 
@@ -35,7 +38,7 @@ export async function jobRoutes(
   app: FastifyInstance,
   options: JobRouteOptions,
 ): Promise<void> {
-  const { schedulerService, webAppBootstrapSecret, sessions, contactService, logger } = options;
+  const { schedulerService, webAppBootstrapSecret, sessions, contactService, runHistory, logger } = options;
 
   // -- GET /api/jobs — list jobs with optional filters --
 
@@ -70,6 +73,37 @@ export async function jobRoutes(
       return reply.status(500).send({ error: message });
     }
   });
+
+  // -- GET /api/jobs/:id/runs — recent runs of a job, newest first --
+  // -- GET /api/jobs/:id/runs/:runId — one run with every step (inputs, outputs, codes) --
+
+  if (runHistory) {
+    app.get('/api/jobs/:id/runs', async (request, reply) => {
+      if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+      try {
+        const { id } = request.params as { id: string };
+        const { limit } = request.query as { limit?: string };
+        const runs = await runHistory.list(id, limit ? Number(limit) : undefined);
+        return reply.header('Cache-Control', 'no-store').send({ runs });
+      } catch (err) {
+        logger.error({ err }, 'jobs: listing run history failed');
+        return reply.status(500).send({ error: 'Failed to load run history' });
+      }
+    });
+
+    app.get('/api/jobs/:id/runs/:runId', async (request, reply) => {
+      if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+      try {
+        const { id, runId } = request.params as { id: string; runId: string };
+        const run = await runHistory.get(id, runId);
+        if (!run) return reply.status(404).send({ error: 'Run not found' });
+        return reply.header('Cache-Control', 'no-store').send({ run });
+      } catch (err) {
+        logger.error({ err }, 'jobs: loading a run failed');
+        return reply.status(500).send({ error: 'Failed to load run' });
+      }
+    });
+  }
 
   // -- POST /api/jobs — create a new job --
 
