@@ -2,8 +2,7 @@
 //
 // Secrets (all in the vault; none in code or config files):
 //   inbox_triage_enabled            "true" to turn the watcher on
-//   inbox_triage_ntfy_url           ntfy server, e.g. https://ntfy.example.com
-//   inbox_triage_ntfy_topic         topic the phone is subscribed to
+//   inbox_triage_ntfy_url           full ntfy topic address the phone is subscribed to, e.g. https://ntfy.example.com/curia-mail
 //   inbox_triage_ntfy_token         optional bearer token for a protected topic
 //   inbox_triage_min_confidence     0..1, default 0.6 (below it urgent/drafted become an unsure "seen")
 //   nylas_api_key, nylas_region     shared with /phone/inbox
@@ -42,7 +41,6 @@ export interface RunningInboxTriage {
 export const TRIAGE_SECRET_KEYS = {
   enabled: 'inbox_triage_enabled',
   ntfyUrl: 'inbox_triage_ntfy_url',
-  ntfyTopic: 'inbox_triage_ntfy_topic',
   ntfyToken: 'inbox_triage_ntfy_token',
   minConfidence: 'inbox_triage_min_confidence',
 } as const;
@@ -76,12 +74,11 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
   }
 
   const ntfyUrl = await read('inbox_triage_ntfy_url');
-  const ntfyTopic = await read('inbox_triage_ntfy_topic');
   // Without ntfy the watcher still tags mail (the phone sees it on its next refresh); it just cannot wake the phone.
-  const notifier: TriageNotifier = ntfyUrl && ntfyTopic
-    ? new NtfyNotifier(ntfyUrl, ntfyTopic, await read('inbox_triage_ntfy_token'), fetchImpl)
+  const notifier: TriageNotifier = ntfyUrl
+    ? new NtfyNotifier(ntfyUrl, await read('inbox_triage_ntfy_token'), fetchImpl)
     : { notify: async () => {} };
-  if (!(ntfyUrl && ntfyTopic)) logger.warn('inbox-triage: no ntfy url/topic set, so tagged mail will not wake the phone');
+  if (!ntfyUrl) logger.warn('inbox-triage: no ntfy address set, so tagged mail will not wake the phone');
 
   const minConfidenceRaw = Number(await read('inbox_triage_min_confidence'));
   const minConfidence = Number.isFinite(minConfidenceRaw) && minConfidenceRaw > 0 && minConfidenceRaw <= 1
