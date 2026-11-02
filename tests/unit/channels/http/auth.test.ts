@@ -53,6 +53,8 @@ describe('bypassesBearerAuth', () => {
     '/api/identity/me',
     '/api/setup/status',
     '/api/connections',
+    '/api/books/batches',
+    '/api/books/batches/:id/rows/:rowId',
     '/api/secret-capture/:token',
     '/api/webhooks/telnyx/sms',
   ])('lets %s through to its own auth', (url) => {

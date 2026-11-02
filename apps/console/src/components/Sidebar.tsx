@@ -42,6 +42,7 @@ const ROUTES: Record<string, string> = {
   contacts: '/contacts',
   tasks:    '/tasks',
   jobs:     '/jobs',
+  books:    '/books',
   tools: '/tools',
   agents:   '/agents',
   channels:   '/channels',
@@ -264,6 +265,7 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
     item('contacts', 'Contacts', <IconPerson />, true),
     item('tasks', 'Tasks', <IconChecklist />, true),
     item('jobs', 'Scheduled Jobs', <IconClock />, true),
+    item('books', 'Books', <IconDocument />, true),
   ];
   const settingsItems = [
     item('tools', 'Tools', <IconWand />, true),
