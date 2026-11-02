@@ -45,3 +45,12 @@ The books Mac mini keeps the rules in an Oxigraph graph (`mowmowaccounting`, `do
 - `GET /api/books/graph` (signed in) returns `{snapshot, received_at}` or `{empty: true}`.
 - The page: Knowledge Graph → Accounting (`/kg?graph=accounting`). Rule nodes are rounded squares coloured by what they assign; proposed rules have a dashed outline, retired ones a struck-through label.
 
+
+## Uploading bank files
+
+The weekly RBC download files are uploaded on the **Books** page (drop or choose files). This needs no change to how people sign in: it is behind the same owner session as the rest of the console.
+
+- `POST /api/books/uploads?name=<file name>` (session): the file is the raw request body (`application/octet-stream`, no multipart). Accepted: `.qbo`, `.ofx`, `.csv` up to 5 MB; OFX files must contain `OFXHEADER` or `<OFX>`, CSVs a delimiter in the first line; anything with a NUL byte is refused. The name is shown as plain text and never used as a path. The same bytes are never stored twice, even after the file was processed.
+- `GET /api/books/uploads` (session): recent uploads and their state (no contents). `DELETE /api/books/uploads/:id` removes a file that has not been taken yet.
+- The books agent uses the same routes as for the Drive folder: `GET /books/inbox` lists waiting uploads (plus Drive files if that folder is set up and working; a broken Drive never hides the uploads), `GET /books/inbox/:id/content`, `POST /books/inbox/:id/processed`. Marking an upload processed **deletes its bytes**; only name, size and SHA-256 are kept.
+- Curia never opens or parses a file; the Mac mini does.
