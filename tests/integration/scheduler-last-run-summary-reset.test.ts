@@ -71,7 +71,7 @@ describeIf('Scheduler last_run_summary reset at claim (#1829)', () => {
 
   function jobRowFor(jobId: string, nextRunAt: string): JobRow {
     return {
-      id: jobId, agentId: AGENT_ID, cronExpr: '0 9 * * *', runAt: null,
+      id: jobId, name: null, agentId: AGENT_ID, cronExpr: '0 9 * * *', runAt: null,
       taskPayload: { task: 'sweep calendar holds' }, status: 'pending',
       lastRunAt: null, nextRunAt, lastError: null, consecutiveFailures: 0,
       createdBy: 'system', createdAt: new Date().toISOString(), timezone: 'UTC',

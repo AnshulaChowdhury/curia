@@ -30,6 +30,7 @@ import { DEFAULT_CONSOLE_EDIT_MAX_BYTES, DEFAULT_HEALTH_CONFIG } from '../../con
 import { healthRoutes } from './routes/health.js';
 import { agentRoutes } from './routes/agents.js';
 import { jobRoutes } from './routes/jobs.js';
+import { JobRunHistory } from '../../scheduler/job-run-history.js';
 import { antfarmRoutes } from './routes/antfarm.js';
 import { activityRoutes } from './routes/activity.js';
 import { dashboardRoutes } from './routes/dashboard.js';
@@ -67,11 +68,14 @@ import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
 import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
 import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
+import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
+import { PgMailboxCategoryStore } from '../../phone-inbox/mailbox-category-store.js';
 import { loadTriageSource } from '../../inbox-triage/start.js';
 import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
+import { contactsSourcesRoutes } from './routes/contacts-sources.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
@@ -151,6 +155,8 @@ export interface HttpAdapterConfig {
   /** Backs the /api/vault/* routes (secrets status + skill-secret entry). Mounted only
    *  alongside registryService, which scopes which secret names may be written. */
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
+  /** The process's one QuickBooks connection (ADR-060). Built here when absent, which only tests rely on. */
+  qboConnection?: import('../../quickbooks/qbo-connection.js').QboConnection;
   /** Backs GET /phone/brief, the Command Hub morning brief. Mounted only when the secrets vault is also available. */
   phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
   /** Unsorted mail for the phone's review cards (GET/POST /phone/triage/review). */
@@ -409,6 +415,7 @@ export class HttpAdapter implements Channel {
         sessions,
         // Needed so console-created jobs carry principal lineage (#1127).
         contactService: this.config.contactService,
+        runHistory: new JobRunHistory(pool),
         logger,
       });
     }
@@ -709,6 +716,12 @@ export class HttpAdapter implements Channel {
         getMarker: (account) => loadPhoneThreadMarker(secrets, account),
         invalidate: (account) => { phoneInboxCache.good.delete(account); },
       });
+      // Which mailbox is Work or Personal, reported by the phone (the source of truth). Same token as /phone/inbox.
+      await this.app.register(phoneMailboxCategoryRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        store: new PgMailboxCategoryStore(pool),
+      });
       // The text of one email, for the phone's email page. Same token as /phone/inbox.
       await this.app.register(phoneMessageRoutes, {
         logger,
@@ -755,7 +768,7 @@ export class HttpAdapter implements Channel {
     if (this.config.secretsService) {
       await this.app.register(quickbooksRoutes, {
         logger,
-        connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
+        connection: this.config.qboConnection ?? new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
         booksToken: new BooksToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,
@@ -813,6 +826,17 @@ export class HttpAdapter implements Channel {
         logger,
         secrets: this.config.secretsService,
         importToken: new ContactsImportToken(this.config.secretsService),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // The Contacts page "Sources" drawer: which mailboxes and bridges the import will read, and each mailbox's
+      // Work/Personal category as reported by Command Hub. Read-only; nothing is fetched from Nylas or a bridge.
+      const sourcesSecrets = this.config.secretsService;
+      await this.app.register(contactsSourcesRoutes, {
+        logger,
+        secrets: sourcesSecrets,
+        categories: new PgMailboxCategoryStore(pool),
+        loadMailboxes: () => loadPhoneInboxAccounts(sourcesSecrets),
         webAppBootstrapSecret,
         sessions,
       });

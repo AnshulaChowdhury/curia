@@ -1926,6 +1926,7 @@ table.records-table tbody tr:hover td { background: transparent; }
 table.records-table tbody tr.active td { background: transparent; }
 
 .cell-primary { font-weight: 600; color: var(--app-fg); }
+.cell-secondary { font-size: 12px; color: var(--app-fg-muted); }
 .cell-muted   { color: var(--app-fg-muted); font-size: 12px; }
 .cell-mono    { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--app-fg-muted); }
 .cell-actions { display: flex; gap: 4px; justify-content: flex-end; }
@@ -4070,3 +4071,73 @@ table.records-table tbody tr.active td { background: transparent; }
 .app-root:has(.sidebar.is-collapsed) .records-toolbar { padding: 8px 12px; }
 .app-root:has(.sidebar.is-collapsed) .docs-view-header { padding: 12px 14px 10px; }
 .app-root:has(.sidebar.is-collapsed) .docs-body { padding: 14px 16px 32px; }
+
+/* ── Job drawer: wider, with a run history ─────────────────────────── */
+/* Job drawer: one 18px rhythm on every edge. The shared drawer pads the body 14px on top of the form's own 16px (about
+   30px above the first field, 18px at the sides), and its footer sits 14px in while the content sits 18px in. */
+.drawer-wide { width: 440px; max-width: 100vw; }
+.job-drawer .drawer-header { padding: 18px 18px 16px; }
+.job-drawer .drawer-body { padding: 0; }
+.job-drawer .edit-drawer-form { padding: 18px; gap: 16px; }
+.job-drawer .drawer-footer { padding: 12px 18px; }
+
+.run-history { display: flex; flex-direction: column; gap: 10px; }
+.run-history-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.run-history-title {
+  margin: 0; font-size: 11px; color: var(--app-fg-muted);
+  text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+}
+.run-history-note { margin: 0; font-size: 13px; color: var(--app-fg-muted); line-height: 1.5; }
+.run-history-error { color: var(--app-destructive); }
+
+.run-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.run-item { border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-card); overflow: hidden; }
+.run-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+  width: 100%; padding: 10px 12px; text-align: left;
+  background: none; border: none; box-shadow: none; font: inherit; color: var(--app-fg); cursor: pointer;
+}
+.run-row:hover { background: var(--app-muted); }
+.run-when { font-size: 13px; font-weight: 600; }
+.run-meta { flex-basis: 100%; font-size: 12px; color: var(--app-fg-muted); }
+.run-detail { border-top: 1px solid var(--app-border); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+
+.run-step { border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-card); }
+.run-step-error { border-color: var(--app-destructive); }
+.run-step-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  padding: 8px 10px; cursor: pointer; list-style: none; font-size: 12px;
+}
+.run-step-head::-webkit-details-marker { display: none; }
+.run-step-time { color: var(--app-fg-muted); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.run-step-kind {
+  padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.05em; background: var(--app-muted); color: var(--app-fg-muted);
+}
+.run-kind-tool { color: var(--app-teal); }
+.run-kind-error, .run-kind-blocked { color: var(--app-destructive); }
+.run-step-title { font-weight: 600; color: var(--app-fg); overflow-wrap: anywhere; }
+.run-step-status { font-size: 11px; font-weight: 600; }
+.run-step-status.ok { color: var(--app-green); }
+.run-step-status.error { color: var(--app-destructive); }
+.run-step-duration { margin-left: auto; font-size: 11px; color: var(--app-fg-muted); }
+
+.run-codes { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 8px; }
+.run-code {
+  padding: 2px 8px; border-radius: 999px; font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  border: 1px solid var(--app-border); background: var(--app-muted); color: var(--app-fg);
+}
+.run-code-inferred { border-style: dashed; color: var(--app-fg-muted); }
+
+.run-io { padding: 0 10px 10px; }
+.run-io-label {
+  margin-bottom: 4px; font-size: 10px; color: var(--app-fg-muted);
+  text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+}
+.run-io-body {
+  margin: 0; padding: 8px 10px; max-height: 260px; overflow: auto;
+  border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-muted);
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.5; color: var(--app-fg);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.run-step-empty { padding: 0 10px 10px; font-size: 12px; color: var(--app-fg-muted); }

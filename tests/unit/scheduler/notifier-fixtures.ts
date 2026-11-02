@@ -10,6 +10,7 @@ export function mockSchedulerService(job: JobRow | null = null) {
 export function makeJob(overrides: Partial<JobRow> = {}): JobRow {
   return {
     id: 'job-abc123',
+    name: null,
     agentId: 'coordinator',
     cronExpr: null,
     runAt: '2026-07-03T08:00:00.000Z',

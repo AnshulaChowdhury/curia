@@ -15,6 +15,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **`POST /phone/inbox/read`** — marking mail seen in Command Hub marks the thread read in the mailbox; never unread, no label changes.
+- **Contacts page Sources drawer** — shows each mailbox, bridge and contact app the import reads, with Work/Personal set on Command Hub.
+- **Mailbox category from the phone** — `PUT /phone/inbox/accounts/{id}/category` stores each mailbox's Work/Personal choice from Command Hub (migration 118).
+- **Books specialist** — the Digital EA can ask a read-only `books` agent about cash, review queue and uploads (ADR-060).
+- **Job names** — name a scheduled job on the Jobs page; the books reminders are now named (migration 116).
 - **Sort unsorted mail from the phone** — `GET`/`POST /phone/triage/review`: one card per email triage could not sort, tap a category.
 - **Morning brief "unsorted" section** — lists emails triage could not sort; migration 115 stores them.
 - **Accounting Knowledge Graph coverage** — shows how many chart-of-accounts categories no rule can assign, how many wait for confirmation, and a list of the ones needing a decision. Needs the books agent's coverage field in the snapshot (books PR #8).
@@ -37,6 +41,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
+- **MCP Skills page** — now points to the Tools page, where bundles such as books live.
+- **QuickBooks connection** — built once in `index.ts` and shared, since QuickBooks rotates refresh tokens on every use.
 
 - **Inbox triage window** — labels every inbox email received since 1 Nov 2026, read or unread; read mail never pings the phone.
 - **Inbox triage load** — catches up on the backlog once, then lists recent mail only; a rate-limited mailbox pauses.

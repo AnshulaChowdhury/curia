@@ -73,6 +73,9 @@ export interface RegistryEntry {
   installedBy: string | null;
   enabledAt: string | null;
   enabledBy: string | null;
+  /** Agents only: skill bundles this agent pins that exist on disk but are not enabled. The agent boots without
+   *  those bundles' tools (the boot log says only "Pinned skill not found"), so the console warns about them. */
+  unresolvedBundles?: string[];
 }
 
 /** Thrown by RegistryService for expected guard rejections (not-on-disk, broken manifest,

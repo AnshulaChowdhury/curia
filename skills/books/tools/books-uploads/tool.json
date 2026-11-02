@@ -1,0 +1,18 @@
+{
+  "name": "books-uploads",
+  "description": "Recent bank-file uploads and what became of each: name, size, uploaded time, and whether it is waiting for the weekly run or already processed. File contents are never returned. Read-only: it cannot upload or remove a file.",
+  "version": "0.1.0",
+  "sensitivity": "elevated",
+  "action_risk": "none",
+  "inputs": {
+    "limit": "number? (1 to 50, default 10)"
+  },
+  "outputs": {
+    "uploads": "object[] (id, name, size, status, uploaded_at, processed_at)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": ["booksReader"],
+  "allowed_callers": ["books"]
+}

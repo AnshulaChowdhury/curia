@@ -11,7 +11,8 @@
 // Bearer token — the browser sends the curia_session cookie automatically.
 
 import type { FastifyInstance } from 'fastify';
-import type { SchedulerService } from '../../../scheduler/scheduler-service.js';
+import { normaliseJobName, type SchedulerService } from '../../../scheduler/scheduler-service.js';
+import type { JobRunHistory } from '../../../scheduler/job-run-history.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
 import type { Logger } from '../../../logger.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
@@ -28,6 +29,8 @@ export interface JobRouteOptions {
   // (#1127). The console is a principal-only surface; a job created here must be stamped principal-
   // originated, consistent with scheduler-create's principal path.
   contactService: ContactService;
+  /** Reads a job's run history from the audit log. Omit to leave the run-history routes unregistered. */
+  runHistory?: JobRunHistory;
   logger: Logger;
 }
 
@@ -35,7 +38,7 @@ export async function jobRoutes(
   app: FastifyInstance,
   options: JobRouteOptions,
 ): Promise<void> {
-  const { schedulerService, webAppBootstrapSecret, sessions, contactService, logger } = options;
+  const { schedulerService, webAppBootstrapSecret, sessions, contactService, runHistory, logger } = options;
 
   // -- GET /api/jobs — list jobs with optional filters --
 
@@ -71,11 +74,43 @@ export async function jobRoutes(
     }
   });
 
+  // -- GET /api/jobs/:id/runs — recent runs of a job, newest first --
+  // -- GET /api/jobs/:id/runs/:runId — one run with every step (inputs, outputs, codes) --
+
+  if (runHistory) {
+    app.get('/api/jobs/:id/runs', async (request, reply) => {
+      if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+      try {
+        const { id } = request.params as { id: string };
+        const { limit } = request.query as { limit?: string };
+        const runs = await runHistory.list(id, limit ? Number(limit) : undefined);
+        return reply.header('Cache-Control', 'no-store').send({ runs });
+      } catch (err) {
+        logger.error({ err }, 'jobs: listing run history failed');
+        return reply.status(500).send({ error: 'Failed to load run history' });
+      }
+    });
+
+    app.get('/api/jobs/:id/runs/:runId', async (request, reply) => {
+      if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+      try {
+        const { id, runId } = request.params as { id: string; runId: string };
+        const run = await runHistory.get(id, runId);
+        if (!run) return reply.status(404).send({ error: 'Run not found' });
+        return reply.header('Cache-Control', 'no-store').send({ run });
+      } catch (err) {
+        logger.error({ err }, 'jobs: loading a run failed');
+        return reply.status(500).send({ error: 'Failed to load run' });
+      }
+    });
+  }
+
   // -- POST /api/jobs — create a new job --
 
   app.post('/api/jobs', async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     const body = request.body as {
+      name?: unknown;
       agent_id?: string;
       cron_expr?: string;
       run_at?: string;
@@ -92,6 +127,13 @@ export async function jobRoutes(
     const agentId = typeof body.agent_id === 'string' ? body.agent_id.trim() || undefined : undefined;
     const cronExpr = typeof body.cron_expr === 'string' ? body.cron_expr.trim() || undefined : undefined;
     const runAt = typeof body.run_at === 'string' ? body.run_at.trim() || undefined : undefined;
+
+    let name: string | null;
+    try {
+      name = normaliseJobName(body.name);
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid name' });
+    }
 
     if (!agentId) {
       return reply.status(400).send({ error: 'agent_id is required' });
@@ -111,6 +153,7 @@ export async function jobRoutes(
     try {
       const result = await schedulerService.createJob({
         agentId,
+        name: name ?? undefined,
         cronExpr,
         runAt: runAt ? new Date(runAt) : undefined,
         taskPayload: body.task_payload,
@@ -157,6 +200,7 @@ export async function jobRoutes(
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     const { id } = request.params as { id: string };
     const body = request.body as {
+      name?: unknown;
       status?: string;
       cron_expr?: string;
       run_at?: string;
@@ -170,10 +214,18 @@ export async function jobRoutes(
     const cronExpr = typeof body.cron_expr === 'string' ? body.cron_expr.trim() || undefined : undefined;
     const runAt = typeof body.run_at === 'string' ? body.run_at.trim() || undefined : undefined;
 
+    let name: string | null | undefined;
+    try {
+      name = body.name === undefined ? undefined : normaliseJobName(body.name);
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid name' });
+    }
+
     const hasUpdateFields =
       cronExpr !== undefined ||
       runAt !== undefined ||
-      body.task_payload !== undefined;
+      body.task_payload !== undefined ||
+      name !== undefined;
 
     try {
       // Existence check inside try so any DB error is caught and serialized
@@ -188,12 +240,13 @@ export async function jobRoutes(
       if (body.status === 'pending') {
         await schedulerService.unsuspendJob(id);
       } else if (!hasUpdateFields) {
-        return reply.status(400).send({ error: 'At least one of cron_expr, run_at, or task_payload must be provided' });
+        return reply.status(400).send({ error: 'At least one of name, cron_expr, run_at, or task_payload must be provided' });
       } else {
         await schedulerService.updateJob(id, {
           cronExpr,
           runAt: runAt ? new Date(runAt) : undefined,
           taskPayload: body.task_payload,
+          name,
         });
       }
 

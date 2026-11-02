@@ -283,6 +283,10 @@ export interface ToolContext {
    *  Read-only access to the operational + agent-state tables (scheduled_jobs, held_messages,
    *  autonomy_action_log, outbound_context, working_memory) for the diagnostics agent (#1356). */
   diagnosticsRepo?: import('../diagnostics/diagnostics-repo.js').DiagnosticsRepo;
+  /** Books read facade — available to skills declaring 'booksReader' in capabilities.
+   *  Read-only view of the bookkeeping state (QuickBooks balances, the review queue, uploads, the Mac mini's
+   *  check-ins) for the books specialist (ADR-060). It has no method that changes anything. */
+  booksReader?: import('../books/books-reader.js').BooksReader;
   /** Task repo — available to skills declaring 'taskRepo' in capabilities.
    *  Provides CRUD access to the tasks table and manages linked wake-up scheduled_jobs rows.
    *  Used by task-create, task-list, task-update, task-complete. */

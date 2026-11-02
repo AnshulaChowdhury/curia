@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 const adapter = readFileSync(new URL('../../../../src/channels/http/http-adapter.ts', import.meta.url), 'utf8');
 
 describe('HttpAdapter phone routes', () => {
-  it.each(['phoneInboxRoutes', 'phoneMessageRoutes', 'phoneBooksRoutes', 'phoneBriefRoutes', 'phoneTriageRoutes', 'phoneInboxReadRoutes'])(
+  it.each(['phoneInboxRoutes', 'phoneMessageRoutes', 'phoneBooksRoutes', 'phoneBriefRoutes', 'phoneTriageRoutes', 'phoneInboxReadRoutes', 'phoneMailboxCategoryRoutes'])(
     'imports and registers %s',
     (name) => {
       expect(adapter, `${name} import`).toMatch(new RegExp(`import \\{ ${name} \\} from '\\./routes/`));

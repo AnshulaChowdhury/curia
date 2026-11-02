@@ -642,3 +642,86 @@ describe('RegistryService.uninstall — enabled check and delete are atomic', ()
     expect(await skillRepo.getRow('broken')).toBeNull();
   });
 });
+
+describe('RegistryService — agents and the bundles they pin', () => {
+  const agentDisc = (pinned: string[]): Discovery[] => [{
+    name: 'books',
+    metadata: { name: 'books', description: 'd', version: '0.1.0', role: 'specialist', pinnedTools: pinned },
+  }];
+  const bundleDisc: Discovery[] = [{
+    name: 'books', metadata: { name: 'books', description: 'd', version: '0.1.0', tools: ['books-summary'], pinnedBy: ['books'] },
+  }];
+
+  async function build(opts: { bundleEnabled?: boolean; pinned?: string[]; toolDiscovery?: Discovery[]; secrets?: SecretsLister } = {}) {
+    const agentRepo = new FakeRepo();
+    await agentRepo.install('books', 'test');
+    const skillRepo = new FakeRepo();
+    if (opts.bundleEnabled) await skillRepo.installAndEnable('books', 'test');
+    const cascade = new FakeCascade();
+    const svc = new RegistryService(
+      new FakeRepo(), agentRepo, opts.toolDiscovery ?? [], agentDisc(opts.pinned ?? ['books', 'request-clarification']),
+      opts.secrets, skillRepo, bundleDisc, cascade,
+    );
+    return { svc, agentRepo, cascade };
+  }
+
+  it('lists the bundles an agent pins that are not enabled, and nothing else', async () => {
+    const { svc } = await build();
+    const [books] = await svc.list('agent');
+    expect(books!.unresolvedBundles).toEqual(['books']);       // 'request-clarification' is not a bundle on disk: not this check's business
+  });
+
+  it('reports none once the bundle is enabled, or when the agent pins no bundle', async () => {
+    expect((await (await build({ bundleEnabled: true })).svc.list('agent'))[0]!.unresolvedBundles).toEqual([]);
+    expect((await (await build({ pinned: ['request-clarification'] })).svc.list('agent'))[0]!.unresolvedBundles).toEqual([]);
+  });
+
+  it('only agents carry the field', async () => {
+    const { svc } = await build();
+    expect((await svc.list('skill'))[0]).not.toHaveProperty('unresolvedBundles');
+  });
+
+  it('enabling an agent alone changes nothing else, and still reports the gap', async () => {
+    const { svc, cascade } = await build();
+    const entry = await svc.enable('agent', 'books', 'web-app');
+    expect(entry.state).toBe('enabled');
+    expect(entry.unresolvedBundles).toEqual(['books']);
+    expect(cascade.enabled).toEqual([]);
+  });
+
+  it('with the option, enables the bundle it pins and then the agent', async () => {
+    const { svc, cascade } = await build();
+    const entry = await svc.enable('agent', 'books', 'web-app', { withBundles: true });
+    expect(cascade.enabled).toEqual([{ bundle: 'books', tools: ['books-summary'] }]);
+    expect(entry.state).toBe('enabled');
+  });
+
+  it('install-enable takes the option too, and does not touch bundles that are already on', async () => {
+    const fresh = await build();
+    await fresh.agentRepo.uninstall('books');
+    await fresh.svc.installAndEnable('agent', 'books', 'web-app', { withBundles: true });
+    expect(fresh.cascade.enabled).toHaveLength(1);
+
+    const on = await build({ bundleEnabled: true });
+    await on.svc.enable('agent', 'books', 'web-app', { withBundles: true });
+    expect(on.cascade.enabled).toEqual([]);
+  });
+
+  it('leaves the agent off, and names the bundle, when the bundle cannot be enabled', async () => {
+    const needsKey: Discovery[] = [{ name: 'books-summary', metadata: { name: 'books-summary', description: 'd', version: '1', requiresSecrets: ['books_key'] } }];
+    const { svc, agentRepo, cascade } = await build({ toolDiscovery: needsKey, secrets: new FakeSecrets([]) });
+    await expect(svc.enable('agent', 'books', 'web-app', { withBundles: true }))
+      .rejects.toThrow(/skill bundle 'books' could not be enabled/);
+    expect((await agentRepo.getRow('books'))!.enabled).toBe(false);
+    expect(cascade.enabled).toEqual([]);
+  });
+
+  it('ignores the option for a bundle or a tool', async () => {
+    const skillRepo = new FakeRepo();
+    await skillRepo.install('books', 'test');
+    const cascade = new FakeCascade();
+    const svc = new RegistryService(new FakeRepo(), new FakeRepo(), [], [], undefined, skillRepo, bundleDisc, cascade);
+    await svc.enable('skill', 'books', 'web-app', { withBundles: true });
+    expect(cascade.enabled).toHaveLength(1);
+  });
+});

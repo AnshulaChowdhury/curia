@@ -6,14 +6,19 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import { JobRunHistory } from './JobRunHistory.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type JobStatus = 'pending' | 'running' | 'suspended' | 'paused' | 'completed' | 'cancelled' | 'failed';
 type LastRunOutcome = 'completed' | 'failed' | 'timed_out' | null;
 
+// Matches the database limit on scheduled_jobs.name.
+const MAX_NAME_LENGTH = 120;
+
 interface Job {
   id: string;
+  name: string | null;
   agentId: string;
   cronExpr: string | null;
   runAt: string | null;
@@ -203,6 +208,7 @@ interface DrawerProps {
 function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerProps) {
   const isCronJob = job ? job.cronExpr !== null : true;
 
+  const [name, setName] = useState(job?.name ?? '');
   const [agentId, setAgentId] = useState(job?.agentId ?? '');
   const [cronExpr, setCronExpr] = useState(job?.cronExpr ?? '');
   const [runAt, setRunAt] = useState(utcToLocal(job?.runAt ?? null));
@@ -234,6 +240,10 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
       return;
     }
 
+    if (name.trim().length > MAX_NAME_LENGTH) {
+      setError(`The name must be at most ${MAX_NAME_LENGTH} characters.`);
+      return;
+    }
     if (creating && !agentId.trim()) {
       setError('Agent ID is required.');
       return;
@@ -256,6 +266,7 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
           agent_id: agentId.trim(),
           task_payload: parsed,
         };
+        if (name.trim()) body['name'] = name.trim();
         if (scheduleType === 'cron') {
           body['cron_expr'] = cronExpr.trim();
         } else {
@@ -270,7 +281,8 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
           body: JSON.stringify(body),
         });
       } else {
-        const body: Record<string, unknown> = { task_payload: parsed };
+        // A blank name clears it.
+        const body: Record<string, unknown> = { task_payload: parsed, name: name.trim() };
         // Only send the schedule field for the type this job uses.
         if (isCronJob) {
           body['cron_expr'] = cronExpr.trim() || job!.cronExpr;
@@ -336,7 +348,7 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
   }
 
   return (
-    <aside className="drawer">
+    <aside className="drawer drawer-wide job-drawer">
       <div className="drawer-header">
         <div className="drawer-header-top">
           <span className="badge badge-organization">job</span>
@@ -346,7 +358,7 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
             </svg>
           </button>
         </div>
-        <h2 className="drawer-title-h2">{creating ? 'New job' : (job?.agentId ?? '')}</h2>
+        <h2 className="drawer-title-h2">{creating ? 'New job' : (job?.name || job?.agentId || '')}</h2>
         {!creating && job && (
           <div className="drawer-subtitle">
             <span className={`status-pill ${job.status}`}>{job.status}</span>
@@ -357,6 +369,18 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
       <div className="drawer-body">
         <div className="edit-drawer-form">
           {error && <p style={{ color: 'var(--app-destructive)', margin: 0, fontSize: 13 }}>{error}</p>}
+
+          <div className="form-field">
+            <label htmlFor="jf-name">Name</label>
+            <input
+              id="jf-name"
+              type="text"
+              value={name}
+              maxLength={MAX_NAME_LENGTH}
+              onChange={e => setName(e.target.value)}
+              placeholder="e.g. Books: Monday upload reminder"
+            />
+          </div>
 
           {creating ? (
             <>
@@ -475,6 +499,8 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
               )}
             </>
           )}
+
+          {!creating && job && <JobRunHistory key={job.id} jobId={job.id} />}
 
           <div className="form-field">
             <label htmlFor="jf-payload">Task payload (JSON)</label>
@@ -644,6 +670,7 @@ export default function JobsPage() {
       const q = search.toLowerCase();
       rows = rows.filter(j =>
         j.agentId.toLowerCase().includes(q) ||
+        (j.name ?? '').toLowerCase().includes(q) ||
         (j.cronExpr ?? '').toLowerCase().includes(q) ||
         (j.intentAnchor ?? '').toLowerCase().includes(q),
       );
@@ -829,7 +856,7 @@ export default function JobsPage() {
                         <tr>
                           <th className="sortable" aria-sort={ariaSortFor('agentId')}>
                             <button className="sort-btn" onClick={() => toggleSort('agentId')}>
-                              Agent <span className="sort-arrow">{sortArrow('agentId')}</span>
+                              Job <span className="sort-arrow">{sortArrow('agentId')}</span>
                             </button>
                           </th>
                           <th className="sortable" aria-sort={ariaSortFor('status')}>
@@ -873,7 +900,8 @@ export default function JobsPage() {
                             onClick={() => { setCreating(false); setEditing(j); }}
                           >
                             <td>
-                              <span className="cell-primary">{j.agentId}</span>
+                              <span className="cell-primary">{j.name || j.agentId}</span>
+                              {j.name && <div className="cell-secondary">agent: {j.agentId}</div>}
                             </td>
                             <td>
                               <span className={`status-pill ${j.status}`}>{j.status}</span>
