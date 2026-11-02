@@ -283,6 +283,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
+- **Books tools** — no longer `elevated`, which blocked every delegated or scheduled call; reads now work for the books agent.
 - **`GET /phone/brief`** — route was no longer registered after a merge, so the phone got 404; registered again.
 
 - **Contact merge** — carries the contacts-import source mappings and label decisions to the survivor, so none are lost.

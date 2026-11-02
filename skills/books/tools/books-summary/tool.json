@@ -1,8 +1,8 @@
 {
   "name": "books-summary",
   "description": "The state of the MowMow books in one read: QuickBooks cash, liabilities and receivable, the latest RBC batch (transactions and how many are matched in QuickBooks), how many transactions need the owner, bank files waiting, the last weekly run, and when the books Mac mini last checked in. A part that cannot be read comes back with a note, never a guess. Read-only.",
-  "version": "0.1.0",
-  "sensitivity": "elevated",
+  "version": "0.1.1",
+  "sensitivity": "normal",
   "action_risk": "none",
   "inputs": {},
   "outputs": {
