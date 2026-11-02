@@ -263,6 +263,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Real-time inbox triage** — the classifier agent is now enabled by default; before, every classification failed as unowned.
 - **Principal inbox paging** — follow-up pages keep their folder/unread filters, ending drain re-triage of handled mail. (#2377)
 - **Calendar write tools** — `calendar-create-event` and `calendar-update-event` refuse undeclared inputs instead of silently dropping them. (#2385)
 - **Signal call bridge** — logs every call event; a call ended mid-resolution is skipped with its reason. (#2372)

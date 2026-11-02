@@ -94,6 +94,7 @@ agents:
   - contacts
   - research-analyst
   - meeting-debrief
+  - email-classifier   # internal; only runs when real-time inbox triage tasks it (off until the Settings switch is on)
   # NOTE: calendar agent excluded — enable after calendar credentials are configured
   # NOTE: ceo-inbox excluded — specialized inbox agent; must be enabled manually
   # NOTE: diagnostics excluded — principal-only, read-only forensic agent (#1356). Opt-in:
