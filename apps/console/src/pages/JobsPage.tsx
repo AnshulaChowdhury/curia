@@ -6,6 +6,7 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar, TopbarSearch, TopbarDivider } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import { JobRunHistory } from './JobRunHistory.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -347,7 +348,7 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
   }
 
   return (
-    <aside className="drawer">
+    <aside className="drawer drawer-wide job-drawer">
       <div className="drawer-header">
         <div className="drawer-header-top">
           <span className="badge badge-organization">job</span>
@@ -498,6 +499,8 @@ function JobEditDrawer({ job, creating, onClose, onSaved, onDeleted }: DrawerPro
               )}
             </>
           )}
+
+          {!creating && job && <JobRunHistory key={job.id} jobId={job.id} />}
 
           <div className="form-field">
             <label htmlFor="jf-payload">Task payload (JSON)</label>

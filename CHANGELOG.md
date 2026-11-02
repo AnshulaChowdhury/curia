@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Job run history** — the Jobs drawer lists each run with every step's input, output and API codes (migration 117).
 - **Job names** — name a scheduled job on the Jobs page; the books reminders are now named (migration 116).
 - **Sort unsorted mail from the phone** — `GET`/`POST /phone/triage/review`: one card per email triage could not sort, tap a category.
 - **Morning brief "unsorted" section** — lists emails triage could not sort; migration 115 stores them.
@@ -37,6 +38,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
+- **Jobs drawer** — wider, with even 18px padding and footer buttons aligned to the content edge.
 
 - **Inbox triage window** — labels every inbox email received since 1 Nov 2026, read or unread; read mail never pings the phone.
 - **Inbox triage memory** — classified ids now live in Postgres, so a redeploy no longer re-classifies mail.
