@@ -99,6 +99,7 @@ describe('Job routes', () => {
   it('GET /api/jobs/:id returns the job when found', async () => {
     const fakeJob: JobRow = {
       id: 'job-42',
+      name: null,
       agentId: 'agent-a',
       cronExpr: '0 9 * * *',
       runAt: null,
@@ -138,6 +139,7 @@ describe('Job routes', () => {
     // Route calls getJob() after createJob() to return the full job row.
     const createdJob: JobRow = {
       id: 'job-1',
+      name: null,
       agentId: 'agent-a',
       cronExpr: '0 9 * * *',
       runAt: null,
@@ -318,6 +320,7 @@ describe('Job routes', () => {
   // checks and post-mutation read-backs, so we need a non-null mock return.
   const patchJob: JobRow = {
     id: 'job-50',
+    name: null,
     agentId: 'agent-b',
     cronExpr: '0 9 * * *',
     runAt: null,
@@ -393,5 +396,52 @@ describe('Job routes', () => {
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body);
     expect(body.error).toMatch(/not found or not suspended/);
+  });
+
+  // -- job names --
+
+  it('POST /api/jobs passes a trimmed name to the service', async () => {
+    vi.mocked(scheduler.getJob).mockResolvedValueOnce({ ...patchJob, name: 'Books: Monday reminder' });
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/jobs',
+      headers: AUTH,
+      payload: { name: '  Books: Monday reminder  ', agent_id: 'coordinator', cron_expr: '0 8 * * 1', task_payload: { task: 'x' } },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(vi.mocked(scheduler.createJob).mock.calls.at(-1)![0]).toMatchObject({ name: 'Books: Monday reminder' });
+    expect(JSON.parse(response.body).job.name).toBe('Books: Monday reminder');
+  });
+
+  it('POST /api/jobs rejects a name that is not a string or is too long', async () => {
+    const base = { agent_id: 'coordinator', cron_expr: '0 8 * * 1', task_payload: { task: 'x' } };
+    const before = vi.mocked(scheduler.createJob).mock.calls.length;
+    for (const name of [42, 'x'.repeat(121)]) {
+      const response = await app.inject({ method: 'POST', url: '/api/jobs', headers: AUTH, payload: { ...base, name } });
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error).toMatch(/name must be/);
+    }
+    expect(vi.mocked(scheduler.createJob).mock.calls.length).toBe(before);
+  });
+
+  it('PATCH /api/jobs/:id can rename a job on its own', async () => {
+    vi.mocked(scheduler.getJob).mockResolvedValueOnce(patchJob).mockResolvedValueOnce({ ...patchJob, name: 'Nightly sweep' });
+    const response = await app.inject({ method: 'PATCH', url: '/api/jobs/job-50', headers: AUTH, payload: { name: 'Nightly sweep' } });
+    expect(response.statusCode).toBe(200);
+    expect(scheduler.updateJob).toHaveBeenLastCalledWith('job-50', expect.objectContaining({ name: 'Nightly sweep' }));
+  });
+
+  it('PATCH /api/jobs/:id clears the name when it is blank', async () => {
+    vi.mocked(scheduler.getJob).mockResolvedValueOnce(patchJob).mockResolvedValueOnce(patchJob);
+    const response = await app.inject({ method: 'PATCH', url: '/api/jobs/job-50', headers: AUTH, payload: { name: '   ' } });
+    expect(response.statusCode).toBe(200);
+    expect(scheduler.updateJob).toHaveBeenLastCalledWith('job-50', expect.objectContaining({ name: null }));
+  });
+
+  it('PATCH /api/jobs/:id rejects a too-long name without touching the job', async () => {
+    const calls = vi.mocked(scheduler.updateJob).mock.calls.length;
+    const response = await app.inject({ method: 'PATCH', url: '/api/jobs/job-50', headers: AUTH, payload: { name: 'x'.repeat(121) } });
+    expect(response.statusCode).toBe(400);
+    expect(vi.mocked(scheduler.updateJob).mock.calls.length).toBe(calls);
   });
 });

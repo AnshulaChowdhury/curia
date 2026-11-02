@@ -11,7 +11,7 @@
 // Bearer token — the browser sends the curia_session cookie automatically.
 
 import type { FastifyInstance } from 'fastify';
-import type { SchedulerService } from '../../../scheduler/scheduler-service.js';
+import { normaliseJobName, type SchedulerService } from '../../../scheduler/scheduler-service.js';
 import type { ContactService } from '../../../contacts/contact-service.js';
 import type { Logger } from '../../../logger.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
@@ -76,6 +76,7 @@ export async function jobRoutes(
   app.post('/api/jobs', async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     const body = request.body as {
+      name?: unknown;
       agent_id?: string;
       cron_expr?: string;
       run_at?: string;
@@ -92,6 +93,13 @@ export async function jobRoutes(
     const agentId = typeof body.agent_id === 'string' ? body.agent_id.trim() || undefined : undefined;
     const cronExpr = typeof body.cron_expr === 'string' ? body.cron_expr.trim() || undefined : undefined;
     const runAt = typeof body.run_at === 'string' ? body.run_at.trim() || undefined : undefined;
+
+    let name: string | null;
+    try {
+      name = normaliseJobName(body.name);
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid name' });
+    }
 
     if (!agentId) {
       return reply.status(400).send({ error: 'agent_id is required' });
@@ -111,6 +119,7 @@ export async function jobRoutes(
     try {
       const result = await schedulerService.createJob({
         agentId,
+        name: name ?? undefined,
         cronExpr,
         runAt: runAt ? new Date(runAt) : undefined,
         taskPayload: body.task_payload,
@@ -157,6 +166,7 @@ export async function jobRoutes(
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
     const { id } = request.params as { id: string };
     const body = request.body as {
+      name?: unknown;
       status?: string;
       cron_expr?: string;
       run_at?: string;
@@ -170,10 +180,18 @@ export async function jobRoutes(
     const cronExpr = typeof body.cron_expr === 'string' ? body.cron_expr.trim() || undefined : undefined;
     const runAt = typeof body.run_at === 'string' ? body.run_at.trim() || undefined : undefined;
 
+    let name: string | null | undefined;
+    try {
+      name = body.name === undefined ? undefined : normaliseJobName(body.name);
+    } catch (err) {
+      return reply.status(400).send({ error: err instanceof Error ? err.message : 'Invalid name' });
+    }
+
     const hasUpdateFields =
       cronExpr !== undefined ||
       runAt !== undefined ||
-      body.task_payload !== undefined;
+      body.task_payload !== undefined ||
+      name !== undefined;
 
     try {
       // Existence check inside try so any DB error is caught and serialized
@@ -188,12 +206,13 @@ export async function jobRoutes(
       if (body.status === 'pending') {
         await schedulerService.unsuspendJob(id);
       } else if (!hasUpdateFields) {
-        return reply.status(400).send({ error: 'At least one of cron_expr, run_at, or task_payload must be provided' });
+        return reply.status(400).send({ error: 'At least one of name, cron_expr, run_at, or task_payload must be provided' });
       } else {
         await schedulerService.updateJob(id, {
           cronExpr,
           runAt: runAt ? new Date(runAt) : undefined,
           taskPayload: body.task_payload,
+          name,
         });
       }
 

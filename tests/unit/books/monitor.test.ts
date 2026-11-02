@@ -44,6 +44,11 @@ describe('seeding the weekly jobs', () => {
     expect(await monitor.ensureSeeded()).toBe(false);
     expect(jobs).toHaveLength(2); // a second call, or a restart, never recreates them (even if the owner deleted them)
   });
+  it('gives the two jobs names the Jobs page can show', async () => {
+    const { monitor, jobs } = build();
+    await monitor.ensureSeeded();
+    expect(jobs.map(j => j.name)).toEqual(['Books: Monday upload reminder', 'Books: Tuesday deadline check']);
+  });
   it('waits until the books feature is set up, and retries after a failure without marking it done', async () => {
     const off = build({ token: false });
     expect(await off.monitor.ensureSeeded()).toBe(false);

@@ -798,6 +798,7 @@ export class Scheduler {
         // Map the snake_case DB row to the camelCase JobRow shape.
         const job: JobRow = {
           id: row.id,
+          name: row.name ?? null,
           agentId: row.agent_id,
           cronExpr: row.cron_expr,
           runAt: row.run_at,

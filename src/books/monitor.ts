@@ -79,6 +79,7 @@ export class BooksMonitor {
     try {
       await schedulerService.createJob({
         agentId: 'coordinator',
+        name: 'Books: Monday upload reminder',
         cronExpr: '0 8 * * 1',
         timezone: DEFAULT_TIMEZONE,
         taskPayload: { task: CHECKPOINT_TASK('Monday reminder'), books_job: 'reminder' },
@@ -86,6 +87,7 @@ export class BooksMonitor {
       });
       await schedulerService.createJob({
         agentId: 'coordinator',
+        name: 'Books: Tuesday deadline check',
         cronExpr: '0 12 * * 2',
         timezone: DEFAULT_TIMEZONE,
         taskPayload: { task: CHECKPOINT_TASK('Tuesday deadline'), books_job: 'deadline' },

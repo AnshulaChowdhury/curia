@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { SchedulerService } from '../../../src/scheduler/scheduler-service.js';
+import { SchedulerService, normaliseJobName } from '../../../src/scheduler/scheduler-service.js';
 import type { CreateJobParams } from '../../../src/scheduler/scheduler-service.js';
 
 // -- Mock helpers --
@@ -63,6 +63,23 @@ describe('SchedulerService', () => {
   // -- createJob --
 
   describe('createJob', () => {
+    it('stores a trimmed name, and null when none or a blank one is given', async () => {
+      pool.query.mockResolvedValue({ rows: [{ id: 'job-n' }] });
+      const base = { agentId: 'agent-1', cronExpr: '0 9 * * *', taskPayload: { task: 'x' }, createdBy: 'ceo' };
+      await svc.createJob({ ...base, name: '  Weekly books  ' });
+      await svc.createJob({ ...base, name: '   ' });
+      await svc.createJob(base);
+      const insertParams = pool.query.mock.calls.map(c => c as [string, unknown[]]).filter(([sql]) => sql.includes('INSERT INTO scheduled_jobs'));
+      expect(insertParams[0]![0]).toContain(', name');
+      expect(insertParams.map(([, p]) => p[9])).toEqual(['Weekly books', null, null]);
+    });
+
+    it('rejects a name over 120 characters before touching the database', async () => {
+      await expect(svc.createJob({ agentId: 'a', cronExpr: '0 9 * * *', taskPayload: {}, createdBy: 'ceo', name: 'x'.repeat(121) }))
+        .rejects.toThrow(/at most 120/);
+      expect(pool.query).not.toHaveBeenCalled();
+    });
+
     it('creates a cron job and publishes schedule.created', async () => {
       const jobId = 'job-111';
       pool.query.mockResolvedValueOnce({ rows: [{ id: jobId }] });
@@ -1391,6 +1408,18 @@ describe('SchedulerService', () => {
   // -- updateJob --
 
   describe('updateJob', () => {
+    it('renames a job, clears the name with null, and leaves it alone when absent', async () => {
+      pool.query.mockResolvedValue({ rowCount: 1, rows: [] });
+      await svc.updateJob('job-up', { name: ' Nightly ' });
+      await svc.updateJob('job-up', { name: null });
+      await svc.updateJob('job-up', { cronExpr: '*/10 * * * *' });
+      const calls = pool.query.mock.calls as Array<[string, unknown[]]>;
+      expect(calls[0]![0]).toContain('name = $1');
+      expect(calls[0]![1]).toEqual(['Nightly', 'job-up']);
+      expect(calls[1]![1]).toEqual([null, 'job-up']);
+      expect(calls[2]![0]).not.toContain('name =');
+    });
+
     it('updates cronExpr and recalculates next_run_at', async () => {
       pool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 });
 
@@ -1417,5 +1446,20 @@ describe('SchedulerService', () => {
 
       await expect(svc.updateJob('gone', { cronExpr: '*/10 * * * *' })).rejects.toThrow('not found');
     });
+  });
+});
+
+describe('normaliseJobName', () => {
+  it('trims, and treats absent or blank as no name', () => {
+    expect(normaliseJobName('  Books  ')).toBe('Books');
+    expect(normaliseJobName(undefined)).toBeNull();
+    expect(normaliseJobName(null)).toBeNull();
+    expect(normaliseJobName('   ')).toBeNull();
+  });
+
+  it('accepts exactly 120 characters and refuses 121 or a non-string', () => {
+    expect(normaliseJobName('x'.repeat(120))).toHaveLength(120);
+    expect(() => normaliseJobName('x'.repeat(121))).toThrow(/at most 120/);
+    expect(() => normaliseJobName(7)).toThrow(/must be a string/);
   });
 });
