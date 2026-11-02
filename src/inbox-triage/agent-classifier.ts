@@ -9,6 +9,7 @@ import { createAgentTask, createScheduleFired } from '../bus/events.js';
 import type { AgentResponseEvent } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import { NO_VERDICT, parseVerdict, type TriageCandidate, type TriageVerdict } from './types.js';
+import type { ContactLookup } from './contact-lookup.js';
 import type { Classifier } from './watcher.js';
 
 export const CLASSIFIER_AGENT_ID = 'email-classifier';
@@ -25,15 +26,18 @@ export interface AgentClassifierConfig {
   minConfidence: number;
   /** Hard limit on one classification. A timeout means 'none': the sweep covers the message. */
   timeoutMs: number;
+  /** Tells the classifier when the sender is in the principal's contacts. Optional. */
+  contacts?: ContactLookup;
 }
 
 /** The task text. Email fields are fenced and capped so they read as data (FR-ETC-6). */
-export function buildClassifierTask(c: TriageCandidate): string {
+export function buildClassifierTask(c: TriageCandidate, knownContact = false): string {
   const clip = (s: string, n: number) => s.replace(/[\r\n]+/g, ' ').slice(0, n);
   return [
     'Classify this new email. Reply with the JSON line only.',
     '<email>',
     `From: ${clip(c.from, 200)}`,
+    ...(knownContact ? ['Known contact: yes'] : []),
     `Subject: ${clip(c.subject, 300)}`,
     `Preview: ${clip(c.snippet, 400)}`,
     '</email>',
@@ -59,6 +63,7 @@ export class AgentClassifier implements Classifier {
 
   async classify(candidate: TriageCandidate): Promise<TriageVerdict> {
     const { bus, logger, minConfidence, timeoutMs } = this.config;
+    const knownContact = candidate.fromAddress && this.config.contacts ? await this.config.contacts.isKnown(candidate.fromAddress) : false;
     const runId = randomUUID();
     const fired = createScheduleFired({ jobId: `inbox-triage:${runId}`, agentId: CLASSIFIER_AGENT_ID, agentTaskId: null });
     const task = createAgentTask({
@@ -66,7 +71,7 @@ export class AgentClassifier implements Classifier {
       conversationId: `inbox-triage:${runId}`,
       channelId: 'scheduler',
       senderId: 'inbox-triage',
-      content: buildClassifierTask(candidate),
+      content: buildClassifierTask(candidate, knownContact),
       parentEventId: fired.id,
     });
 

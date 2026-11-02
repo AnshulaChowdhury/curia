@@ -77,6 +77,7 @@ export class NylasTriageSource implements TriageSource {
           messageId: m.id,
           threadId: m.thread_id ?? '',
           from: m.from?.[0]?.name || m.from?.[0]?.email || '',
+          ...(m.from?.[0]?.email ? { fromAddress: m.from[0].email } : {}),
           subject: m.subject ?? '',
           snippet: (m.snippet ?? '').slice(0, SNIPPET_MAX_CHARS),
           receivedAt: m.date ?? 0,

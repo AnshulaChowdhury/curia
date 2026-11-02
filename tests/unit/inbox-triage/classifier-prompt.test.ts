@@ -12,8 +12,8 @@ const agent = load(readFileSync(path.resolve(import.meta.dirname, '../../../agen
 };
 
 describe('email-classifier prompt', () => {
-  it('is version 0.3.0', () => {
-    expect(agent.version).toBe('0.3.0');
+  it('is version 0.4.0', () => {
+    expect(agent.version).toBe('0.4.0');
   });
 
   it('sends mail a person wrote for an answer to "Needs a reply", not FYI', () => {
@@ -26,5 +26,10 @@ describe('email-classifier prompt', () => {
 
   it('keeps cold outreach from strangers out of "Needs a reply"', () => {
     expect(agent.system_prompt).toMatch(/pitches from strangers are not drafted/);
+  });
+
+  it('tells the model what "Known contact: yes" means', () => {
+    expect(agent.system_prompt).toMatch(/"Known contact: yes"/);
+    expect(agent.system_prompt).toMatch(/never spam or newsletter/);
   });
 });

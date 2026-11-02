@@ -69,6 +69,7 @@ import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
 import { InboxTriageController } from './inbox-triage/controller.js';
 import { PgTriageStore } from './inbox-triage/item-store.js';
+import { contactLookupFor } from './inbox-triage/contact-lookup.js';
 import { UnsortedBriefSource } from './phone-brief/unsorted-source.js';
 import { PgBriefStore } from './phone-brief/brief-store.js';
 import { PhoneBriefService } from './phone-brief/brief-service.js';
@@ -3204,6 +3205,7 @@ async function main(): Promise<void> {
     secrets: secretsService,
     items: triageItems,
     timezone: config.timezone,
+    ...(contactService ? { contacts: contactLookupFor(contactService, logger) } : {}),
   });
   try {
     await inboxTriage.reload();

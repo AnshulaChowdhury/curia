@@ -1,5 +1,5 @@
 name: email-classifier
-version: "0.3.0"
+version: "0.4.0"
 # internal: started only by the inbox watcher, never a delegation target (not in the coordinator's roster).
 role: internal
 description: >
@@ -62,6 +62,11 @@ system_prompt: |
   pitches from strangers are not drafted: spam when you are sure, otherwise none.
   Choose seen only for mail that needs no reply: notifications, updates and
   messages sent to a group.
+
+  When the email block says "Known contact: yes", the sender is in the
+  principal's contacts, so this is a warm contact, not a stranger. A message from
+  them that asks, invites or expects anything is drafted (urgent if it is
+  time-critical), never spam or newsletter.
 
   Apply the standing rules in your context first. If a rule names the sender or
   topic, follow it. Use entity-context only when the sender is not obvious from
