@@ -110,6 +110,36 @@ export class RegistryService {
     return this.cascade;
   }
 
+  /** Names of the skill bundles that are enabled. Empty when no skill registry is wired. */
+  private async enabledBundleNames(): Promise<Set<string>> {
+    if (!this.skillRepo) return new Set();
+    return new Set((await this.skillRepo.listRows()).filter(r => r.enabled).map(r => r.name));
+  }
+
+  /** Bundles in `pinned` that exist on disk but are not enabled. A pin that is not a bundle (a single tool, or a name
+   *  that is not on disk) is not this check's business: those are reported at boot. */
+  private missingBundles(pinned: readonly string[] | undefined, enabled: ReadonlySet<string>): string[] {
+    if (!pinned?.length) return [];
+    const onDisk = new Set(this.skillDiscovery.map(d => d.name));
+    return pinned.filter(p => onDisk.has(p) && !enabled.has(p));
+  }
+
+  /** Installs and enables the bundles an agent pins that are not enabled yet. Runs before the agent is enabled, so a
+   *  bundle that cannot be enabled (a missing secret, a broken manifest) leaves the agent off and says which bundle. */
+  private async enablePinnedBundles(agent: string, actor: string): Promise<void> {
+    const pinned = this.agentDiscovery.find(d => d.name === agent)?.metadata?.pinnedTools;
+    for (const bundle of this.missingBundles(pinned, await this.enabledBundleNames())) {
+      try {
+        await this.installAndEnable('skill', bundle, actor);
+      } catch (err) {
+        if (err instanceof RegistryGuardError) {
+          throw new RegistryGuardError(`Cannot enable '${agent}': its skill bundle '${bundle}' could not be enabled: ${err.message}`);
+        }
+        throw err;
+      }
+    }
+  }
+
   /** Every known item (on disk and/or in DB) with its derived state. */
   async list(kind: RegistryKind): Promise<RegistryEntry[]> {
     const rows = await this.repo(kind).listRows();
@@ -119,6 +149,7 @@ export class RegistryService {
 
     const names = new Set<string>([...discByName.keys(), ...rowByName.keys()]);
     const entries: RegistryEntry[] = [];
+    const enabledBundles = kind === 'agent' ? await this.enabledBundleNames() : new Set<string>();
 
     for (const name of names) {
       const disc = discByName.get(name);
@@ -140,6 +171,7 @@ export class RegistryService {
         installedBy: row?.installedBy ?? null,
         enabledAt: row?.enabledAt ?? null,
         enabledBy: row?.enabledBy ?? null,
+        ...(kind === 'agent' && { unresolvedBundles: this.missingBundles(disc?.metadata?.pinnedTools, enabledBundles) }),
       });
     }
 
@@ -277,13 +309,16 @@ export class RegistryService {
     return this.entry(kind, name);
   }
 
-  async enable(kind: RegistryKind, name: string, actor: string): Promise<RegistryEntry> {
+  /** `opts.withBundles` (agents only): also install and enable the skill bundles the agent pins, which the operator
+   *  asked for explicitly. Without it nothing else changes and the entry reports `unresolvedBundles`. */
+  async enable(kind: RegistryKind, name: string, actor: string, opts?: { withBundles?: boolean }): Promise<RegistryEntry> {
     this.assertInstallable(kind, name);
     // Re-check at enable time too: secrets could have been deleted since install, and
     // enable is the moment the item actually goes live on the next restart.
     await this.assertSecretsConfigured(kind, name);
     const row = await this.repo(kind).getRow(name);
     if (!row) throw new RegistryGuardError(`Cannot enable '${name}': not installed. Install it first.`);
+    if (kind === 'agent' && opts?.withBundles) await this.enablePinnedBundles(name, actor);
     if (kind === 'skill') {
       // Bundle + members in one transaction — the bundle is the unit of control (#1724).
       // requireBundleTools (not bundleTools) because assertInstallable above has already
@@ -295,9 +330,10 @@ export class RegistryService {
     return this.entry(kind, name);
   }
 
-  async installAndEnable(kind: RegistryKind, name: string, actor: string): Promise<RegistryEntry> {
+  async installAndEnable(kind: RegistryKind, name: string, actor: string, opts?: { withBundles?: boolean }): Promise<RegistryEntry> {
     this.assertInstallable(kind, name);
     await this.assertSecretsConfigured(kind, name);
+    if (kind === 'agent' && opts?.withBundles) await this.enablePinnedBundles(name, actor);
     if (kind === 'skill') {
       // No separate install() here: ENABLE_SKILL (bundle-cascade-repo.ts) is already an
       // upsert (`INSERT ... ON CONFLICT DO UPDATE`), so the cascade alone installs-and-

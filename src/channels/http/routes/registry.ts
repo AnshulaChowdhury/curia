@@ -5,7 +5,7 @@
 //   GET    /api/registry/tools                  — list all tools with derived state
 //   GET    /api/registry/agents                  — list all agents with derived state
 //   POST   /api/registry/:kind/:name/install
-//   POST   /api/registry/:kind/:name/enable
+//   POST   /api/registry/:kind/:name/enable          — agents: ?with_bundles=true also enables the bundles it pins
 //   POST   /api/registry/:kind/:name/install-enable
 //   POST   /api/registry/:kind/:name/disable
 //   DELETE /api/registry/:kind/:name             — uninstall
@@ -99,11 +99,13 @@ export async function registryRoutes(
           error: `Unknown kind '${rawKind}' (expected 'tools', 'agents', or 'skills')`,
         });
       }
+      // ?with_bundles=true (agents): also enable the skill bundles the agent pins. Opt-in, never implied.
+      const withBundles = (request.query as { with_bundles?: string }).with_bundles === 'true';
       try {
         let entry;
         if (op === 'install') entry = await registryService.install(kind, name, ACTOR);
-        else if (op === 'enable') entry = await registryService.enable(kind, name, ACTOR);
-        else if (op === 'install-enable') entry = await registryService.installAndEnable(kind, name, ACTOR);
+        else if (op === 'enable') entry = await registryService.enable(kind, name, ACTOR, { withBundles });
+        else if (op === 'install-enable') entry = await registryService.installAndEnable(kind, name, ACTOR, { withBundles });
         else entry = await registryService.disable(kind, name, ACTOR);
         return reply.send({ entry });
       } catch (err) {

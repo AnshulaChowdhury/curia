@@ -39,6 +39,42 @@ export interface RegistryEntry {
   installedBy: string | null;
   enabledAt: string | null;
   enabledBy: string | null;
+  /** Agents only: skill bundles the agent pins that are on disk but not enabled. */
+  unresolvedBundles?: string[];
+}
+
+/**
+ * The bundles an ENABLED agent pins but that are not enabled, or [] when there is no gap. Such an agent boots without
+ * those bundles' tools and only the boot log says so, so the console says it where the agent is listed. A disabled
+ * agent is not a problem yet.
+ */
+export function bundleGap(entry: RegistryEntry): string[] {
+  return entry.kind === 'agent' && entry.state === 'enabled' ? entry.unresolvedBundles ?? [] : [];
+}
+
+const quoted = (names: readonly string[]): string => names.map(n => `"${n}"`).join(', ');
+
+/** Why an enabled agent has no tools, in a sentence for the drawer and the table tooltip. */
+export function bundleGapMessage(entry: RegistryEntry): string | null {
+  const gap = bundleGap(entry);
+  if (gap.length === 0) return null;
+  const many = gap.length > 1;
+  return `"${entry.name}" pins the skill bundle${many ? 's' : ''} ${quoted(gap)}, which ${many ? 'are' : 'is'} not enabled, ` +
+    `so it has no tools from ${many ? 'them' : 'it'}. Enable ${many ? 'them' : 'it'} on the Tools page, or use the button below.`;
+}
+
+/** Confirmation text before enabling an agent whose bundles are off, or null when nothing else would be enabled. */
+export function enableWithBundlesPrompt(entry: RegistryEntry): string | null {
+  const gap = entry.kind === 'agent' ? entry.unresolvedBundles ?? [] : [];
+  if (gap.length === 0) return null;
+  return [
+    `Enable "${entry.name}"?`,
+    '',
+    `It pins the skill bundle${gap.length > 1 ? 's' : ''} ${quoted(gap)}, which ${gap.length > 1 ? 'are' : 'is'} not enabled.`,
+    `Without ${gap.length > 1 ? 'them' : 'it'} the agent has no tools, so ${gap.length > 1 ? 'they' : 'it'} will be enabled too.`,
+    '',
+    'Takes effect on the next restart.',
+  ].join('\n');
 }
 
 export type RowKind = 'bundle' | 'tool';
