@@ -15,9 +15,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
-- **Books deadline, heartbeat and alerts** — Curia watches the weekly books run: a 15-minute check notifies reviewers (ntfy) of a missed deadline, a failed run, an unprocessed file or a silent Mac mini. The Monday reminder and Tuesday deadline are scheduler jobs you can edit; `POST /books/heartbeat` and `POST /books/runs` feed it.
+- **`GET /phone/message`** — plain text of one email for the phone's email page; shares the `/phone/inbox` token.
 - **Books review** — the weekly batch of bank rows the books agent pushes shows on a new Books page: edit category, tax code, location, class and payee, then approve or skip rows; the agent pulls the approved rows, posts them to QuickBooks and reports the results back. Rows with an open flag cannot be approved without a category, and a posted row is final.
 - **Bank files folder (Google Drive)** — the books agent fetches the weekly RBC download files from one Drive folder through Curia (service account, folder-scoped; set up on the API connections page), and finished files move to a Processed subfolder.
+- **QuickBooks allow-list** — the books routes may read BillPayment, JournalEntry, receipts, Bill, Invoice, CreditMemo and CreditCardPayment, and create a JournalEntry (month-end).
 - **QuickBooks connection and API connections page** — Settings → API connections sets up QuickBooks (enter the app's client ID and secret, authorise, make the books agent's token); Curia holds and refreshes the tokens, and `/books/qbo/{status,query,create}` give the books agent a narrow, token-gated API.
 - **Real-time inbox triage** — new mail is classified within ~30s, labelled, and wakes the phone via ntfy. Off by default.
 - **Inbox triage settings** — a form under API connections saves ntfy details to the vault, restarts the watcher, sends a test push.
@@ -263,6 +264,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Real-time inbox triage** — the classifier agent is now enabled by default; before, every classification failed as unowned.
 - **Principal inbox paging** — follow-up pages keep their folder/unread filters, ending drain re-triage of handled mail. (#2377)
 - **Calendar write tools** — `calendar-create-event` and `calendar-update-event` refuse undeclared inputs instead of silently dropping them. (#2385)
 - **Signal call bridge** — logs every call event; a call ended mid-resolution is skipped with its reason. (#2372)

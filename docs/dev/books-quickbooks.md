@@ -15,8 +15,8 @@ Railway variables still work as a fallback: `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`
 ## Routes
 
 - `GET /books/qbo/status` — connected or not (no tokens).
-- `POST /books/qbo/query` `{query}` — one `select ... from <entity>` on Account, Class, Department, TaxCode, Vendor, Customer, Purchase, Deposit, Transfer, Preferences, CompanyInfo, Item.
-- `POST /books/qbo/create` `{entity, payload, request_id}` — Purchase, Deposit, Transfer or Vendor; QuickBooks de-duplicates on `request_id`.
+- `POST /books/qbo/query` `{query}` — one `select ... from <entity>` on Account, Class, Department, TaxCode, Vendor, Customer, Item, Preferences, CompanyInfo and the transaction types Purchase, Deposit, Transfer, BillPayment, JournalEntry, SalesReceipt, RefundReceipt, Bill, Invoice, CreditMemo, CreditCardPayment.
+- `POST /books/qbo/create` `{entity, payload, request_id}` — Purchase, Deposit, Transfer, Vendor or JournalEntry; QuickBooks de-duplicates on `request_id`.
 
 Errors: 409 `not_connected` (connect again), 422 QuickBooks refused the entry (message and fault included), 502 QuickBooks unavailable.
 

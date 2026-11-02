@@ -100,6 +100,25 @@ describe('quickbooks routes', () => {
     expect(api).toHaveLength(1);
   });
 
+  it('query allows the transaction types the duplicate check, audit and month-end read', async () => {
+    const { conn, api } = fakeConnection();
+    await build(conn);
+    const post = (query: string) => app.inject({ method: 'POST', url: '/books/qbo/query', headers: auth, payload: { query } as Record<string, unknown> });
+    for (const e of ['BillPayment', 'JournalEntry', 'SalesReceipt', 'RefundReceipt', 'Bill', 'Invoice', 'CreditMemo', 'CreditCardPayment']) {
+      expect((await post(`select * from ${e} where TxnDate >= '2026-01-01' STARTPOSITION 1 MAXRESULTS 1000`)).statusCode).toBe(200);
+    }
+    expect(api).toHaveLength(8);
+    expect((await post('select * from Payment')).statusCode).toBe(400);
+  });
+
+  it('create allows a JournalEntry (month-end), under the same request id rule', async () => {
+    const { conn, api } = fakeConnection();
+    await build(conn);
+    const res = await app.inject({ method: 'POST', url: '/books/qbo/create', headers: auth, payload: { entity: 'JournalEntry', payload: { DocNumber: 'LOC-2026-10' }, request_id: 'row-9' } });
+    expect(res.statusCode).toBe(200);
+    expect(api[0]).toEqual(['POST', 'journalentry', { requestid: 'row-9' }, { DocNumber: 'LOC-2026-10' }]);
+  });
+
   it('create allows only Purchase, Deposit, Transfer and Vendor, and passes the request id', async () => {
     const { conn, api } = fakeConnection();
     await build(conn);
