@@ -268,6 +268,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Contact merge** — carries the contacts-import source mappings and label decisions to the survivor, so none are lost.
 - **Real-time inbox triage** — the classifier agent is now enabled by default; before, every classification failed as unowned.
 - **Principal inbox paging** — follow-up pages keep their folder/unread filters, ending drain re-triage of handled mail. (#2377)
 - **Calendar write tools** — `calendar-create-event` and `calendar-update-event` refuse undeclared inputs instead of silently dropping them. (#2385)
