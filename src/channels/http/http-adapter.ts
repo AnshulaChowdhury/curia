@@ -66,6 +66,8 @@ import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
 import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
+import { PgMailboxCategoryStore } from '../../phone-inbox/mailbox-category-store.js';
 import { loadTriageSource } from '../../inbox-triage/start.js';
 import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
@@ -703,6 +705,12 @@ export class HttpAdapter implements Channel {
             return null;
           }
         },
+      });
+      // Which mailbox is Work or Personal, reported by the phone (the source of truth). Same token as /phone/inbox.
+      await this.app.register(phoneMailboxCategoryRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        store: new PgMailboxCategoryStore(pool),
       });
       // The text of one email, for the phone's email page. Same token as /phone/inbox.
       await this.app.register(phoneMessageRoutes, {
