@@ -65,6 +65,8 @@ import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
 import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
+import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
 import { loadTriageSource } from '../../inbox-triage/start.js';
 import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
@@ -699,6 +701,13 @@ export class HttpAdapter implements Channel {
             return null;
           }
         },
+      });
+      // The phone marks threads seen; this marks them read in the mailbox (and only that). Same token.
+      await this.app.register(phoneInboxReadRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        getMarker: (account) => loadPhoneThreadMarker(secrets, account),
+        invalidate: (account) => { phoneInboxCache.good.delete(account); },
       });
       // The text of one email, for the phone's email page. Same token as /phone/inbox.
       await this.app.register(phoneMessageRoutes, {
