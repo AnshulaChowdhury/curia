@@ -267,6 +267,7 @@ const kgRoute = createRoute({
   validateSearch: (search: Record<string, unknown>) => ({
     q: typeof search['q'] === 'string' ? search['q'] : undefined,
     node: typeof search['node'] === 'string' ? search['node'] : undefined,
+    graph: search['graph'] === 'accounting' ? 'accounting' as const : undefined,
   }),
   component: KgPage,
 });

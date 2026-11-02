@@ -75,6 +75,8 @@ import { BooksToken } from '../../quickbooks/books-token.js';
 import { DriveInbox } from '../../books/drive-inbox.js';
 import { booksInboxRoutes } from './routes/books-inbox.js';
 import { booksBatchRoutes } from './routes/books-batches.js';
+import { booksGraphRoutes } from './routes/books-graph.js';
+import { GraphSnapshotStore } from '../../books/graph-store.js';
 import { BatchStore } from '../../books/batch-store.js';
 import { setupRoutes } from './routes/setup.js';
 import { smsWebhookRoutes } from '../sms/webhook-route.js';
@@ -713,6 +715,13 @@ export class HttpAdapter implements Channel {
       await this.app.register(booksBatchRoutes, {
         logger,
         batchStore: new BatchStore(pool),
+        booksToken: new BooksToken(this.config.secretsService),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      await this.app.register(booksGraphRoutes, {
+        logger,
+        graphStore: new GraphSnapshotStore(pool),
         booksToken: new BooksToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,

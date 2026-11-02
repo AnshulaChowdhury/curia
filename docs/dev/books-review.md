@@ -36,3 +36,12 @@ Signed-in owner (session cookie or bootstrap secret):
 | `POST /api/books/batches/:id/decide` | `{row_ids: [...], decision: approved\|skipped\|pending}` | `{ok, updated}` |
 
 Errors: 400 bad input or a row that cannot be approved (the message says why), 404 unknown batch or row, 409 the row is posted or no longer pending.
+
+## Accounting graph snapshot
+
+The books Mac mini keeps the rules in an Oxigraph graph (`mowmowaccounting`, `docs/graph.md`) and pushes a read-only snapshot for the Knowledge Graph page (ADR-059).
+
+- `POST /books/graph` (books token) body `{"snapshot": {version?, generated_at?, nodes: [...], edges: [...]}}` returns `{ok, nodes, edges}`. Nodes: `id`, `type`, `label` required; optional `properties` (flat: text, numbers, booleans, null, short lists), `confidence` (0 to 1), `decayClass`, `source`, `sensitivity`, `createdAt`, `lastConfirmedAt`, `aliases`, `archived`. Edges: `id`, `sourceNodeId`, `targetNodeId`, `type`; optional `confidence`, `decayClass`, `source`, `createdAt`, `lastConfirmedAt`. Unknown fields, duplicate ids, edges to missing nodes, more than 5000 nodes / 20000 edges or more than 2 MB are refused with 400 and a message. Only the latest snapshot is kept (`books_graph_snapshot`).
+- `GET /api/books/graph` (signed in) returns `{snapshot, received_at}` or `{empty: true}`.
+- The page: Knowledge Graph → Accounting (`/kg?graph=accounting`). Rule nodes are rounded squares coloured by what they assign; proposed rules have a dashed outline, retired ones a struck-through label.
+

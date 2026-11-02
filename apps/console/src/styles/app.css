@@ -2814,6 +2814,26 @@ table.records-table tbody tr.active td { background: transparent; }
 .kg-c-type-concept      { --kg-fill: var(--kg-concept); }
 .kg-c-type-fact         { --kg-fill: var(--kg-fact); }
 .kg-c-type-other        { --kg-fill: var(--kg-other); }
+/* Accounting rules graph (Knowledge Graph > Accounting): the same palette, by what a node is. */
+.kg-c-acct-category, .kg-c-acct-rule-category { --kg-fill: var(--kg-concept); }
+.kg-c-acct-bank_account { --kg-fill: var(--kg-organization); }
+.kg-c-acct-tax_code, .kg-c-acct-rule-tax { --kg-fill: var(--kg-decision); }
+.kg-c-acct-location, .kg-c-acct-rule-location { --kg-fill: var(--kg-event); }
+.kg-c-acct-class, .kg-c-acct-rule-class { --kg-fill: var(--kg-project); }
+.kg-c-acct-payee, .kg-c-acct-rule-vendor { --kg-fill: var(--kg-person); }
+.kg-c-acct-rule-other, .kg-c-acct-other { --kg-fill: var(--kg-other); }
+/* Rules are rounded squares; a proposed rule has a dashed outline, a retired one a struck-through label. */
+.kg-gnode.kg-shape-rule { border-radius: 28%; }
+.kg-gnode.kg-st-proposed { outline-style: dashed; outline-width: 1.5px; }
+.kg-gnode.kg-st-retired .kg-gnode-label { text-decoration: line-through; }
+.kg-accounting-note { font-size: 12px; color: var(--app-fg-muted); margin: 8px 0 0; line-height: 1.5; }
+.kg-graph-switch { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--app-border); border-radius: 8px; }
+.kg-graph-switch button {
+  border: none; background: transparent; color: var(--app-fg-muted); font: inherit; font-size: 12px;
+  padding: 4px 10px; border-radius: 6px; cursor: pointer;
+}
+.kg-graph-switch button.active { background: var(--app-muted); color: var(--app-fg); }
+.kg-empty { padding: 32px; color: var(--app-fg-muted); font-size: 13px; }
 .kg-c-sens-public       { --kg-fill: var(--kg-public); }
 .kg-c-sens-internal     { --kg-fill: var(--kg-internal); }
 .kg-c-sens-confidential { --kg-fill: var(--kg-confidential); }
