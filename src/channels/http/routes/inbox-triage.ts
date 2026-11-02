@@ -2,7 +2,8 @@
 //
 //   GET  /api/connections/inbox-triage       — current settings (never the ntfy token) + whether the watcher is running
 //   PUT  /api/connections/inbox-triage       — save settings to the encrypted vault, then restart the watcher
-//   POST /api/connections/inbox-triage/test  — send one content-free test push with the saved ntfy settings
+//   POST /api/connections/inbox-triage/test  — send one content-free test push with the saved ntfy settings;
+//                                              body {group: 'urgent'} sends the urgent push, default is the quiet one
 //
 // Session auth like the other console routes. Values are written to the vault under fixed `inbox_triage_*` names only;
 // the ntfy token is write-only (the form can replace or clear it, never read it back).
@@ -107,10 +108,12 @@ export async function inboxTriageRoutes(app: FastifyInstance, options: InboxTria
 
   app.post('/api/connections/inbox-triage/test', TEST_RATE, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
+    const group = (request.body as { group?: unknown } | null | undefined)?.group ?? 'seen';
+    if (group !== 'seen' && group !== 'urgent') return reply.status(400).send({ error: "group must be 'seen' or 'urgent'" });
     const url = await read(K.ntfyUrl);
     if (!url) return reply.status(400).send({ error: 'Save the ntfy address first.' });
     try {
-      await new NtfyNotifier(url, (await read(K.ntfyToken)) || null, fetchImpl).notify('seen');
+      await new NtfyNotifier(url, (await read(K.ntfyToken)) || null, fetchImpl).notify(group);
       return reply.send({ ok: true });
     } catch (err) {
       // The notifier's message carries the HTTP status only; never echo the URL or token.

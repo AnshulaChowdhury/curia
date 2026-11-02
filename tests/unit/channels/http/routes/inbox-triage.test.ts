@@ -104,6 +104,20 @@ describe('inbox triage settings routes', () => {
     expect(s.vault.get('inbox_triage_enabled')).toBe('true');
   });
 
+  it('sends the urgent push for group urgent, and rejects any other group', async () => {
+    const fetchImpl = vi.fn(async () => new Response('', { status: 200 })) as unknown as typeof fetch;
+    const s = setup({ fetchImpl, seed: { inbox_triage_ntfy_url: 'https://ntfy.example.com/curia-mail' } });
+    await build(s);
+    const res = await app.inject({ method: 'POST', url: `${URL_}/test`, headers: COOKIE, payload: { group: 'urgent' } });
+    expect(res.json()).toEqual({ ok: true });
+    const [, init] = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(init.body).toBe('mail:urgent');
+    expect((init.headers as Record<string, string>).Priority).toBe('4');
+    const bad = await app.inject({ method: 'POST', url: `${URL_}/test`, headers: COOKIE, payload: { group: 'drafted' } });
+    expect(bad.statusCode).toBe(400);
+    expect((fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
   it('test push needs saved settings, posts the content-free body, and reports a failure without the URL', async () => {
     const none = setup();
     await build(none);
