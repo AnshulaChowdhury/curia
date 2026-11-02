@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Upload bank files on the Books page** — drop the week's .qbo/.ofx/.csv files on the Books page; the books run takes them from Curia (no Google Drive needed). Files are checked, stored until recorded, then their contents are deleted.
 - **Urgent test push** — Inbox triage settings gets a button that sends the same push urgent mail does.
 - **`GET /phone/message`** — plain text of one email for the phone's email page; shares the `/phone/inbox` token.
 - **Books review** — the weekly batch of bank rows the books agent pushes shows on a new Books page: edit category, tax code, location, class and payee, then approve or skip rows; the agent pulls the approved rows, posts them to QuickBooks and reports the results back. Rows with an open flag cannot be approved without a category, and a posted row is final.

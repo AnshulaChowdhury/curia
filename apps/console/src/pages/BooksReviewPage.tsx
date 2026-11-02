@@ -233,6 +233,122 @@ function BatchView({ batchId, onBack }: { batchId: string; onBack: () => void })
   );
 }
 
+interface UploadItem {
+  id: string;
+  name: string;
+  size: number;
+  status: 'waiting' | 'processed';
+  uploaded_at: string;
+  processed_at: string | null;
+}
+
+function formatSize(n: number): string {
+  return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Upload the week's RBC download files (.qbo/.ofx/.csv). The books run takes them from here within about 15 minutes. */
+function UploadPanel({ onChange }: { onChange: () => void }) {
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  const [notes, setNotes] = useState<Array<{ text: string; error: boolean }>>([]);
+  const [busy, setBusy] = useState(false);
+  const [dragging, setDragging] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/books/uploads');
+      if (res.ok) setUploads((await res.json() as { uploads: UploadItem[] }).uploads);
+    } catch { /* the list is a convenience; a failed refresh is not worth an error */ }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  async function send(files: File[]) {
+    setBusy(true);
+    const out: Array<{ text: string; error: boolean }> = [];
+    for (const file of files) {
+      try {
+        const res = await apiFetch(`/api/books/uploads?name=${encodeURIComponent(file.name)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: file,
+        });
+        const d = await res.json().catch(() => ({})) as { error?: string; message?: string; duplicate?: boolean };
+        if (!res.ok) out.push({ text: `${file.name}: ${d.error ?? `HTTP ${res.status}`}`, error: true });
+        else out.push({ text: d.duplicate ? `${d.message ?? file.name}` : `${file.name} uploaded`, error: false });
+      } catch (e) {
+        out.push({ text: `${file.name}: ${e instanceof Error ? e.message : 'upload failed'}`, error: true });
+      }
+    }
+    setNotes(out);
+    setBusy(false);
+    await load();
+    onChange();
+  }
+
+  async function remove(id: string) {
+    const res = await apiFetch(`/api/books/uploads/${id}`, { method: 'DELETE' });
+    if (!res.ok) setNotes([{ text: await errorText(res), error: true }]);
+    await load();
+  }
+
+  const muted = { color: 'var(--app-fg-muted)' } as const;
+  return (
+    <section className="settings-section" style={{ maxWidth: 'none', margin: '16px 24px' }}>
+      <div className="settings-section-head">
+        <h3 className="settings-section-title">Upload bank files</h3>
+        <p className="settings-section-sub">
+          The week&apos;s RBC downloads (.qbo, .ofx or .csv, up to 5 MB each), chequing and card. The books run picks them up within about
+          15 minutes, compares them with QuickBooks and makes a batch below. Once recorded, the file&apos;s contents are deleted from Curia.
+        </p>
+      </div>
+      <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 }}>
+        <div
+          onDragOver={e => { e.preventDefault(); setDragging(true); }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={e => { e.preventDefault(); setDragging(false); void send([...e.dataTransfer.files]); }}
+          style={{
+            border: `2px dashed ${dragging ? 'var(--app-primary)' : 'var(--app-input-bd)'}`, borderRadius: 8, padding: 24,
+            textAlign: 'center', ...muted,
+          }}
+        >
+          {busy ? 'Uploading…' : (
+            <>
+              Drop files here, or{' '}
+              <label className="btn btn-secondary" style={{ cursor: 'pointer' }}>
+                Choose files
+                <input
+                  type="file" multiple accept=".qbo,.ofx,.csv" style={{ display: 'none' }}
+                  onChange={e => { const f = [...(e.target.files ?? [])]; e.target.value = ''; if (f.length) void send(f); }}
+                />
+              </label>
+            </>
+          )}
+        </div>
+        {notes.map((n, i) => (
+          <div key={i} style={{ color: n.error ? 'var(--app-destructive)' : 'var(--app-fg)' }}>{n.text}</div>
+        ))}
+        {uploads.length > 0 && (
+          <table className="records-table">
+            <thead><tr><th>File</th><th style={{ textAlign: 'right' }}>Size</th><th>Uploaded</th><th>State</th><th /></tr></thead>
+            <tbody>
+              {uploads.map(u => (
+                <tr key={u.id}>
+                  <td>{u.name}</td>
+                  <td style={{ textAlign: 'right' }}>{formatSize(u.size)}</td>
+                  <td>{formatDate(u.uploaded_at)}</td>
+                  <td>{u.status === 'waiting' ? 'Waiting for the next run' : `Processed ${u.processed_at ? formatDate(u.processed_at) : ''}`}</td>
+                  <td style={{ textAlign: 'right' }}>
+                    {u.status === 'waiting' && <button type="button" className="btn btn-secondary" onClick={() => void remove(u.id)}>Remove</button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function BooksReviewPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -266,11 +382,13 @@ export default function BooksReviewPage() {
           {openId ? (
             <BatchView batchId={openId} onBack={() => setOpenId(null)} />
           ) : (
+            <>
+            <UploadPanel onChange={() => void load()} />
             <div className="records-table-wrap">
               {loadError && <div style={{ padding: 24, fontSize: 13, color: 'var(--app-destructive)' }}>{loadError}</div>}
               {batches && batches.length === 0 && (
                 <div style={{ padding: 24, fontSize: 13, color: 'var(--app-fg-muted)' }}>
-                  No batches yet. Drop the week&apos;s RBC download files in the bank files folder; the books run turns them into a batch here.
+                  No batches yet. Upload the week&apos;s RBC download files above; the books run turns them into a batch here.
                 </div>
               )}
               {batches && batches.length > 0 && (
@@ -294,6 +412,7 @@ export default function BooksReviewPage() {
                 </table>
               )}
             </div>
+            </>
           )}
         </main>
       </div>
