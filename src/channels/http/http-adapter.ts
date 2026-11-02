@@ -74,6 +74,13 @@ import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
 import { contactsSourcesRoutes } from './routes/contacts-sources.js';
+import { BRIDGES, bridgeVaultKeys } from '../../contacts-import/bridges.js';
+import { contactsImportRunRoutes } from './routes/contacts-import-run.js';
+import { ContactImportService } from '../../contacts-import/import-service.js';
+import { PgImportStore } from '../../contacts-import/import-store.js';
+import { PgRunStore } from '../../contacts-import/run-store.js';
+import { ContactsPullService, type Collector } from '../../contacts-import/pull-service.js';
+import { fetchBridgeContacts } from '../../contacts-import/bridge-contacts.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
@@ -828,6 +835,33 @@ export class HttpAdapter implements Channel {
         secrets: sourcesSecrets,
         categories: new PgMailboxCategoryStore(pool),
         loadMailboxes: () => loadPhoneInboxAccounts(sourcesSecrets),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // Preview and Apply for the Sources drawer. Preview is a dry run; Apply does exactly what the preview planned.
+      // Today it reads the Matrix bridges only; mailboxes join when their reader exists.
+      await this.app.register(contactsImportRunRoutes, {
+        logger,
+        getService: async () => {
+          const collectors: Collector[] = [];
+          for (const bridge of BRIDGES) {
+            const keys = bridgeVaultKeys(bridge.id);
+            const url = (await sourcesSecrets.get(keys.url))?.trim() ?? '';
+            const secret = (await sourcesSecrets.get(keys.secret))?.trim() ?? '';
+            if (!url || !secret) continue;
+            collectors.push({
+              sourceId: `bridge:${bridge.id}`,
+              label: bridge.label,
+              collect: () => fetchBridgeContacts(bridge, url, secret, logger),
+            });
+          }
+          return new ContactsPullService(
+            new ContactImportService(this.config.contactService, new PgImportStore(pool), logger),
+            new PgRunStore(pool),
+            collectors,
+            logger,
+          );
+        },
         webAppBootstrapSecret,
         sessions,
       });

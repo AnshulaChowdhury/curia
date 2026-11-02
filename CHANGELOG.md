@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Contacts import Preview and Apply** — dry-run the Matrix bridges' contact lists, then apply exactly that preview as `unknown` contacts (migration 119).
 - **Contacts page Sources drawer** — shows each mailbox, bridge and contact app the import reads, with Work/Personal set on Command Hub.
 - **Mailbox category from the phone** — `PUT /phone/inbox/accounts/{id}/category` stores each mailbox's Work/Personal choice from Command Hub (migration 118).
 - **Books specialist** — the Digital EA can ask a read-only `books` agent about cash, review queue and uploads (ADR-060).

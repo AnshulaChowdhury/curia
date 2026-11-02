@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api.js';
-import { STATUS_LABEL, categoryLabel, sourcesSummary, type ImportSourceRow } from './sources-utils.js';
+import {
+  STATUS_LABEL, applyOutcomeText, applyPrompt, categoryLabel, reviewReasonText, sourcesSummary,
+  type ApplyResult, type ImportSourceRow, type PreviewResult,
+} from './sources-utils.js';
 
 // The Contacts page "Sources" drawer: every place the contact import reads people from, and whether it will.
 // Read-only. A mailbox's Work/Personal category is set on Command Hub (the Android launcher) and only shown here.
@@ -12,6 +15,53 @@ interface Props {
 export default function SourcesDrawer({ onClose }: Props) {
   const [rows, setRows] = useState<ImportSourceRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<PreviewResult | null>(null);
+  const [outcome, setOutcome] = useState<string | null>(null);
+  const [busy, setBusy] = useState<'preview' | 'apply' | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function errorOf(res: Response): Promise<string> {
+    try {
+      const body = await res.json() as { error?: string };
+      return body.error ?? `HTTP ${res.status}`;
+    } catch {
+      return `HTTP ${res.status}`;
+    }
+  }
+
+  async function runPreview() {
+    setBusy('preview'); setActionError(null); setOutcome(null); setPreview(null);
+    try {
+      const res = await apiFetch('/api/contacts/import/preview', { method: 'POST' });
+      if (!res.ok) { setActionError(await errorOf(res)); return; }
+      setPreview(await res.json() as PreviewResult);
+    } catch (err) {
+      setActionError('Could not reach Curia');
+      console.error('[SourcesDrawer] preview failed:', err);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runApply() {
+    if (!preview) return;
+    setBusy('apply'); setActionError(null);
+    try {
+      const res = await apiFetch('/api/contacts/import/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId: preview.runId }),
+      });
+      if (!res.ok) { setActionError(await errorOf(res)); return; }
+      setOutcome(applyOutcomeText(await res.json() as ApplyResult));
+      setPreview(null); // a preview can be applied once
+    } catch (err) {
+      setActionError('Could not reach Curia');
+      console.error('[SourcesDrawer] apply failed:', err);
+    } finally {
+      setBusy(null);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -70,6 +120,59 @@ export default function SourcesDrawer({ onClose }: Props) {
               );
             })}
           </ul>
+        )}
+
+        {rows && (
+          <div style={{ marginTop: 16 }}>
+            <button className="btn btn-secondary btn-sm" onClick={() => void runPreview()} disabled={busy !== null}>
+              {busy === 'preview' ? 'Reading sources…' : 'Preview import'}
+            </button>
+            <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '6px 0 0' }}>
+              A preview reads the ready sources and counts what would happen. It changes nothing.
+            </p>
+            {actionError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: '8px 0 0' }}>{actionError}</p>}
+            {outcome && <p style={{ fontSize: 13, margin: '8px 0 0' }}>{outcome}</p>}
+
+            {preview && (
+              <div style={{ marginTop: 12, border: '1px solid var(--app-border)', borderRadius: 6, padding: '10px 12px', fontSize: 12 }}>
+                <strong style={{ fontSize: 13 }}>{preview.totals.people} people found</strong>
+                <div style={{ marginTop: 4 }}>
+                  {preview.totals.create} new · {preview.totals.attach} already in Curia · {preview.totals.review} need review
+                  {preview.droppedNoName > 0 && ` · ${preview.droppedNoName} skipped (only a number, no name)`}
+                </div>
+                <ul style={{ margin: '8px 0 0', paddingLeft: 16, color: 'var(--app-fg-muted)' }}>
+                  {preview.sources.map(s => (
+                    <li key={s.sourceId}>{s.label}: {s.ok ? `${s.usable} usable of ${s.read}` : s.message}</li>
+                  ))}
+                </ul>
+                {Object.keys(preview.reviewReasons).length > 0 && (
+                  <ul style={{ margin: '8px 0 0', paddingLeft: 16, color: 'var(--app-fg-muted)' }}>
+                    {Object.entries(preview.reviewReasons).map(([code, n]) => (
+                      <li key={code}>{n} to review: {reviewReasonText(code)}</li>
+                    ))}
+                  </ul>
+                )}
+                {(['create', 'attach', 'review'] as const).map(kind => preview.sample[kind].length > 0 && (
+                  <div key={kind} style={{ marginTop: 8 }}>
+                    <div style={{ textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: 11, color: 'var(--app-fg-muted)' }}>
+                      Sample: {kind === 'create' ? 'new' : kind === 'attach' ? 'already in Curia' : 'to review'}
+                    </div>
+                    {preview.sample[kind].map((r, i) => (
+                      <div key={`${kind}-${i}`} style={{ fontFamily: 'JetBrains Mono, monospace' }}>{r.name} · {r.identifier}</div>
+                    ))}
+                  </div>
+                ))}
+                <p style={{ margin: '12px 0 6px' }}>{applyPrompt(preview)}</p>
+                <button
+                  className="btn btn-primary btn-sm"
+                  onClick={() => void runApply()}
+                  disabled={busy !== null || preview.totals.create + preview.totals.attach === 0}
+                >
+                  {busy === 'apply' ? 'Applying…' : 'Apply this preview'}
+                </button>
+              </div>
+            )}
+          </div>
         )}
       </div>
     </aside>
