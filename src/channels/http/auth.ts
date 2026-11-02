@@ -67,6 +67,8 @@ const SELF_AUTHED_API_PREFIXES = [
   '/api/vault',
   // API connections page (QuickBooks status): session auth via assertSecret.
   '/api/connections',
+  // Books review (batches of bank rows to approve): session auth via assertSecret.
+  '/api/books',
   // Secret-capture routes are token-authed (the single-use token in the URL is the
   // capability), so they bypass bearer auth and self-authorize via the token (#971).
   '/api/secret-capture',
