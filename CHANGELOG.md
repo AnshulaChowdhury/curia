@@ -17,6 +17,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Urgent test push** — Inbox triage settings gets a button that sends the same push urgent mail does.
 - **`GET /phone/message`** — plain text of one email for the phone's email page; shares the `/phone/inbox` token.
+- **Contacts import service** — dry run, then apply; new people are tier unknown with unverified identities.
+- **Contacts import tables (migration 112)** — saved plans, record-to-contact map, work/personal labels.
 - **Books review** — the weekly batch of bank rows the books agent pushes shows on a new Books page: edit category, tax code, location, class and payee, then approve or skip rows; the agent pulls the approved rows, posts them to QuickBooks and reports the results back. Rows with an open flag cannot be approved without a category, and a posted row is final.
 - **Bank files folder (Google Drive)** — the books agent fetches the weekly RBC download files from one Drive folder through Curia (service account, folder-scoped; set up on the API connections page), and finished files move to a Processed subfolder.
 - **QuickBooks allow-list** — the books routes may read BillPayment, JournalEntry, receipts, Bill, Invoice, CreditMemo and CreditCardPayment, and create a JournalEntry (month-end).
