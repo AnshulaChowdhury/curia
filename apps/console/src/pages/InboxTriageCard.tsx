@@ -81,13 +81,22 @@ export default function InboxTriageCard() {
     }
   }
 
-  async function sendTest() {
+  async function sendTest(group: 'seen' | 'urgent') {
     setBusy(true);
     setMessage(null);
     try {
-      const res = await apiFetch('/api/connections/inbox-triage/test', { method: 'POST' });
+      const res = await apiFetch('/api/connections/inbox-triage/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ group }),
+      });
       if (!res.ok) throw new Error(await errorOf(res));
-      setMessage({ kind: 'ok', text: 'Test push sent. Your phone should ping within a few seconds.' });
+      setMessage({
+        kind: 'ok',
+        text: group === 'urgent'
+          ? 'Urgent test push sent. If "Notify for urgent email" is on in Command Hub, an "Urgent email" notification appears.'
+          : 'Test push sent. Command Hub refreshes its inbox quietly; it only notifies if "Notify for other new email" is on.',
+      });
     } catch (err) {
       setMessage({ kind: 'error', text: err instanceof Error ? err.message : 'Test failed' });
     } finally {
@@ -146,8 +155,12 @@ export default function InboxTriageCard() {
             Save
           </button>
           <button type="button" className="btn btn-secondary" disabled={!saved || busy || dirty || !saved.ntfyUrl}
-            onClick={() => void sendTest()} title={dirty ? 'Save first' : undefined}>
+            onClick={() => void sendTest('seen')} title={dirty ? 'Save first' : undefined}>
             Send test push
+          </button>
+          <button type="button" className="btn btn-secondary" disabled={!saved || busy || dirty || !saved.ntfyUrl}
+            onClick={() => void sendTest('urgent')} title={dirty ? 'Save first' : undefined}>
+            Send urgent test push
           </button>
           {saved?.hasToken && (
             <button type="button" className="btn btn-secondary" disabled={busy} onClick={() => void save({ ntfyToken: '' })}>
