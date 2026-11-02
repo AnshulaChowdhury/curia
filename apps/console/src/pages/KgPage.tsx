@@ -27,6 +27,8 @@ import {
 import type { ApiKgEdge, ColorMode, KgFlowEdge, KgFlowNode } from './kg-graph-model.js';
 import { KG_EDGE_TYPES, KG_NODE_TYPES, ZoomLevelClass } from './kg-graph-view.js';
 import { createLayoutClient } from './kg-layout-client.js';
+import AccountingGraphPage from './AccountingGraphPage.js';
+import { GraphSelector } from './GraphSelector.js';
 import type { LayoutClient } from './kg-layout-client.js';
 
 // The graph is drawn with xyflow; layout runs in a Web Worker (ADR-058).
@@ -194,6 +196,9 @@ function NodeDetailDrawer({ node, onClose, onMerge }: NodeDetailDrawerProps) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function KgPage() {
+  // ?graph=accounting shows the accounting rules graph (ADR-059); anything else is the memory graph.
+  const { graph } = useSearch({ strict: false }) as { graph?: string };
+  if (graph === 'accounting') return <AccountingGraphPage />;
   // useReactFlow (fitView) needs the provider above the component that calls it.
   return (
     <ReactFlowProvider>
@@ -300,7 +305,7 @@ function KgPageInner() {
   function syncUrl(q: string, nodeId: string | undefined) {
     navigate({
       to: '/kg',
-      search: { q: q || undefined, node: nodeId },
+      search: { q: q || undefined, node: nodeId, graph: undefined },
       replace: true,
     }).catch(err => {
       console.error('[KgPage] URL sync failed:', err);
@@ -755,6 +760,7 @@ function KgPageInner() {
         )}
         <main className="main">
           <Topbar crumb="Memory" title="Knowledge Graph">
+            <GraphSelector current="memory" />
             <TopbarSearch
               placeholder="Search nodes…"
               value={search}

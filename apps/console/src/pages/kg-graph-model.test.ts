@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  addToModel, applyPositions, buildFlow, closedNeighborhood, colorClass, degrees, drawerNode, emptyFlowCache,
+  accountingSwatchClass, addToModel, applyPositions, buildFlow, closedNeighborhood, colorClass, degrees, drawerNode, emptyFlowCache,
   graphStatus, layoutRequest, modelFrom, nodeSize, removeNode, swatchClass,
 } from './kg-graph-model.js';
 import type { ApiKgEdge, FlowOptions } from './kg-graph-model.js';
@@ -138,5 +138,51 @@ describe('layoutRequest', () => {
     expect(exp.anchorId).toBe('a');
     expect(exp.nodes.find(n => n.id === 'b')).toMatchObject({ x: 100, y: 0 });
     expect(exp.edges).toHaveLength(2);
+  });
+});
+
+describe('accounting colour classes', () => {
+  const rule = (props: Record<string, unknown>) => node('r', 'rule', { properties: props });
+
+  it('colours a rule by what it assigns and draws it as a rule', () => {
+    expect(colorClass(rule({ ruleKind: 'tax', status: 'confirmed' }), 'accounting')).toBe('kg-c-acct-rule-tax kg-shape-rule');
+    expect(colorClass(rule({ ruleKind: 'vendor', status: 'confirmed' }), 'accounting')).toBe('kg-c-acct-rule-vendor kg-shape-rule');
+  });
+
+  it('marks a proposed rule dashed and a retired or dismissed one struck through', () => {
+    expect(colorClass(rule({ ruleKind: 'category', status: 'proposed' }), 'accounting')).toContain('kg-st-proposed');
+    expect(colorClass(rule({ ruleKind: 'category', status: 'retired' }), 'accounting')).toContain('kg-st-retired');
+    expect(colorClass(rule({ ruleKind: 'category', status: 'dismissed' }), 'accounting')).toContain('kg-st-retired');
+  });
+
+  it('colours things by type and falls back for unknown kinds and types', () => {
+    expect(colorClass(node('c', 'category'), 'accounting')).toBe('kg-c-acct-category');
+    expect(colorClass(node('b', 'bank_account'), 'accounting')).toBe('kg-c-acct-bank_account');
+    expect(colorClass(node('x', 'mystery'), 'accounting')).toBe('kg-c-acct-other');
+    expect(colorClass(rule({ ruleKind: 'weird' }), 'accounting')).toContain('kg-c-acct-rule-other');
+    expect(colorClass(rule({}), 'accounting')).toContain('kg-c-acct-rule-other');
+  });
+
+  it('never puts text from the snapshot into a class name', () => {
+    expect(colorClass(rule({ ruleKind: 'tax" onmouseover="x', status: 'proposed' }), 'accounting')).not.toContain('onmouseover');
+    expect(colorClass(node('c', 'category" x="y'), 'accounting')).toBe('kg-c-acct-other');
+  });
+
+  it('gives a swatch class per type', () => {
+    expect(accountingSwatchClass('payee')).toBe('kg-c-acct-payee');
+    expect(accountingSwatchClass('rule')).toBe('kg-c-acct-rule-other');
+    expect(accountingSwatchClass('zzz')).toBe('kg-c-acct-other');
+  });
+
+  it('opacity follows the derived confidence: proposed fainter, retired faintest', () => {
+    const m = modelFrom({
+      nodes: [node('a', 'rule', { confidence: 1 }), node('p', 'rule', { confidence: 0.5 }), node('r', 'rule', { confidence: 0 })],
+      edges: [],
+    });
+    applyPositions(m, { a: { x: 0, y: 0 }, p: { x: 1, y: 1 }, r: { x: 2, y: 2 } });
+    const { nodes } = buildFlow(m, opts({ colorMode: 'accounting' }), emptyFlowCache());
+    const op = Object.fromEntries(nodes.map(n => [n.id, n.data.opacity]));
+    expect(op['a']).toBeGreaterThan(op['p']!);
+    expect(op['p']).toBeGreaterThan(op['r']!);
   });
 });

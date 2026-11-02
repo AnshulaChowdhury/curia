@@ -17,7 +17,7 @@ export interface ApiKgEdge {
   confidence: number;
 }
 
-export type ColorMode = 'type' | 'sensitivity' | 'decay';
+export type ColorMode = 'type' | 'sensitivity' | 'decay' | 'accounting';
 
 export interface Point { x: number; y: number }
 
@@ -150,8 +150,32 @@ const KNOWN_TYPES = new Set(['person', 'organization', 'project', 'decision', 'e
 const KNOWN_SENS = new Set(['public', 'internal', 'confidential', 'restricted']);
 const KNOWN_DECAY = new Set(['permanent', 'slow_decay', 'fast_decay']);
 
+const ACCOUNTING_TYPES = new Set(['category', 'bank_account', 'tax_code', 'location', 'class', 'payee']);
+const RULE_KINDS = new Set(['category', 'tax', 'vendor', 'location', 'class']);
+
+/**
+ * Classes for a node of the accounting rules graph: fill by what it is (rules by what they assign), rules drawn
+ * as rounded squares, and the rule's status (proposed: dashed outline; retired or dismissed: struck-through label).
+ */
+export function accountingClass(n: ApiKgNode): string {
+  if (n.type !== 'rule') return `kg-c-acct-${ACCOUNTING_TYPES.has(n.type) ? n.type : 'other'}`;
+  const props = n.properties ?? {};
+  const kind = typeof props['ruleKind'] === 'string' && RULE_KINDS.has(props['ruleKind']) ? props['ruleKind'] : 'other';
+  const status = props['status'];
+  const cls = [`kg-c-acct-rule-${kind}`, 'kg-shape-rule'];
+  if (status === 'proposed') cls.push('kg-st-proposed');
+  if (status === 'retired' || status === 'dismissed') cls.push('kg-st-retired');
+  return cls.join(' ');
+}
+
+/** Swatch class for a type in the accounting filter list. */
+export function accountingSwatchClass(type: string): string {
+  return `kg-c-acct-${ACCOUNTING_TYPES.has(type) ? type : type === 'rule' ? 'rule-other' : 'other'}`;
+}
+
 /** CSS class carrying the node's fill (colours live in app.css, so they follow the theme). */
 export function colorClass(n: ApiKgNode, mode: ColorMode): string {
+  if (mode === 'accounting') return accountingClass(n);
   if (mode === 'sensitivity') {
     const s = normalizeSensitivity(n.sensitivity);
     return `kg-c-sens-${KNOWN_SENS.has(s) ? s : 'other'}`;

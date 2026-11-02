@@ -80,6 +80,7 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 | [056](056-pinned-context.md) | Agents declare the documents and settings they work from (`pinned_context`) — `/shared/` documents and single config keys injected fresh every turn; declaring a `/shared/` path is the permission to write it; `/shared/` is durable by prefix (#2338) | Accepted |
 | [057](057-two-http-chat-surfaces.md) | Retire bearer `/api/messages` and `/api/messages/stream`; console chat on `/api/chat` is the only message ingress. The HTTP adapter, `API_TOKEN`, and catalog entry stay (#999) | Accepted |
 | [058](058-knowledge-graph-view-on-xyflow.md) | Knowledge Graph view drawn with xyflow, laid out by d3-force in a Web Worker; less detail when zoomed out, memoised nodes; same neighbourhood-at-a-time flow | Accepted |
+| [059](059-accounting-graph-on-the-mac-mini-snapshot-in-curia.md) | The accounting rules graph lives on the books Mac mini; Curia stores a read-only pushed snapshot and the Knowledge Graph page gets a second, selectable Accounting graph | Accepted |
 
 ## Adding new ADRs
 
