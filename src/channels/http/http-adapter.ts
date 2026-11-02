@@ -685,6 +685,15 @@ export class HttpAdapter implements Channel {
         logger,
         getToken: () => secrets.get('phone_inbox_token'),
         getService: async () => new PhoneInboxService(await loadPhoneInboxAccounts(secrets), logger, undefined, phoneInboxCache),
+        // The assistant's name for the phone's morning-brief row. A failure here must not break the inbox answer.
+        getAssistantName: () => {
+          try {
+            return this.config.identityService?.get().assistant.name ?? null;
+          } catch (err) {
+            logger.warn({ err }, 'phone-inbox: could not read the assistant name');
+            return null;
+          }
+        },
       });
       // The text of one email, for the phone's email page. Same token as /phone/inbox.
       await this.app.register(phoneMessageRoutes, {

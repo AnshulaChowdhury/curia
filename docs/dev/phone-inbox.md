@@ -4,6 +4,9 @@ Read-only summary of email that "needs you", for the Command Hub Android launche
 MVOS repo (`contracts/phone-inbox.openapi.yaml`); this is how Curia serves it.
 
 ## What it returns
+Top level: `updatedAt`, `accounts`, and `assistantName`: the executive assistant's full name from the office identity (one
+line, at most 80 characters, `null` if unknown). The phone shows the first word in "morning brief from …" and falls back to
+"Curia" when the field is missing, so it is optional for older phones.
 Per mailbox (`personal`, `moonray`, `work-outlook`; always all three): the unread inbox messages tagged
 **Urgent**, **Drafted** or **Seen** by the `ceo-inbox` triage, newest first, one per thread, minus any thread
 you replied to after the message arrived (sent mail from the last 14 days is checked). Only sender, subject,
