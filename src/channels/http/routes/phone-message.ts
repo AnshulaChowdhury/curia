@@ -6,12 +6,12 @@
 // it is read from Nylas, returned with `Cache-Control: no-store`, and dropped.
 // Contract: contracts/phone-inbox.openapi.yaml in the MVOS repo.
 
-import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import { NylasMailboxError } from '../../../phone-inbox/nylas-mailbox.js';
 import type { NylasMessageReader } from '../../../phone-inbox/nylas-message.js';
 import { MailboxRateLimitedError, PHONE_INBOX_ACCOUNT_IDS, type PhoneInboxAccountId } from '../../../phone-inbox/phone-inbox-service.js';
+import { authorisePhoneRequest } from './phone-auth.js';
 
 export interface PhoneMessageRouteOptions {
   logger: Logger;
@@ -22,13 +22,6 @@ export interface PhoneMessageRouteOptions {
 }
 
 const MAX_ID_LENGTH = 256;
-
-// Same constant-time check as routes/phone-inbox.ts (kept separate so that file stays as it is).
-function tokensMatch(provided: string, expected: string): boolean {
-  const a = createHash('sha256').update(provided).digest();
-  const b = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(a, b);
-}
 
 function validId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= MAX_ID_LENGTH;
@@ -42,16 +35,7 @@ export async function phoneMessageRoutes(app: FastifyInstance, options: PhoneMes
     '/phone/message',
     { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
     async (request, reply) => {
-      const expected = (await getToken())?.trim();
-      if (!expected) return reply.status(404).send({ error: 'Not found' });
-
-      const header = request.headers.authorization;
-      const provided = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
-      if (!provided || !tokensMatch(provided, expected)) {
-        // Never log the token; only whether one was sent.
-        logger.warn({ ip: request.ip, reason: provided ? 'invalid_token' : 'missing_token' }, 'phone-message: auth failed');
-        return reply.status(401).header('WWW-Authenticate', 'Bearer').send({ error: 'Unauthorized' });
-      }
+      if (!(await authorisePhoneRequest(request, reply, getToken, logger, 'phone-message'))) return reply;
 
       const { account, threadId, messageId } = request.query;
       const accountId = PHONE_INBOX_ACCOUNT_IDS.find((id) => id === account);

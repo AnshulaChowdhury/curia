@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **`GET /phone/brief`** — daily 06:30 morning brief for the phone: yesterday's newsletters summarised; other sections plug in.
 - **Upload bank files on the Books page** — drop the week's .qbo/.ofx/.csv files on the Books page; the books run takes them from Curia (no Google Drive needed). Files are checked, stored until recorded, then their contents are deleted.
 - **Urgent test push** — Inbox triage settings gets a button that sends the same push urgent mail does.
 - **`GET /phone/message`** — plain text of one email for the phone's email page; shares the `/phone/inbox` token.

@@ -63,6 +63,7 @@ import { emailAccountsRoutes } from './routes/email-accounts.js';
 import { secretCaptureRoutes } from './routes/secret-capture.js';
 import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
+import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
@@ -145,6 +146,8 @@ export interface HttpAdapterConfig {
   /** Backs the /api/vault/* routes (secrets status + skill-secret entry). Mounted only
    *  alongside registryService, which scopes which secret names may be written. */
   secretsService?: import('../../secrets/secrets-service.js').SecretsService;
+  /** Backs GET /phone/brief, the Command Hub morning brief. Mounted only when the secrets vault is also available. */
+  phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
@@ -689,6 +692,14 @@ export class HttpAdapter implements Channel {
         getToken: () => secrets.get('phone_inbox_token'),
         getReader: (account) => loadPhoneMessageReader(secrets, account),
       });
+      // The morning brief. Same token as /phone/inbox.
+      if (this.config.phoneBrief) {
+        await this.app.register(phoneBriefRoutes, {
+          logger,
+          getToken: () => secrets.get('phone_inbox_token'),
+          service: this.config.phoneBrief,
+        });
+      }
     }
     // Telnyx SMS webhook — always mounted; SmsAdapter installs the handler on start.
     // Authenticates via Ed25519 (bearer-exempt above). Returns 503 when SMS is not started.
