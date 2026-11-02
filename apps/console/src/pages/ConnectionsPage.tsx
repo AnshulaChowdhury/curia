@@ -187,6 +187,112 @@ function QuickbooksCard({ c, reload }: { c: Connection; reload: () => Promise<vo
   );
 }
 
+interface DriveStatus {
+  configured: boolean;
+  serviceAccountEmail?: string;
+  folderName?: string;
+  reachable?: boolean;
+  problem?: string;
+}
+
+/** The service account's address from the pasted key, so the page can say who to share the folder with. */
+function emailFromKey(json: string): string | null {
+  try {
+    const email = (JSON.parse(json) as { client_email?: unknown }).client_email;
+    return typeof email === 'string' ? email : null;
+  } catch {
+    return null;
+  }
+}
+
+function DriveCard() {
+  const [status, setStatus] = useState<DriveStatus | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [keyJson, setKeyJson] = useState('');
+  const [folder, setFolder] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/connections/drive');
+      if (!res.ok) throw new Error(await errorText(res));
+      const st = await res.json() as DriveStatus;
+      setStatus(st);
+      setEditing(!st.configured);
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : 'Failed to load', error: true });
+    }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  async function save() {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const res = await apiFetch('/api/connections/drive/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serviceAccountJson: keyJson, folder }),
+      });
+      if (!res.ok) throw new Error(await errorText(res));
+      setKeyJson('');
+      setFolder('');
+      setMessage({ text: 'Saved. Curia can open the folder.', error: false });
+      await load();
+    } catch (e) {
+      setMessage({ text: e instanceof Error ? e.message : 'Could not save', error: true });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const muted = { color: 'var(--app-fg-muted)' } as const;
+  const keyEmail = emailFromKey(keyJson);
+  return (
+    <section className="settings-section">
+      <div className="settings-section-head">
+        <h3 className="settings-section-title">
+          Google Drive: bank files{' '}
+          <span className={`status-pill${status?.configured ? (status.reachable ? ' confirmed' : ' provisional') : ''}`}>
+            {!status ? '…' : !status.configured ? 'Not set up' : status.reachable ? 'Connected' : 'Folder not reachable'}
+          </span>
+        </h3>
+        <p className="settings-section-sub">
+          The folder where the RBC download files (.qbo) are dropped each week. Curia can see only this folder, and hands the files to the books agent.
+        </p>
+      </div>
+      <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 }}>
+        {message && <div style={{ color: message.error ? 'var(--app-destructive)' : 'var(--app-fg)' }}>{message.text}</div>}
+        {status?.configured && !editing ? (
+          <div style={muted}>
+            {status.reachable ? <>Folder &ldquo;{status.folderName}&rdquo;, read as {status.serviceAccountEmail}. </> : <>{status.problem} </>}
+            <button type="button" className="btn btn-secondary" onClick={() => setEditing(true)}>Change</button>
+          </div>
+        ) : (
+          <form onSubmit={e => { e.preventDefault(); void save(); }} style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 520 }}>
+            <div style={muted}>
+              In Google Cloud, create a service account, enable the Google Drive API for the project, and download the account&apos;s JSON key.
+              Then share your bank files folder with the account&apos;s email address (Editor, so it can move finished files to a Processed folder).
+            </div>
+            <label style={fieldStyle}>Service account key (the JSON file&apos;s contents)
+              <textarea style={{ ...inputStyle, minHeight: 90, fontFamily: 'monospace', fontSize: 12 }} value={keyJson} onChange={e => setKeyJson(e.target.value)} spellCheck={false} autoComplete="off" />
+            </label>
+            {keyEmail && <div style={muted}>Share the folder with <strong>{keyEmail}</strong> before you save.</div>}
+            <label style={fieldStyle}>Folder link (from Google Drive: Share &rarr; Copy link)
+              <input style={inputStyle} value={folder} onChange={e => setFolder(e.target.value)} spellCheck={false} />
+            </label>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button type="submit" className="btn btn-primary" disabled={saving || !keyJson.trim() || !folder.trim()}>{saving ? 'Checking…' : 'Save'}</button>
+              {status?.configured && <button type="button" className="btn btn-secondary" onClick={() => setEditing(false)}>Cancel</button>}
+            </div>
+          </form>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function ConnectionsPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -232,6 +338,7 @@ export default function ConnectionsPage() {
             </div>
             {loadError && <div style={{ color: 'var(--app-destructive)', fontSize: 13 }}>{loadError}</div>}
             {connections.map(c => <QuickbooksCard key={c.id} c={c} reload={() => load()} />)}
+            <DriveCard />
             <InboxTriageCard />
           </div>
         </main>

@@ -68,6 +68,8 @@ import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbo
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { QboConnection, qboSettingsFromEnv } from '../../quickbooks/qbo-connection.js';
 import { BooksToken } from '../../quickbooks/books-token.js';
+import { DriveInbox } from '../../books/drive-inbox.js';
+import { booksInboxRoutes } from './routes/books-inbox.js';
 import { setupRoutes } from './routes/setup.js';
 import { smsWebhookRoutes } from '../sms/webhook-route.js';
 import { SmsWebhookBridge } from '../sms/webhook-bridge.js';
@@ -685,6 +687,13 @@ export class HttpAdapter implements Channel {
       await this.app.register(quickbooksRoutes, {
         logger,
         connection: new QboConnection(qboSettingsFromEnv(), this.config.secretsService, logger),
+        booksToken: new BooksToken(this.config.secretsService),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      await this.app.register(booksInboxRoutes, {
+        logger,
+        driveInbox: new DriveInbox(this.config.secretsService),
         booksToken: new BooksToken(this.config.secretsService),
         webAppBootstrapSecret,
         sessions,
