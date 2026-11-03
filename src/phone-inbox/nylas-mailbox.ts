@@ -25,6 +25,22 @@ interface NylasListResponse<T> {
   data?: T[];
 }
 
+/** One participant-level view of a message, with no subject, body or id: what the contacts farm needs. */
+export interface ScannedMessage {
+  from: { name?: string; email: string }[];
+  to: { name?: string; email: string }[];
+  cc: { name?: string; email: string }[];
+  /** Seconds since the epoch. */
+  date: number;
+  folders: string[];
+}
+
+export interface ScanPage {
+  messages: ScannedMessage[];
+  /** Pass back to continue; undefined when this was the last page. */
+  nextCursor?: string;
+}
+
 interface NylasMessage {
   id: string;
   thread_id?: string;
@@ -94,7 +110,46 @@ export class NylasMailbox implements MailboxReader {
     return messages.map((m) => ({ threadId: m.thread_id ?? '', date: m.date ?? 0 }));
   }
 
+  /** Folder id → name, for telling spam, trash and drafts from real mail. */
+  async folderNames(): Promise<Map<string, string>> {
+    const folders = await this.get<NylasFolder>('/folders', 'folders');
+    return new Map(folders.map((f) => [f.id, f.name ?? ''] as const));
+  }
+
+  /**
+   * One page of every message (newest first) back to `receivedAfter`, reduced to participants and a date. Asks Nylas to
+   * send only those fields, and keeps only those fields, so no subject, body or message id is ever held.
+   */
+  async scanPage(receivedAfter: number, cursor?: string, pageSize = 200): Promise<ScanPage> {
+    const query = new URLSearchParams({
+      limit: String(pageSize),
+      received_after: String(receivedAfter),
+      select: 'from,to,cc,date,folders',
+    });
+    if (cursor) query.set('page_token', cursor);
+    const json = await this.getJson<{ data?: Array<Record<string, unknown>>; next_cursor?: string }>(`/messages?${query}`, 'scan');
+    const people = (v: unknown): ScannedMessage['from'] =>
+      Array.isArray(v)
+        ? v.flatMap((p) => {
+            const o = p as { name?: unknown; email?: unknown };
+            return typeof o?.email === 'string' ? [{ email: o.email, ...(typeof o.name === 'string' && o.name ? { name: o.name } : {}) }] : [];
+          })
+        : [];
+    const messages = (json.data ?? []).map((m) => ({
+      from: people(m.from),
+      to: people(m.to),
+      cc: people(m.cc),
+      date: typeof m.date === 'number' ? m.date : 0,
+      folders: Array.isArray(m.folders) ? m.folders.filter((f): f is string => typeof f === 'string') : [],
+    }));
+    return { messages, ...(json.next_cursor ? { nextCursor: json.next_cursor } : {}) };
+  }
+
   private async get<T>(path: string, endpoint: string): Promise<T[]> {
+    return (await this.getJson<NylasListResponse<T>>(path, endpoint)).data ?? [];
+  }
+
+  private async getJson<J>(path: string, endpoint: string): Promise<J> {
     const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method: 'GET',
       headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/json' },
@@ -105,7 +160,6 @@ export class NylasMailbox implements MailboxReader {
       throw new MailboxRateLimitedError(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
     }
     if (!res.ok) throw new NylasMailboxError(res.status, endpoint);
-    const json = (await res.json()) as NylasListResponse<T>;
-    return json.data ?? [];
+    return (await res.json()) as J;
   }
 }

@@ -81,6 +81,11 @@ import { contactsImportRunRoutes } from './routes/contacts-import-run.js';
 import { ContactImportService } from '../../contacts-import/import-service.js';
 import { PgImportStore } from '../../contacts-import/import-store.js';
 import { PgRunStore } from '../../contacts-import/run-store.js';
+import { PgFarmStore } from '../../contacts-import/farm-store.js';
+import { MailboxFarmService } from '../../contacts-import/farm-service.js';
+import { FarmFacade } from '../../contacts-import/farm-facade.js';
+import { farmCollector, resolveFarmTarget } from '../../contacts-import/mailbox-contacts.js';
+import { contactsFarmRoutes } from './routes/contacts-farm.js';
 import { ContactsPullService, type Collector } from '../../contacts-import/pull-service.js';
 import { fetchBridgeContacts } from '../../contacts-import/bridge-contacts.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
@@ -847,8 +852,18 @@ export class HttpAdapter implements Channel {
         webAppBootstrapSecret,
         sessions,
       });
+      // The mailbox scans: ten years of mail reduced, in the background, to per-person counts (no message content).
+      const farmStore = new PgFarmStore(pool);
+      const farmScans = new MailboxFarmService(farmStore, logger);
+      const farmCategories = new PgMailboxCategoryStore(pool);
+      await this.app.register(contactsFarmRoutes, {
+        logger,
+        service: new FarmFacade(farmStore, farmScans, () => loadPhoneInboxAccounts(sourcesSecrets), farmCategories),
+        webAppBootstrapSecret,
+        sessions,
+      });
       // Preview and Apply for the Sources drawer. Preview is a dry run; Apply does exactly what the preview planned.
-      // Today it reads the Matrix bridges only; mailboxes join when their reader exists.
+      // It reads the Matrix bridges and every scanned mailbox that is connected and has its category.
       await this.app.register(contactsImportRunRoutes, {
         logger,
         getService: async () => {
@@ -863,6 +878,11 @@ export class HttpAdapter implements Channel {
               label: bridge.label,
               collect: () => fetchBridgeContacts(bridge, url, secret, logger),
             });
+          }
+          const mailboxes = await loadPhoneInboxAccounts(sourcesSecrets);
+          for (const box of mailboxes) {
+            const t = await resolveFarmTarget(box.id, mailboxes, farmCategories);
+            if (t.ok && (await farmStore.getRun(box.id))) collectors.push(farmCollector(box.id, `${box.id} mailbox`, t.category, farmStore));
           }
           return new ContactsPullService(
             new ContactImportService(this.config.contactService, new PgImportStore(pool), logger),
