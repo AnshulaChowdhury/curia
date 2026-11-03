@@ -90,3 +90,57 @@ export function applyOutcomeText(r: ApplyResult): string {
   const base = `Added ${t.created}, linked ${t.attached}, left ${t.skipped} alone`;
   return t.failed > 0 ? `${base}. ${t.failed} could not be saved; run the preview again to retry.` : `${base}.`;
 }
+
+// ---- Mailbox scans (GET/POST /api/contacts/import/farm) ----
+
+export interface FarmMailbox {
+  accountId: string;
+  eligible: boolean;
+  reason?: 'skipped' | 'not_connected' | 'no_category';
+  status: 'not_started' | 'running' | 'paused' | 'done' | 'failed';
+  running: boolean;
+  messagesScanned: number;
+  peopleFound: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  errorKind: string | null;
+}
+
+const FARM_NAMES: Record<string, string> = { personal: 'Personal mailbox', moonray: 'Moonray mailbox', 'work-outlook': 'Work Outlook mailbox' };
+export function farmName(accountId: string): string {
+  return FARM_NAMES[accountId] ?? accountId;
+}
+
+const FARM_WHY: Record<string, string> = {
+  skipped: 'Skipped for now.',
+  not_connected: 'Not connected to Nylas.',
+  no_category: 'Waiting for Command Hub (Android Launcher) to report the category.',
+};
+
+/** One plain line: where the scan is. Counts only, never addresses. */
+export function farmStatusText(m: FarmMailbox): string {
+  if (!m.eligible && m.status === 'not_started') return FARM_WHY[m.reason ?? ''] ?? 'Not available.';
+  const counts = `${m.messagesScanned.toLocaleString('en-US')} messages read, ${m.peopleFound.toLocaleString('en-US')} people found`;
+  if (m.running) return `Scanning… ${counts}.`;
+  switch (m.status) {
+    case 'not_started': return 'Not scanned yet. Reads the last ten years of mail and keeps only counts.';
+    case 'done': return `Done. ${counts}.`;
+    case 'paused': return `Paused (the mail provider asked us to slow down). ${counts}. Resume to continue.`;
+    case 'failed': return `Stopped by an error (${m.errorKind ?? 'unknown'}). ${counts}. Resume to continue.`;
+    default: return counts;
+  }
+}
+
+/** The button a mailbox offers, or null when none applies. */
+export function farmAction(m: FarmMailbox): { label: string; resume: boolean } | null {
+  if (!m.eligible || m.running) return null;
+  switch (m.status) {
+    case 'not_started': return { label: 'Scan last 10 years', resume: false };
+    case 'paused':
+    case 'failed': return { label: 'Resume scan', resume: true };
+    case 'done': return { label: 'Scan again', resume: false };
+    default: return null;
+  }
+}
+
+export const anyFarmRunning = (ms: FarmMailbox[]): boolean => ms.some((m) => m.running);

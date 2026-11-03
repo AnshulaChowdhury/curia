@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api.js';
 import {
-  STATUS_LABEL, applyOutcomeText, applyPrompt, categoryLabel, reviewReasonText, sourcesSummary,
-  type ApplyResult, type ImportSourceRow, type PreviewResult,
+  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, categoryLabel, farmAction, farmName, farmStatusText, reviewReasonText, sourcesSummary,
+  type ApplyResult, type FarmMailbox, type ImportSourceRow, type PreviewResult,
 } from './sources-utils.js';
 
 // The Contacts page "Sources" drawer: every place the contact import reads people from, and whether it will.
@@ -19,6 +19,45 @@ export default function SourcesDrawer({ onClose }: Props) {
   const [outcome, setOutcome] = useState<string | null>(null);
   const [busy, setBusy] = useState<'preview' | 'apply' | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [farm, setFarm] = useState<FarmMailbox[] | null>(null);
+  const [farmError, setFarmError] = useState<string | null>(null);
+
+  async function loadFarm() {
+    try {
+      const res = await apiFetch('/api/contacts/import/farm');
+      if (!res.ok) { setFarmError(`Could not load the mailbox scans (HTTP ${res.status})`); return; }
+      setFarm((await res.json() as { mailboxes: FarmMailbox[] }).mailboxes);
+      setFarmError(null);
+    } catch (err) {
+      setFarmError('Could not load the mailbox scans');
+      console.error('[SourcesDrawer] farm status failed:', err);
+    }
+  }
+
+  async function startScan(accountId: string, resume: boolean) {
+    setFarmError(null);
+    try {
+      const res = await apiFetch(`/api/contacts/import/farm/${encodeURIComponent(accountId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resume }),
+      });
+      if (!res.ok) setFarmError(await errorOf(res));
+    } catch (err) {
+      setFarmError('Could not reach Curia');
+      console.error('[SourcesDrawer] start scan failed:', err);
+    }
+    await loadFarm();
+  }
+
+  useEffect(() => { void loadFarm(); }, []);
+  // While a scan runs, refresh its counts every few seconds.
+  const scanning = farm ? anyFarmRunning(farm) : false;
+  useEffect(() => {
+    if (!scanning) return;
+    const t = setInterval(() => void loadFarm(), 5000);
+    return () => clearInterval(t);
+  }, [scanning]);
 
   async function errorOf(res: Response): Promise<string> {
     try {
@@ -120,6 +159,32 @@ export default function SourcesDrawer({ onClose }: Props) {
               );
             })}
           </ul>
+        )}
+
+        {farm && (
+          <div style={{ marginTop: 16 }}>
+            <strong style={{ fontSize: 13 }}>Mailbox scans</strong>
+            <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '4px 0 8px' }}>
+              Reads each connected mailbox once, in the background, and keeps only counts per person. No message text is stored.
+            </p>
+            <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 8 }}>
+              {farm.map(m => {
+                const action = farmAction(m);
+                return (
+                  <li key={m.accountId} style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: '8px 12px', fontSize: 12 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                      <strong style={{ fontSize: 13 }}>{farmName(m.accountId)}</strong>
+                      {action && (
+                        <button className="btn btn-secondary btn-sm" onClick={() => void startScan(m.accountId, action.resume)}>{action.label}</button>
+                      )}
+                    </div>
+                    <div style={{ color: 'var(--app-fg-muted)', marginTop: 4 }}>{farmStatusText(m)}</div>
+                  </li>
+                );
+              })}
+            </ul>
+            {farmError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: '8px 0 0' }}>{farmError}</p>}
+          </div>
         )}
 
         {rows && (
