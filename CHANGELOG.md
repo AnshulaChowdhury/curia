@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **`skipKgNode` for `createContact`** — creates a contact with no knowledge-graph node (no person node, no org routing).
 - **Contacts import Preview and Apply** — dry-run the Matrix bridges' contact lists, then apply exactly that preview as `unknown` contacts (migration 119).
@@ -65,6 +66,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Bedrock Sonnet 4.5** — `{global,us,eu}.anthropic.claude-sonnet-4-5-20250929-v1:0` registered as provider `bedrock`.
@@ -404,6 +406,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Behavior release gate** — release pre-flight now runs two behavior suites on the production standard-tier model: `pnpm smoke` (end-to-end turns against a stubbed fixture office on a throwaway database copy) and the new `pnpm scenarios` (coordinator and specialist decisions, including real coordinator → specialist round trips). Both exit non-zero on a failed gate, run four cases at a time, stub web search by default, and print the model spend per case. `known_failure` reports a tracked bug without blocking; `pnpm rejudge` compares a candidate judge against saved transcripts; `--overlay` runs a deployment's own agents and cases over core. `pnpm e2e:setup-wizard` also walks a fresh install through `/setup` in a real browser. (#1956, #1966, #1977, #1980, #2024, #2025, #2027, #2106, #2129, #2146)
@@ -482,6 +485,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Signal voice calls** — call Curia's Signal number and hold a live spoken conversation through the existing voice pipeline. Answers everyone but blocked contacts; one call at a time; hard duration cap. Config-gated off. (#1672)
@@ -544,6 +548,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Voice channel** — talk to Curia by voice from the console: duplex WebRTC over self-hosted LiveKit, Deepgram speech-to-text, Cartesia text-to-speech, and barge-in. Join, mute, and hang up from chat; a principal hangup ends the session (1-hour call tokens, room teardown). Ships with a LiveKit Compose sample and an operator security/privacy guide (ADR-037). (#1414)
@@ -584,6 +589,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Passive email observation & voice learning** — Curia watches your Sent folder, captures how you edit its drafts, and a weekly LLM pass proposes a free-form writing-voice guide you approve or dismiss. Evidence, learned voice, and task state reuse existing stores rather than new memory types (ADR-029). (#1419–#1423)
@@ -647,6 +653,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Ant Farm** — a pixel-art office at `/antfarm/` that replays Curia's audit log as animation: agents at desks, a scheduler claw dropping in jobs, delegation walks, speech and thought bubbles, task cards opening and closing. DVR-style scrub and replay plus a live edge, over `GET /api/antfarm/timeline` (keyset-paginated) and `GET /api/antfarm/stream` (live SSE). Renders licensed LimeZu pixel art when present, procedural placeholders otherwise. (#1314–#1319, #1335)
@@ -692,6 +699,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Resumable tasks & projects (spec 19)** — long work checkpoints and resumes across bursts instead of failing when it runs out of budget: a paused task saves progress and schedules its own continuation, a progress-based circuit breaker escalates genuinely stuck work, and complex goals decompose into a `plan` of child steps that advance as dependencies clear and auto-complete into a deliverable. Adds the `checkpoint` and `plan` skills, throughput telemetry with advisory slice-sizing, and adaptive re-planning on divergence. (#1150, #691)
@@ -728,6 +736,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Health observability** — a new `GET /api/health` endpoint reports `ok` / `degraded` / `down` with per-check status across seven services (`down`/503 only when db or bus fails). A daily canary validates LLM tiers, credentials, and external deps and pings heartbeat URLs; new `llm.error` / `embedding.error` telemetry feeds it without billed probes. (#434)
@@ -777,6 +786,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Email accounts** — manage one or many agent-owned mailboxes from the console (Settings → Channels → Email); per-account Nylas grants stored in the vault at `channel.email.<name>.nylas_grant_id`. (#1101)
@@ -826,6 +836,7 @@ This release rebuilds how Curia decides who to trust. The old `status` + `trust_
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Capability tiers & kinds (migration 055)** — every contact carries an ordered `tier` and a descriptive `kind` (`person`/`organization`/`automated`/`agent`/`principal`), backfilled from the legacy fields. (#945)
@@ -876,6 +887,7 @@ This release rebuilds how Curia decides who to trust. The old `status` + `trust_
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **URL auto-linking in chat** — bare `http`/`https` URLs in both agent and user messages are automatically wrapped in clickable anchor tags; URLs inside code spans are excluded.
@@ -947,6 +959,7 @@ This release rebuilds how Curia decides who to trust. The old `status` + `trust_
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 #### Registry — install/enable lifecycle (the milestone)
@@ -1017,6 +1030,7 @@ This release rebuilds how Curia decides who to trust. The old `status` + `trust_
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 #### Tasks & Backlog v1 (the milestone)
@@ -1081,6 +1095,7 @@ This release rebuilds how Curia decides who to trust. The old `status` + `trust_
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 #### Onboarding flow (the milestone)
@@ -1149,6 +1164,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **`${principal_contact_id}` placeholder** — agent system prompts reference the principal's contact ID directly; bootstrap-resolved, opt-in. (#716, spec 02 / 09)
@@ -1180,6 +1196,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Meeting debrief agent** — Curia's first proactive specialist: scans the calendar every 5 minutes for recently-ended external meetings, prompts the CEO for takeaways via Signal (Bullpen-through-coordinator), and executes follow-up actions from the CEO's notes (spec 17, #384).
@@ -1239,6 +1256,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **OpenRouter provider** — optional multi-model routing for Gemini Flash, DeepSeek V3, and GPT-4o via `OPENROUTER_API_KEY`. (#379)
@@ -1286,6 +1304,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **`ceo-inbox` agent and 9 skills** — migrated from `curia-deploy/custom/` into curia core; now covered by CI and type-checked against real types. (#592)
@@ -1333,6 +1352,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **LLM token tracking** — every Anthropic API call publishes a structured `llm.call` bus event with token counts, prompt-cache breakdown, estimated cost, and content fingerprints — enabling per-agent attribution. (closes #326)
@@ -1370,6 +1390,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Contact Specialist agent** — new dedicated agent for all contact-domain work: briefings, CRUD, deduplication, and entity resolution. The coordinator now delegates rather than handles contact tasks directly. (#498)
@@ -1412,6 +1433,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Contact confidence scoring pipeline** — `contact_confidence` is now updated on each qualifying event (inbound message, outbound message, CEO trust grant, verified identity pairing) rather than being set by fiat. Supports incremental updates per event and full-recompute on demand with a convergence guarantee. Replaces the `setTrustLevel('high')` band-aid in the outbound gateway. (spec 06, #460)
@@ -1474,6 +1496,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Approval workflow** — when a skill is blocked by the autonomy gate, the execution layer now creates an approval request and notifies the CEO rather than hard-failing. Four new CEO-facing skills: `approve-action`, `deny-action`, `dismiss-action`, `list-pending-actions`. Stale requests expire hourly via `approval-expiry-sweep`; a daily 8 AM digest summarises outstanding requests each morning via `pending-actions-digest`. Implements ADR-018. (#427, #428, #429)
@@ -1531,6 +1554,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Email-triage specialist** (`agents/email-triage.yaml`): new specialist that owns
@@ -1587,6 +1611,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Executive profile** — CEO writing voice (tone, formality, patterns, vocabulary, sign-off) defined in `config/executive-profile.yaml` and managed by `ExecutiveProfileService`. Injected into the coordinator system prompt on every turn with hot-reload support. DB-versioned with audit trail, HTTP API at `/api/executive` (spec 13).
@@ -1616,6 +1641,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **`memory-store` skill** — agents can now write facts directly to the knowledge graph: store named attribute facts about any entity with explicit control over confidence, decay class, and sensitivity. Returns one of four outcomes (`created`, `updated`, `conflict`, `rejected`), surfacing contradictions to the CEO before writing (spec §03, #297).
@@ -1664,6 +1690,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **CEO inbox read skills** (`email-list`, `email-get`, `email-draft-save`) and a fifth triage category `LEAVE FOR CEO` for personal/sensitive email the CEO handles themselves
@@ -1696,6 +1723,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **Dream Engine** (spec 17) — background KG maintenance job that decays confidence on `slow_decay` / `fast_decay` nodes and edges using configurable half-lives (180 d / 21 d), soft-deletes rows at/below the archive threshold via `archived_at`, and cascades archival through edges. All KG read paths filter archived rows. Wired as an internal Scheduler job, configured under `dreaming.decay.*`. Closes #27.
@@ -1732,6 +1760,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 
 - **MCP client layer** — Curia can now connect to any MCP-compatible tool server at startup. Servers are declared in `config/skills.yaml` (stdio or SSE transport). Discovered tools are registered transparently in `SkillRegistry` alongside local skills — agents cannot distinguish local from MCP tools, and all MCP calls flow through the `ExecutionLayer` (sanitization, timeouts, sensitivity gating, audit log). Connection failures warn-not-crash; absence of `config/skills.yaml` is treated as "no MCP servers configured". Closes #270.
@@ -1769,6 +1798,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **ADR-014: Capability-tier model routing** — decision to replace per-agent model declarations with a `fast | standard | powerful` tier system, with optional modality flags (`vision`, `large_context`, `reasoning`, etc.). Implementation tracked in linked issue.
 
@@ -1787,6 +1817,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Message trust scoring** — `messageTrustScore` (0.0–1.0) computed in the dispatch layer from channel trust, contact confidence, and injection risk; attached to every `agent.task` event. Configurable weights under `security.trust_score` in `config/default.yaml` (spec 06).
 - **Trust-gated action thresholds** — `trust_policy` config block; Coordinator system prompt enforces per-category minimums: information queries 0.2, scheduling 0.5, data export/financial 0.8.
@@ -1819,6 +1850,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Conversation checkpoint pipeline** — `ConversationCheckpointProcessor` fires after 10 min inactivity per conversation–agent pair; fans out to background memory skills and advances a per-(conversationId, agentId) watermark in `conversation_checkpoints`. Adds migration 017. **Breaking change:** `conversation.checkpoint` added to the bus event discriminated union.
 - **`extract-facts` skill** — extracts single-entity attribute facts (home city, job title, preferences, etc.) from transcripts and persists as `fact` nodes via `EntityMemory.storeFact()`; runs at each conversation checkpoint alongside `extract-relationships`. Closes #151.
@@ -1845,6 +1877,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Signal channel** (spec 04): inbound and outbound messaging via signal-cli daemon socket. Includes group trust model.
 - **Development setup guide** (`docs/dev/setup.md`): tiered setup guide for contributors covering minimum (Anthropic + Postgres), recommended (+ Nylas + OpenAI), and full (+ Signal + Tavily) configurations. 
@@ -1857,6 +1890,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Bullpen (Tier 2 inter-agent discussion)** — shared threaded workspace where agents can open, reply to, and close discussion threads. Flows through the bus as `agent.discuss` events. BullpenDispatcher routes discuss events to `agent.task` for all thread participants. Pending threads injected into agent context before every LLM call. Visible to dashboards via SSE stream. Implements spec 01 (lines 24–44). Closes #25.
 
@@ -1872,6 +1906,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Scheduler stuck-job recovery** — startup sweep and 5-minute watchdog detect jobs stuck in `running` state beyond their timeout threshold and reset them to `pending`. Adds `run_started_at` (set on job claim, cleared on completion) and `expected_duration_seconds` (per-job timeout hint, sourced from YAML or job creation) columns to `scheduled_jobs`. Timeout formula: `min(expected × 7.5, expected + 60m)`. Recovery increments `consecutive_failures`; third consecutive recovery suspends the job. Emits `schedule.recovered` audit event per recovered job. Resolves silent failure mode observed 2026-04-07.
 
@@ -1890,6 +1925,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Onboarding wizard** — multi-step full-screen wizard guides new users through configuring the office identity (assistant name, tone, communication style, decision posture) on first run. Re-enterable from Settings → Setup Wizard. Requires the identity service (spec 13) to be configured.
 - **Settings nav** — new collapsible Settings section in the sidebar with Setup Wizard sub-item.
@@ -1905,6 +1941,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Scheduled Jobs UI** — management view in the web app for creating, editing, deleting, and unsuspending scheduled jobs; full CRUD via `/api/jobs` with search by agent, status, cron expression, and intent
 
@@ -1914,6 +1951,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **`query-relationships` skill** — query KG edges by entity name with optional edge-type filter
 - **`delete-relationship` skill** — delete a KG edge by triple (subject, predicate, object); idempotent and direction-agnostic
@@ -1936,6 +1974,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **`extract-relationships` skill** — two-stage LLM pipeline (Haiku classifier gate + Sonnet extractor) that extracts entity-to-entity relationship triples from text and persists them to the KG; coordinator calls it after every message
 - **12 new `EDGE_TYPES`** — personal (spouse, parent, child, sibling), professional (reports_to, manages, collaborates_with, advises, represents), organisational (member_of, founded, invested_in)
@@ -1961,6 +2000,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Office Identity Engine** — runtime-configurable persona (name, title, email, tone, pronouns)
   stored in Postgres with a `GET/PUT /api/identity` HTTP API; persona fields interpolated into
@@ -1983,6 +2023,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Autonomy Engine Phase 1** — global score (0–100), five bands, CEO controls via
   `get-autonomy` / `set-autonomy` skills, per-task prompt injection into Coordinator
@@ -2010,6 +2051,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Email channel** — Nylas-backed inbound/outbound email; HTML formatting for outbound bodies
 - **Contacts & identity service** — contact creation, lookup, role assignment, permission grants,
@@ -2032,6 +2074,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **Skills & execution layer** — local skill manifests (`skill.json`), `SkillHandler` interface,
   `SkillContext` with secrets access, input validation, output sanitization, per-invocation
@@ -2051,6 +2094,7 @@ The hand-rolled legacy SPA has been fully replaced by a Vite + React + TanStack 
 
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
+- **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **EventBus** — typed event definitions (discriminated union in `src/bus/events.ts`),
   layer-enforced publish/subscribe permissions (`src/bus/permissions.ts`)
