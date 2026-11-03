@@ -131,6 +131,12 @@ export interface CreateContactOptions {
   notes?: string;
   /** If provided, links to this existing KG node. Otherwise auto-creates one. */
   kgNodeId?: string;
+  /**
+   * Create the contact without any KG node: no person node, no organization routing, no adoption of an existing
+   * node. `kgNodeId` stays null until something deliberately links one later. For bulk imports, where thousands of
+   * edgeless nodes would only add noise. Ignored when `kgNodeId` is passed.
+   */
+  skipKgNode?: boolean;
   source: string;
   // Canonical profile attributes — optional on create, used by CRM import paths.
   preferredName?: string | null;
