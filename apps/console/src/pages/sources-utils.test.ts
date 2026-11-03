@@ -48,3 +48,34 @@ describe('preview and apply wording', () => {
     expect(reviewReasonText('brand_new_code')).toBe('brand_new_code');
   });
 });
+
+import { farmAction, farmStatusText, anyFarmRunning, type FarmMailbox } from './sources-utils.js';
+
+const farm = (over: Partial<FarmMailbox>): FarmMailbox => ({
+  accountId: 'moonray', eligible: true, status: 'not_started', running: false, messagesScanned: 0, peopleFound: 0,
+  startedAt: null, finishedAt: null, errorKind: null, ...over,
+});
+
+describe('mailbox scan text and actions', () => {
+  it('explains why an ineligible mailbox cannot be scanned', () => {
+    expect(farmStatusText(farm({ eligible: false, reason: 'no_category' }))).toContain('Command Hub (Android Launcher)');
+    expect(farmStatusText(farm({ eligible: false, reason: 'skipped' }))).toBe('Skipped for now.');
+    expect(farmAction(farm({ eligible: false, reason: 'skipped' }))).toBeNull();
+  });
+  it('offers start, resume or scan again by state, and nothing while running', () => {
+    expect(farmAction(farm({}))).toEqual({ label: 'Scan last 10 years', resume: false });
+    expect(farmAction(farm({ status: 'paused' }))).toEqual({ label: 'Resume scan', resume: true });
+    expect(farmAction(farm({ status: 'failed' }))).toEqual({ label: 'Resume scan', resume: true });
+    expect(farmAction(farm({ status: 'done' }))).toEqual({ label: 'Scan again', resume: false });
+    expect(farmAction(farm({ status: 'running', running: true }))).toBeNull();
+  });
+  it('shows counts while running and when done', () => {
+    expect(farmStatusText(farm({ status: 'running', running: true, messagesScanned: 12000, peopleFound: 340 }))).toBe('Scanning… 12,000 messages read, 340 people found.');
+    expect(farmStatusText(farm({ status: 'done', messagesScanned: 5, peopleFound: 2 }))).toBe('Done. 5 messages read, 2 people found.');
+    expect(farmStatusText(farm({ status: 'failed', errorKind: 'NylasMailboxError' }))).toContain('NylasMailboxError');
+  });
+  it('detects a running scan so the drawer keeps polling', () => {
+    expect(anyFarmRunning([farm({}), farm({ running: true })])).toBe(true);
+    expect(anyFarmRunning([farm({})])).toBe(false);
+  });
+});
