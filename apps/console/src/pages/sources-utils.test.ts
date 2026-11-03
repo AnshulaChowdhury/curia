@@ -48,3 +48,12 @@ describe('preview and apply wording', () => {
     expect(reviewReasonText('brand_new_code')).toBe('brand_new_code');
   });
 });
+
+import { orgLine } from './sources-utils.js';
+
+describe('orgLine', () => {
+  it('summarises an organisation on one line', () => {
+    expect(orgLine({ domain: 'acme.com', name: 'Acme', people: 12, received: 1340, sent: 120, lastSeen: '', label: 'work', mailboxes: [] })).toBe('12 people · 1,340 in, 120 out · work');
+    expect(orgLine({ domain: 'a.io', name: 'A', people: 1, received: 1, sent: 0, lastSeen: '', label: null, mailboxes: [] })).toBe('1 person · 1 in, 0 out');
+  });
+});

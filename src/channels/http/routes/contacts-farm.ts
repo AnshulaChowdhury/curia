@@ -1,6 +1,7 @@
 // contacts-farm.ts — start and watch the background mailbox scans behind the Contacts import.
 //
 //   GET  /api/contacts/import/farm                  progress of each mailbox (counts only)
+//   GET  /api/contacts/import/organizations         people grouped by email domain (counts; no names or addresses)
 //   POST /api/contacts/import/farm/:accountId       start a scan; { resume: true } continues a stopped one
 //
 // Session auth, low rate limits. Nothing returned or logged holds an address, a name or message content.
@@ -8,21 +9,29 @@
 import type { FastifyInstance } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import type { FarmService } from './contacts-farm-types.js';
+import type { OrganizationSummary } from '../../../contacts-import/organizations.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 
 export interface ContactsFarmRouteOptions {
   logger: Logger;
   service: FarmService;
+  /** Organisations found in the scanned mail, grouped by email domain. */
+  organizations: () => Promise<OrganizationSummary[]>;
   webAppBootstrapSecret: string;
   sessions: SessionStore;
 }
 
 export async function contactsFarmRoutes(app: FastifyInstance, options: ContactsFarmRouteOptions): Promise<void> {
-  const { logger, service, webAppBootstrapSecret, sessions } = options;
+  const { logger, service, organizations, webAppBootstrapSecret, sessions } = options;
 
   app.get('/api/contacts/import/farm', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (request, reply) => {
     if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
     return reply.header('Cache-Control', 'no-store').send({ mailboxes: await service.status() });
+  });
+
+  app.get('/api/contacts/import/organizations', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return reply;
+    return reply.header('Cache-Control', 'no-store').send({ organizations: await organizations() });
   });
 
   app.post<{ Params: { accountId: string }; Body: { resume?: unknown } | undefined }>(

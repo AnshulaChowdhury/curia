@@ -122,6 +122,24 @@ export default function SourcesDrawer({ onClose }: Props) {
           </ul>
         )}
 
+        {orgs && orgs.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <strong style={{ fontSize: 13 }}>Organisations found ({orgs.length})</strong>
+            <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '4px 0 8px' }}>
+              People grouped by email domain (webmail and role addresses left out). A summary only: nothing is added to Curia from it.
+            </p>
+            <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
+              {orgs.slice(0, 50).map(o => (
+                <li key={o.domain} style={{ fontSize: 12 }}>
+                  <strong>{o.name}</strong> <span style={{ color: 'var(--app-fg-muted)', fontFamily: 'JetBrains Mono, monospace' }}>{o.domain}</span>
+                  <div style={{ color: 'var(--app-fg-muted)' }}>{orgLine(o)}</div>
+                </li>
+              ))}
+            </ul>
+            {orgs.length > 50 && <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '6px 0 0' }}>Showing the 50 largest.</p>}
+          </div>
+        )}
+
         {rows && (
           <div style={{ marginTop: 16 }}>
             <button className="btn btn-secondary btn-sm" onClick={() => void runPreview()} disabled={busy !== null}>
