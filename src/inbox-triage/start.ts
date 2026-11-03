@@ -14,6 +14,7 @@ import type { SecretsService } from '../secrets/secrets-service.js';
 import { NYLAS_REGIONS, type NylasRegion } from '../phone-inbox/nylas-mailbox.js';
 import { PHONE_INBOX_ACCOUNT_IDS } from '../phone-inbox/phone-inbox-service.js';
 import { AgentClassifier } from './agent-classifier.js';
+import type { ContactLookup } from './contact-lookup.js';
 import { NtfyNotifier } from './ntfy-notifier.js';
 import { NylasTriageSource } from './nylas-triage-source.js';
 import { startOfLocalDay } from '../phone-brief/local-time.js';
@@ -32,6 +33,8 @@ export interface InboxTriageDeps {
   secrets: Pick<SecretsService, 'get'>;
   /** Remembers classified ids across restarts and keeps the unsorted mail for review from the phone. */
   items: PgTriageStore;
+  /** Lets the classifier know when the sender is in the principal's contacts. Optional. */
+  contacts?: ContactLookup;
   /** IANA timezone that decides where TRIAGE_FROM_DATE starts. */
   timezone: string;
   fetchImpl?: typeof fetch;
@@ -52,7 +55,7 @@ export const TRIAGE_SECRET_KEYS = {
 
 /** Returns the running watcher, or null when triage is off or not fully configured. */
 export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningInboxTriage | null> {
-  const { bus, logger, secrets, items, timezone, fetchImpl = fetch } = deps;
+  const { bus, logger, secrets, items, timezone, contacts, fetchImpl = fetch } = deps;
   const read = async (key: string): Promise<string | null> => (await secrets.get(key))?.trim() || null;
 
   if ((await read('inbox_triage_enabled'))?.toLowerCase() !== 'true') {
@@ -93,7 +96,7 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
 
   const watcher = new InboxWatcher({
     sources,
-    classifier: new AgentClassifier({ bus, logger, minConfidence, timeoutMs: CLASSIFY_TIMEOUT_MS }),
+    classifier: new AgentClassifier({ bus, logger, minConfidence, timeoutMs: CLASSIFY_TIMEOUT_MS, ...(contacts ? { contacts } : {}) }),
     notifier,
     seen: items,
     outcomes: items,

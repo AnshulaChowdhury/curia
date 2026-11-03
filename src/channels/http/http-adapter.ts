@@ -66,6 +66,8 @@ import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
 import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
+import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
 import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
 import { PgMailboxCategoryStore } from '../../phone-inbox/mailbox-category-store.js';
 import { loadTriageSource } from '../../inbox-triage/start.js';
@@ -706,6 +708,13 @@ export class HttpAdapter implements Channel {
             return null;
           }
         },
+      });
+      // The phone marks threads seen; this marks them read in the mailbox (and only that). Same token.
+      await this.app.register(phoneInboxReadRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        getMarker: (account) => loadPhoneThreadMarker(secrets, account),
+        invalidate: (account) => { phoneInboxCache.good.delete(account); },
       });
       // Which mailbox is Work or Personal, reported by the phone (the source of truth). Same token as /phone/inbox.
       await this.app.register(phoneMailboxCategoryRoutes, {

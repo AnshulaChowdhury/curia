@@ -49,6 +49,17 @@ day's brief.
   bank text or contact details).
 - The same `phone_inbox_token` as the other phone routes.
 
+## Marking mail read from the phone (`POST /phone/inbox/read`)
+When the owner marks mail as seen in Command Hub, the phone also asks Curia to mark the whole thread READ in the mailbox
+(owner-approved, 2026-11-02). Body `{ items: [{ account, threadId }] }`, 1 to 50 items (`threadId` as in `/phone/inbox`; duplicates
+are ignored). Curia sends only `{ unread: false }` to the thread: it never marks mail unread, never changes triage labels, never
+archives or deletes. Idempotent; a thread that no longer exists counts as done.
+- `200 { ok: true, marked, failed, failedItems: [{ account, threadId }] }`: `marked` and `failed` are counts, `failedItems` lists the
+  threads to retry (also the ones in a mailbox that is not connected).
+- `400` bad input (nothing is written), `401` bad or missing token, `404` no token configured, `502` nothing could be written
+  (the phone keeps the mark local and retries; `error` is "Mailbox busy" when Nylas rate-limited), `503` no listed mailbox is connected.
+- The mailbox's cached `/phone/inbox` answer is dropped after a successful write, so the thread stops counting on the next poll.
+
 ## Sorting unsorted mail from the phone (`/phone/triage/review`)
 Triage looks at every inbox email received since 2026-11-01 (local), read or unread. Mail it cannot sort stays unlabelled and is kept
 in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once resolved).
@@ -61,7 +72,7 @@ in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once 
 - Mail the owner had already read before triage saw it is labelled but never pings the phone.
 
 ## Auth
-One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review` and `/phone/triage/review` (owner's decision,
+One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review`, `/phone/triage/review` and `/phone/inbox/read` (owner's decision,
 2026-11-02). Because it now also unlocks email text, treat it as sensitive: a leaked token exposes the text of any email you
 can name by thread id. It sits outside `/api`, so `api_token` does not work here and the phone token works on nothing else.
 With no token in the vault the phone routes answer 404.

@@ -56,6 +56,8 @@ export interface TriageCandidate {
   messageId: string;
   threadId: string;
   from: string;
+  /** The sender's address, when the provider gave one. Used to look the sender up in contacts. */
+  fromAddress?: string;
   subject: string;
   /** Short preview from the mail provider; never the full body. */
   snippet: string;

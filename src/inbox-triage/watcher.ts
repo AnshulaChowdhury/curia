@@ -4,6 +4,7 @@
 // anywhere is logged and skipped. The 15-minute ceo-inbox sweep still sees the mail, so nothing is lost.
 
 import type { Logger } from '../logger.js';
+import { MailboxRateLimitedError } from '../phone-inbox/phone-inbox-service.js';
 import type { OutcomeRecorder, TriageOutcome } from './item-store.js';
 import { isPushGroup, type PushGroup, type TriageCandidate, type TriageGroup, type TriageVerdict } from './types.js';
 
@@ -43,10 +44,13 @@ export interface InboxWatcherConfig {
 }
 
 const DEFAULT_MAX_PER_TICK = 5;
+const DEFAULT_COOLDOWN_SECONDS = 300;
 
 export class InboxWatcher {
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Per mailbox: when a rate-limited mailbox may be asked again. */
+  private readonly blockedUntil = new Map<string, number>();
 
   constructor(private readonly config: InboxWatcherConfig) {}
 
@@ -79,10 +83,18 @@ export class InboxWatcher {
 
   private async tickSource(source: TriageSource): Promise<void> {
     const { logger, seen, classifier, notifier } = this.config;
+    if ((this.blockedUntil.get(source.accountId) ?? 0) > Date.now()) return; // cooling down after a rate limit
     let candidates: TriageCandidate[];
     try {
       candidates = await source.listUntagged((messageId) => seen.has(`${source.accountId}:${messageId}`));
     } catch (err) {
+      if (err instanceof MailboxRateLimitedError) {
+        // Leave the mailbox alone for a while: hammering a rate-limited Google account only prolongs it.
+        const waitMs = (err.retryAfterSeconds ?? DEFAULT_COOLDOWN_SECONDS) * 1000;
+        this.blockedUntil.set(source.accountId, Date.now() + waitMs);
+        logger.warn({ accountId: source.accountId, waitSeconds: waitMs / 1000 }, 'inbox-triage: mailbox rate-limited, pausing it');
+        return;
+      }
       // FR-ETW-3: retry on the next tick; the sweep covers the gap.
       logger.warn({ err, accountId: source.accountId }, 'inbox-triage: could not list new mail');
       return;
