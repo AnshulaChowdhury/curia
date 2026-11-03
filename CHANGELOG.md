@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **`setup-local-job`** — guided, idempotent Mac mini installer for local jobs, with `--dry-run` and `doctor`.
 - **Local jobs installer design** — plan for a one-command Mac mini installer and a Local jobs page (`docs/wip`).
 - **Contacts page Sources drawer** — shows each mailbox, bridge and contact app the import reads, with Work/Personal set on Command Hub.
 - **Mailbox category from the phone** — `PUT /phone/inbox/accounts/{id}/category` stores each mailbox's Work/Personal choice from Command Hub (migration 118).
