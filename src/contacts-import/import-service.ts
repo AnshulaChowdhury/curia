@@ -260,6 +260,9 @@ export class ContactImportService {
       ...(n.title ? { title: n.title } : {}),
       // Explicit, because createContact defaults to `known`. An import must never grant more than `unknown`.
       tier: 'unknown',
+      // No graph node at import: thousands of edgeless nodes are noise. A node is created later, when a person is
+      // worth keeping (the contact record allows kgNodeId = null).
+      skipKgNode: true,
       // Noreply / newsletter / bulk senders are `automated`, so they stay out of the default contact list.
       ...(n.emails.length > 0 && n.emails.every(e => classifyEmailSender(e) === 'automated') ? { kind: 'automated' as const } : {}),
       ...(n.emails[0] ? { primaryEmail: n.emails[0] } : {}),

@@ -804,7 +804,7 @@ export class ContactService {
     let kgNodeId: string | null = options.kgNodeId ?? null;
     let resolvedKind: ContactKind = options.kind ?? 'person';
 
-    if (!kgNodeId && this.entityMemory) {
+    if (!kgNodeId && this.entityMemory && !options.skipKgNode) {
       if (options.primaryEmail) {
         // Automated senders (noreply, mailer-daemon, etc.) have no org node worth linking.
         // Skip resolveOrCreateOrgNode entirely and set kind directly. The person-node

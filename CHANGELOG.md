@@ -14,7 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
-- **`POST /phone/inbox/read`** — marking mail seen in Command Hub marks the thread read in the mailbox; never unread, no label changes.
+- **`skipKgNode` for `createContact`** — creates a contact with no knowledge-graph node (no person node, no org routing).
 - **Contacts page Sources drawer** — shows each mailbox, bridge and contact app the import reads, with Work/Personal set on Command Hub.
 - **Mailbox category from the phone** — `PUT /phone/inbox/accounts/{id}/category` stores each mailbox's Work/Personal choice from Command Hub (migration 118).
 - **Books specialist** — the Digital EA can ask a read-only `books` agent about cash, review queue and uploads (ADR-060).
@@ -41,6 +41,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
+- **Contacts import** — imported people no longer get knowledge-graph nodes; a node is linked later, when a person is kept.
 - **MCP Skills page** — now points to the Tools page, where bundles such as books live.
 - **QuickBooks connection** — built once in `index.ts` and shared, since QuickBooks rotates refresh tokens on every use.
 
