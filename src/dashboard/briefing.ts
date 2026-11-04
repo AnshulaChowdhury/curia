@@ -9,6 +9,8 @@ import { buildApprovalDetails } from '../autonomy/approval-notification.js';
 
 /** Successful tool/skill invocations count as this many minutes each. One place, on purpose. */
 export const MINUTES_PER_SUCCESSFUL_ACTION = 1;
+/** A bookkeeping row Curia sorted by itself (a rule, vendor history, a guess or a transfer): a rough estimate, to be tuned. */
+export const MINUTES_PER_BOOKS_ROW = 3;
 
 export const HISTOGRAM_DAYS = 14;
 export const STATS_WINDOW_DAYS = 7;

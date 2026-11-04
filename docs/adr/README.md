@@ -89,3 +89,4 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 2. Fill in Context, Decision, and Consequences
 3. Add a row to the index above
 4. If the ADR supersedes an earlier one, update the earlier ADR's status
+| [061](061-books-run-in-curia-with-a-stateless-python-service.md) | The books run moves from the Mac mini into Curia: a stateless Python service holds the rules, Curia holds the state, QuickBooks access and the model call | Accepted |

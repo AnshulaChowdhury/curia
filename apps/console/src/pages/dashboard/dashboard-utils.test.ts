@@ -374,6 +374,8 @@ describe('briefing number formatting', () => {
   it('formats time saved, hour deltas, and count deltas', () => {
     expect(formatTimeSaved(216, 1)).toBe('≈3.6h');
     expect(hoursFromActions(216, 1)).toBeCloseTo(3.6);
+    expect(formatTimeSaved(60, 1, 20, 3)).toBe('≈2.0h');
+    expect(hoursFromActions(0, 1, 40, 3)).toBeCloseTo(2);
     expect(formatHoursDelta(3.6, 3)).toEqual({ direction: 'up', text: '▲ 0.6h vs last wk' });
     expect(formatCountDelta(214, 181)).toEqual({ direction: 'up', text: '▲ 18%' });
     expect(formatCountDelta(4, 0)).toEqual({ direction: 'up', text: '▲ new' });

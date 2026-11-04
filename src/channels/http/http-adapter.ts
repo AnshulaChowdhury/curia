@@ -101,6 +101,7 @@ import { MonitorStore } from '../../books/monitor-store.js';
 import { BooksNotifier } from '../../books/notifier.js';
 import { booksInboxRoutes } from './routes/books-inbox.js';
 import { booksBatchRoutes } from './routes/books-batches.js';
+import { booksRunRoutes } from './routes/books-run.js';
 import { booksGraphRoutes } from './routes/books-graph.js';
 import { GraphSnapshotStore } from '../../books/graph-store.js';
 import { BatchStore } from '../../books/batch-store.js';
@@ -177,6 +178,8 @@ export interface HttpAdapterConfig {
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
   booksMonitor?: import('../../books/monitor.js').BooksMonitor;
+  /** Runs the books pipeline in Curia (POST /api/books/run); absent when the books service is not configured. */
+  booksRunner?: import('../../books/books-runner.js').BooksRunner;
   /** Backs the public /api/secret-capture/* routes (one-time tokenized secret capture, #971).
    *  Token-authed, so mounted independently of the bootstrap secret. */
   secretCaptureService?: import('../../secrets/secret-capture-service.js').SecretCaptureService;
@@ -804,6 +807,12 @@ export class HttpAdapter implements Channel {
           sessions,
         });
       }
+      await this.app.register(booksRunRoutes, {
+        logger,
+        runner: this.config.booksRunner ?? null,
+        webAppBootstrapSecret,
+        sessions,
+      });
       await this.app.register(booksBatchRoutes, {
         logger,
         batchStore: new BatchStore(pool),

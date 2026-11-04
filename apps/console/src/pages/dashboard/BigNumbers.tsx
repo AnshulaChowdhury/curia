@@ -44,8 +44,8 @@ export function BigNumbers({ onHandled, onTimezone }: BigNumbersProps) {
     onTimezone(data.timezone);
   }, [data, error, onHandled, onTimezone]);
 
-  const hours = data ? hoursFromActions(data.successfulActions.current, data.minutesPerAction) : 0;
-  const prevHours = data ? hoursFromActions(data.successfulActions.previous, data.minutesPerAction) : 0;
+  const hours = data ? hoursFromActions(data.successfulActions.current, data.minutesPerAction, data.booksRows.current, data.minutesPerBooksRow) : 0;
+  const prevHours = data ? hoursFromActions(data.successfulActions.previous, data.minutesPerAction, data.booksRows.previous, data.minutesPerBooksRow) : 0;
   const hoursDelta = data ? formatHoursDelta(hours, prevHours) : null;
   const doneDelta = data ? formatCountDelta(data.done.current, data.done.previous) : null;
 
@@ -54,9 +54,9 @@ export function BigNumbers({ onHandled, onTimezone }: BigNumbersProps) {
       <div className="dash-nums">
         <article className="dash-card dash-num">
           <div className="dash-card-title">Time saved · 7d</div>
-          <div className="dash-num-value">{data ? formatTimeSaved(data.successfulActions.current, data.minutesPerAction) : (loading && !error ? '…' : '—')}</div>
+          <div className="dash-num-value">{data ? formatTimeSaved(data.successfulActions.current, data.minutesPerAction, data.booksRows.current, data.minutesPerBooksRow) : (loading && !error ? '…' : '—')}</div>
           {hoursDelta && <div className={`dash-delta ${hoursDelta.direction}`}>{hoursDelta.text}</div>}
-          {data && <div className="dash-num-foot">rough estimate · ~{data.minutesPerAction} min per action</div>}
+          {data && <div className="dash-num-foot">rough estimate · ~{data.minutesPerAction} min per action, ~{data.minutesPerBooksRow} per bookkeeping row</div>}
         </article>
         <article className="dash-card dash-num">
           <div className="dash-card-title">Done for you · 7d</div>
