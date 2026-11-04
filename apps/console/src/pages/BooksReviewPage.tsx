@@ -242,16 +242,53 @@ interface UploadItem {
   processed_at: string | null;
 }
 
+function runMessage(out: { outcome: string; reason?: string; rows?: number; files?: number }): string {
+  switch (out.outcome) {
+    case 'ready': return `Done: ${out.rows ?? 0} rows from ${out.files ?? 0} file${out.files === 1 ? '' : 's'} are ready to review below.`;
+    case 'nothing_waiting': return 'No files are waiting.';
+    case 'already_running': return 'A run is already in progress.';
+    default: return out.reason ?? 'The run failed. The files are still waiting.';
+  }
+}
+
 function formatSize(n: number): string {
   return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/** Upload the week's RBC download files (.qbo/.ofx/.csv). The books run takes them from here within about 15 minutes. */
+/** Upload the week's RBC download files (.qbo/.ofx/.csv). The books run takes them from here within about 5 minutes. */
 function UploadPanel({ onChange }: { onChange: () => void }) {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [notes, setNotes] = useState<Array<{ text: string; error: boolean }>>([]);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [canRun, setCanRun] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  useEffect(() => {
+    apiFetch('/api/books/run')
+      .then(async res => { if (res.ok) setCanRun((await res.json() as { available: boolean }).available); })
+      .catch(() => setCanRun(false)); // no button when the answer is unknown
+  }, []);
+
+  async function runNow() {
+    setRunning(true);
+    setNotes([]);
+    try {
+      const res = await apiFetch('/api/books/run', { method: 'POST' });
+      if (!res.ok) {
+        setNotes([{ text: await errorText(res), error: true }]);
+      } else {
+        const out = await res.json() as { outcome: string; reason?: string; rows?: number; files?: number };
+        setNotes([{ text: runMessage(out), error: out.outcome === 'failed' }]);
+      }
+    } catch {
+      setNotes([{ text: 'Could not reach Curia. Try again.', error: true }]);
+    } finally {
+      setRunning(false);
+      await load();
+      onChange();
+    }
+  }
 
   const load = useCallback(async () => {
     try {
@@ -297,7 +334,7 @@ function UploadPanel({ onChange }: { onChange: () => void }) {
         <h3 className="settings-section-title">Upload bank files</h3>
         <p className="settings-section-sub">
           The week&apos;s RBC downloads (.qbo, .ofx or .csv, up to 5 MB each), chequing and card. The books run picks them up within about
-          15 minutes, compares them with QuickBooks and makes a batch below. Once recorded, the file&apos;s contents are deleted from Curia.
+          5 minutes (or press Run now), compares them with QuickBooks and makes a batch below. Once recorded, the file&apos;s contents are deleted from Curia.
         </p>
       </div>
       <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 }}>
@@ -323,6 +360,13 @@ function UploadPanel({ onChange }: { onChange: () => void }) {
             </>
           )}
         </div>
+        {canRun && (
+          <div>
+            <button type="button" className="btn btn-primary" disabled={running} onClick={() => void runNow()}>
+              {running ? 'Running…' : 'Run now'}
+            </button>
+          </div>
+        )}
         {notes.map((n, i) => (
           <div key={i} style={{ color: n.error ? 'var(--app-destructive)' : 'var(--app-fg)' }}>{n.text}</div>
         ))}

@@ -264,6 +264,9 @@ import { DriveInbox } from './books/drive-inbox.js';
 import { BooksToken } from './quickbooks/books-token.js';
 import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.js';
 import { BooksReader } from './books/books-reader.js';
+import { BooksRunner } from './books/books-runner.js';
+import { booksServiceFromEnv } from './books/books-service-client.js';
+import { PipelineStateStore } from './books/pipeline-state-store.js';
 import { BatchStore } from './books/batch-store.js';
 import { UploadStore } from './books/upload-store.js';
 
@@ -3253,6 +3256,25 @@ async function main(): Promise<void> {
   });
   booksMonitor.start();
 
+  // The books run itself, in Curia: bank files -> the books service -> a batch to review. Needs BOOKS_SERVICE_URL and
+  // BOOKS_SERVICE_TOKEN (Railway sets both); without them nothing runs and "Run now" says so.
+  const booksService = booksServiceFromEnv(process.env, logger);
+  const booksRunner = booksService
+    ? new BooksRunner({
+        service: booksService,
+        state: new PipelineStateStore(pool),
+        uploads: new UploadStore(pool),
+        drive: new DriveInbox(secretsService),
+        batches: new BatchStore(pool),
+        monitorStore: new MonitorStore(pool),
+        monitor: booksMonitor,
+        qbo: qboConnection,
+        llm: infraLlmService.scoped({ toolName: 'books-categorise' }),
+        logger,
+      })
+    : undefined;
+  booksRunner?.start();
+
   // Reaction → approval mapper (#1479): channel-agnostic inbound.reaction handling.
   // Registered after ExecutionLayer so approve can re-invoke the blocked skill.
   const reactionIntentsConfig = yamlConfig.autonomy?.reaction_intents;
@@ -3490,6 +3512,7 @@ async function main(): Promise<void> {
     triageItems,
     phoneBrief,
     booksMonitor,
+    booksRunner,
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
@@ -3537,6 +3560,7 @@ async function main(): Promise<void> {
     inboxTriage.stop();
     phoneBriefScheduler.stop();
     booksMonitor.stop();
+    booksRunner?.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace
     // before Signal, Slack, and the pool close (#2254).
