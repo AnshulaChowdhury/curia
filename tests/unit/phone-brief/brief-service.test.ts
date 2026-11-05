@@ -125,4 +125,20 @@ describe('PhoneBriefService', () => {
     await svc.generate(NOW);
     expect((await svc.today(NOW))!.signalNumber).toBe(expected);
   });
+
+  it('keeps account and messageId together for a known mailbox, and drops them otherwise', async () => {
+    const { svc } = service();
+    svc.registerSource(source('newsletters', [
+      { from: 'A', subject: 'ok', account: 'moonray', messageId: 'm1' },
+      { from: 'B', subject: 'unknown mailbox', account: 'elsewhere', messageId: 'm2' },
+      { from: 'C', subject: 'no id', account: 'moonray' },
+      { from: 'D', subject: 'odd id', account: 'moonray', messageId: 'a\nb' },
+    ]));
+    expect((await svc.generate(NOW)).sections[0]!.items).toEqual([
+      { from: 'A', subject: 'ok', account: 'moonray', messageId: 'm1' },
+      { from: 'B', subject: 'unknown mailbox' },
+      { from: 'C', subject: 'no id' },
+      { from: 'D', subject: 'odd id' },
+    ]);
+  });
 });

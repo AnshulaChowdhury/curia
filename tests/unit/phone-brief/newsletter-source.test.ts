@@ -47,7 +47,7 @@ describe('NewsletterBriefSource', () => {
     const { fetchImpl, calls } = nylas({ 'g-moonray': { folders: [{ id: 'INBOX', name: 'INBOX' }, { id: 'N1', name: 'Newsletter' }], mail: [mail('a', 500)] } });
     const s = summarizer();
     const items = await new NewsletterBriefSource({ secrets: vault(), summarizer: s, logger, fetchImpl }).items(CTX);
-    expect(items).toEqual([{ from: 'Sender a', subject: 'Subject a', text: 'Summary of: Body of a' }]);
+    expect(items).toEqual([{ from: 'Sender a', subject: 'Subject a', text: 'Summary of: Body of a', account: expect.any(String), messageId: 'a' }]);
     const list = calls.find((u) => u.includes('/messages?'))!;
     expect(list).toContain('in=N1');
     expect(list).toContain('received_after=1000');
@@ -77,7 +77,7 @@ describe('NewsletterBriefSource', () => {
   it('still sends sender and subject when the model gives no summary', async () => {
     const { fetchImpl } = nylas({ 'g-moonray': { folders: [{ id: 'N1', name: 'Newsletter' }], mail: [mail('a', 500)] } });
     const items = await new NewsletterBriefSource({ secrets: vault(), summarizer: summarizer(() => null), logger, fetchImpl }).items(CTX);
-    expect(items).toEqual([{ from: 'Sender a', subject: 'Subject a', text: undefined }]);
+    expect(items).toEqual([{ from: 'Sender a', subject: 'Subject a', text: undefined, account: expect.any(String), messageId: 'a' }]);
   });
 
   it('survives the summarizer throwing, and an email with no text', async () => {
