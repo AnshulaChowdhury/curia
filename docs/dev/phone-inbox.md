@@ -70,9 +70,33 @@ in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once 
   marked read) and removes the card; `group: "dismiss"` removes it and leaves the mail alone. `{ ok, id, remaining }` on success;
   400 bad input, 404 not waiting (so a double tap does nothing), 502 the mailbox write failed (card stays), 503 mailbox not connected.
 - Mail the owner had already read before triage saw it is labelled but never pings the phone.
+- After a category is chosen the answer may also carry `savePrompt: { group, question, options: [{ scope: "sender"|"domain", value, label }] }`
+  (no domain option for shared providers like gmail.com; no `savePrompt` when the sender's address is unknown or for `dismiss`).
+  The phone asks the owner "Save this for next time?" and, on yes, calls `POST /phone/triage/preferences`. "Not now" is just not calling it.
+
+## Remembering a choice (`/phone/triage/preferences`)
+Only the owner's yes saves anything. A saved preference is given to the classifier as `Earlier choice: <label>` for mail from that
+sender (an exact address beats its domain, per mailbox). It is a hint the model weighs, not a rule: urgent still wins for time-critical
+mail. Stored in `inbox_triage_preferences` (address or domain, group, dates; no mail text).
+- `POST /phone/triage/preferences` with `{ account, scope: "sender"|"domain", value, group }` saves it (`{ ok: true }`). `400` for an
+  unknown account/group, a value that is not a lower-case address (sender) or a non-shared domain (domain).
+- `GET /phone/triage/preferences` → `{ preferences: [{ account, scope, value, group }] }`.
+- `POST /phone/triage/preferences/forget` with `{ account, scope, value }` removes one: `204`, or `404` if it was not saved.
+
+## Unsubscribing from a newsletter (`POST /phone/unsubscribe`)
+`{ account, messageId }`. Curia reads the email's `List-Unsubscribe` header and always answers `200 { result }` (`Cache-Control: no-store`):
+- `unsubscribed`: the sender supports one-click unsubscribe (RFC 8058) and accepted Curia's request.
+- `open-link` + `url`: no one-click support; the phone opens the sender's page for the owner. Curia sends nothing.
+- `open-mailto` + `mailto`: the sender only offers an address; the phone opens it for the owner. Curia never sends the email itself.
+- `failed` (+ `url`): the one-click request was refused or timed out (or the link was not a public https address); open `url` instead.
+- `none`: no unsubscribe information in this email.
+
+Errors: `400` bad input, `404` message gone, `429` mailbox busy, `502` mailbox error, `503` mailbox not connected. Rate limit 10/min.
+The link comes from the sender, so Curia only POSTs to an https link on a named public host (port 443, no login in the URL, no redirects),
+checking every resolved address at connect time. The full link is never logged, only the host name.
 
 ## Auth
-One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review`, `/phone/triage/review` and `/phone/inbox/read` (owner's decision,
+One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review`, `/phone/triage/review`, `/phone/triage/preferences`, `/phone/unsubscribe` and `/phone/inbox/read` (owner's decision,
 2026-11-02). Because it now also unlocks email text, treat it as sensitive: a leaked token exposes the text of any email you
 can name by thread id. It sits outside `/api`, so `api_token` does not work here and the phone token works on nothing else.
 With no token in the vault the phone routes answer 404.

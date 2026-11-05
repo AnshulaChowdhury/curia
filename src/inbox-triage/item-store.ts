@@ -16,6 +16,8 @@ export interface UnsortedItem {
   messageId: string;
   threadId: string;
   from: string;
+  /** The sender's address, when the provider gave one. */
+  fromAddress: string;
   subject: string;
   snippet: string;
   /** ISO-8601, or null when the provider gave no date. */
@@ -33,6 +35,7 @@ interface Row {
   message_id: string;
   thread_id: string | null;
   sender: string | null;
+  sender_address: string | null;
   subject: string | null;
   snippet: string | null;
   received_at: Date | null;
@@ -44,13 +47,14 @@ const toItem = (r: Row): UnsortedItem => ({
   messageId: r.message_id,
   threadId: r.thread_id ?? '',
   from: r.sender ?? '',
+  fromAddress: r.sender_address ?? '',
   subject: r.subject ?? '',
   snippet: r.snippet ?? '',
   receivedAt: r.received_at ? r.received_at.toISOString() : null,
   reason: r.outcome,
 });
 
-const COLUMNS = 'account_id, message_id, thread_id, sender, subject, snippet, received_at, outcome';
+const COLUMNS = 'account_id, message_id, thread_id, sender, sender_address, subject, snippet, received_at, outcome';
 
 export class PgTriageStore implements SeenStore, OutcomeRecorder {
   constructor(private readonly pool: DbPool) {}
@@ -78,15 +82,16 @@ export class PgTriageStore implements SeenStore, OutcomeRecorder {
   async record(c: TriageCandidate, outcome: TriageOutcome): Promise<void> {
     const keep = outcome !== 'tagged';
     await this.pool.query(
-      `INSERT INTO inbox_triage_items (account_id, message_id, outcome, thread_id, sender, subject, snippet, received_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $8::bigint > 0 THEN to_timestamp($8::bigint) END)
+      `INSERT INTO inbox_triage_items (account_id, message_id, outcome, thread_id, sender, subject, snippet, received_at, sender_address)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $8::bigint > 0 THEN to_timestamp($8::bigint) END, $9)
        ON CONFLICT (account_id, message_id) DO UPDATE SET
          outcome = EXCLUDED.outcome, thread_id = EXCLUDED.thread_id, sender = EXCLUDED.sender,
-         subject = EXCLUDED.subject, snippet = EXCLUDED.snippet, received_at = EXCLUDED.received_at`,
+         subject = EXCLUDED.subject, snippet = EXCLUDED.snippet, received_at = EXCLUDED.received_at,
+         sender_address = EXCLUDED.sender_address`,
       [
         c.accountId, c.messageId, outcome,
         keep ? c.threadId : null, keep ? c.from : null, keep ? c.subject : null, keep ? c.snippet.slice(0, 300) : null,
-        c.receivedAt,
+        c.receivedAt, keep ? c.fromAddress ?? null : null,
       ],
     );
   }
@@ -119,7 +124,7 @@ export class PgTriageStore implements SeenStore, OutcomeRecorder {
   async resolve(accountId: string, messageId: string, group: string | null): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE inbox_triage_items SET outcome = 'resolved', resolved_group = $3, resolved_at = now(),
-         sender = NULL, subject = NULL, snippet = NULL, thread_id = NULL
+         sender = NULL, sender_address = NULL, subject = NULL, snippet = NULL, thread_id = NULL
        WHERE account_id = $1 AND message_id = $2 AND outcome IN ('none', 'failed')`,
       [accountId, messageId, group],
     );

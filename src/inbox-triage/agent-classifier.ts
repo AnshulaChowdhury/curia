@@ -8,7 +8,7 @@ import type { EventBus } from '../bus/bus.js';
 import { createAgentTask, createScheduleFired } from '../bus/events.js';
 import type { AgentResponseEvent } from '../bus/events.js';
 import type { Logger } from '../logger.js';
-import { NO_VERDICT, parseVerdict, type TriageCandidate, type TriageVerdict } from './types.js';
+import { NO_VERDICT, parseVerdict, TRIAGE_LABELS, type TriageCandidate, type TriageGroup, type TriageVerdict } from './types.js';
 import type { ContactLookup } from './contact-lookup.js';
 import type { Classifier } from './watcher.js';
 
@@ -28,16 +28,19 @@ export interface AgentClassifierConfig {
   timeoutMs: number;
   /** Tells the classifier when the sender is in the principal's contacts. Optional. */
   contacts?: ContactLookup;
+  /** What the owner said earlier about this sender or its domain. Optional; a failure just means no hint. */
+  preferences?: { lookup(accountId: string, fromAddress: string): Promise<TriageGroup | null> };
 }
 
 /** The task text. Email fields are fenced and capped so they read as data (FR-ETC-6). */
-export function buildClassifierTask(c: TriageCandidate, knownContact = false): string {
+export function buildClassifierTask(c: TriageCandidate, knownContact = false, earlierChoice: TriageGroup | null = null): string {
   const clip = (s: string, n: number) => s.replace(/[\r\n]+/g, ' ').slice(0, n);
   return [
     'Classify this new email. Reply with the JSON line only.',
     '<email>',
     `From: ${clip(c.from, 200)}`,
     ...(knownContact ? ['Known contact: yes'] : []),
+    ...(earlierChoice ? [`Earlier choice: ${TRIAGE_LABELS[earlierChoice]}`] : []),
     `Subject: ${clip(c.subject, 300)}`,
     `Preview: ${clip(c.snippet, 400)}`,
     '</email>',
@@ -61,9 +64,21 @@ export class AgentClassifier implements Classifier {
     });
   }
 
+  private async earlierChoice(candidate: TriageCandidate): Promise<TriageGroup | null> {
+    const { preferences, logger } = this.config;
+    if (!preferences || !candidate.fromAddress) return null;
+    try {
+      return await preferences.lookup(candidate.accountId, candidate.fromAddress);
+    } catch (err) {
+      logger.warn({ err }, 'inbox-triage: preference lookup failed, classifying without it');
+      return null;
+    }
+  }
+
   async classify(candidate: TriageCandidate): Promise<TriageVerdict> {
     const { bus, logger, minConfidence, timeoutMs } = this.config;
     const knownContact = candidate.fromAddress && this.config.contacts ? await this.config.contacts.isKnown(candidate.fromAddress) : false;
+    const earlierChoice = await this.earlierChoice(candidate);
     const runId = randomUUID();
     const fired = createScheduleFired({ jobId: `inbox-triage:${runId}`, agentId: CLASSIFIER_AGENT_ID, agentTaskId: null });
     const task = createAgentTask({
@@ -71,7 +86,7 @@ export class AgentClassifier implements Classifier {
       conversationId: `inbox-triage:${runId}`,
       channelId: 'scheduler',
       senderId: 'inbox-triage',
-      content: buildClassifierTask(candidate, knownContact),
+      content: buildClassifierTask(candidate, knownContact, earlierChoice),
       parentEventId: fired.id,
     });
 

@@ -12,8 +12,8 @@ const agent = load(readFileSync(path.resolve(import.meta.dirname, '../../../agen
 };
 
 describe('email-classifier prompt', () => {
-  it('is version 0.4.0', () => {
-    expect(agent.version).toBe('0.4.0');
+  it('is version 0.5.0', () => {
+    expect(agent.version).toBe('0.5.0');
   });
 
   it('sends mail a person wrote for an answer to "Needs a reply", not FYI', () => {
@@ -31,5 +31,11 @@ describe('email-classifier prompt', () => {
   it('tells the model what "Known contact: yes" means', () => {
     expect(agent.system_prompt).toMatch(/"Known contact: yes"/);
     expect(agent.system_prompt).toMatch(/never spam or newsletter/);
+  });
+
+  it('tells the model what "Earlier choice" means and keeps urgent and spam cautious', () => {
+    expect(agent.system_prompt).toMatch(/"Earlier choice: <label>"/);
+    expect(agent.system_prompt).toMatch(/Still choose urgent if this\s+message is plainly time-critical/);
+    expect(agent.system_prompt).toMatch(/follow it\s+only if this message looks like the same kind of mail/);
   });
 });

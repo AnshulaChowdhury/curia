@@ -6,7 +6,7 @@ import { createSilentLogger } from '../../../../../src/logger.js';
 
 const AUTH = { authorization: 'Bearer secret' };
 const ITEM: UnsortedItem = {
-  accountId: 'moonray', messageId: 'm1', threadId: 't1', from: 'Dana\u0000 Lee', subject: 'Quarterly\nnumbers',
+  accountId: 'moonray', messageId: 'm1', threadId: 't1', from: 'Dana\u0000 Lee', fromAddress: 'Dana@Acme.com', subject: 'Quarterly\nnumbers',
   snippet: 'Hi there', receivedAt: '2026-11-02T14:00:00.000Z', reason: 'none',
 };
 
@@ -63,6 +63,32 @@ describe('POST /phone/triage/review', () => {
     expect(applyLabel).toHaveBeenCalledWith('m1', 'drafted');
     expect(store.resolve).toHaveBeenCalledWith('moonray', 'm1', 'drafted');
     expect(res.json()).toMatchObject({ ok: true, id: 'moonray:m1', remaining: 1 });
+  });
+
+  it('offers to save the choice for the sender and the domain, lower-cased', async () => {
+    const { app: a } = await make();
+    const res = await post(a, { account: 'moonray', messageId: 'm1', group: 'drafted' });
+    expect(res.json().savePrompt).toEqual({
+      group: 'drafted',
+      question: 'Save this for next time? File mail like this as "Needs a reply".',
+      options: [
+        { scope: 'sender', value: 'dana@acme.com', label: 'From dana@acme.com' },
+        { scope: 'domain', value: 'acme.com', label: 'Anyone at acme.com' },
+      ],
+    });
+  });
+
+  it('offers only the sender for a shared mail provider, and no prompt without an address or for "dismiss"', async () => {
+    const gmail = await make({ item: { ...ITEM, fromAddress: 'dana@gmail.com' } });
+    expect(gmail.app && (await post(gmail.app, { account: 'moonray', messageId: 'm1', group: 'seen' })).json().savePrompt.options).toEqual([
+      { scope: 'sender', value: 'dana@gmail.com', label: 'From dana@gmail.com' },
+    ]);
+    await gmail.app.close();
+    const none = await make({ item: { ...ITEM, fromAddress: '' } });
+    expect((await post(none.app, { account: 'moonray', messageId: 'm1', group: 'seen' })).json()).not.toHaveProperty('savePrompt');
+    await none.app.close();
+    const dismiss = await make();
+    expect((await post(dismiss.app, { account: 'moonray', messageId: 'm1', group: 'dismiss' })).json()).not.toHaveProperty('savePrompt');
   });
 
   it('"dismiss" resolves the card without touching the mailbox', async () => {

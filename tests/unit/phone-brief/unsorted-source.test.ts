@@ -3,7 +3,7 @@ import { UnsortedBriefSource } from '../../../src/phone-brief/unsorted-source.js
 import type { UnsortedItem } from '../../../src/inbox-triage/item-store.js';
 
 const item = (n: number, reason: UnsortedItem['reason'] = 'none'): UnsortedItem =>
-  ({ accountId: 'moonray', messageId: `m${n}`, threadId: '', from: `Sender ${n}`, subject: `Subject ${n}`, snippet: '', receivedAt: null, reason });
+  ({ accountId: 'moonray', messageId: `m${n}`, threadId: '', from: `Sender ${n}`, fromAddress: '', subject: `Subject ${n}`, snippet: '', receivedAt: null, reason });
 
 describe('UnsortedBriefSource', () => {
   it('has no section when nothing is waiting', async () => {
