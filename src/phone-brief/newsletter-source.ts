@@ -65,7 +65,10 @@ export class NewsletterBriefSource implements BriefSource {
 
     const items: BriefItem[] = [];
     for (const message of found.slice(0, MAX_ITEMS_PER_SECTION)) {
-      items.push({ from: message.from, subject: message.subject, text: await this.summary(message) });
+      items.push({
+        from: message.from, subject: message.subject, text: await this.summary(message),
+        account: message.mailbox.accountId, messageId: message.id,
+      });
     }
     return items;
   }

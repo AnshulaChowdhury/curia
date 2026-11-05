@@ -31,7 +31,7 @@ an email. `/phone/inbox` itself still never returns bodies.
   502 when Nylas fails, 503 (with `Retry-After` when Nylas gave one) when it rate-limits.
 
 ## The morning brief (`GET /phone/brief`)
-`{ date, generatedAt, signalNumber, sections: [{ id, items: [{ text?, from?, subject? }] }] }`, for the Command Hub Home row.
+`{ date, generatedAt, signalNumber, sections: [{ id, items: [{ text?, from?, subject?, account?, messageId? }] }] }`, for the Command Hub Home row.
 Sections are `accounting`, `contacts`, `newsletters`, `unsorted`, always in that order, only those with items, at most 10 items each, text
 at most 280 characters, plain text. `204` when there is nothing to report; `404` with no token. It never serves a previous
 day's brief.
@@ -41,7 +41,9 @@ day's brief.
 - **`signalNumber`** is the number the Signal channel runs on (`SIGNAL_PHONE_NUMBER`), only if it is E.164, else `null`.
 - **Newsletters:** yesterday's mail (local day) that triage labelled `Newsletter`, newest first. Each item has sender, subject and a
   one-to-two sentence summary written by the fast model from the email's text (the only place email text leaves Curia for the
-  brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only.
+  brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only. Each newsletter item also
+  carries `account` (same ids as `/phone/inbox`) and `messageId` (the one `POST /phone/unsubscribe` takes) so the phone can offer
+  Unsubscribe; both or neither, and a brief built before this change has neither.
 - **Unsorted:** mail triage could not sort (the classifier said `none`, the call failed, or the label could not be written), one
   item per email with sender, subject and why. Not limited to yesterday: it lists everything still waiting, until the owner sorts it.
 - **Other sections** are supplied by their owners: `PhoneBriefService.registerSource({ id, items(ctx) })` with `ctx.yesterday`
