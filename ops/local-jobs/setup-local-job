@@ -181,12 +181,17 @@ esac
 
 # ================= install =================
 step 1 "Preflight"
-[ "$(uname)" = Darwin ] || die "this installer is for macOS"
-[ "$(id -u)" != 0 ] || die "run as yourself, not root; it uses sudo only where needed"
+# A dry run only prints the plan, so it may run anywhere (CI is Linux); a real run needs macOS.
+if [ "$(uname)" != Darwin ]; then
+  [ "$DRY" = 1 ] && say "   warn: not macOS; showing the plan only" || die "this installer is for macOS"
+fi
+[ "$(id -u)" != 0 ] || [ "$DRY" = 1 ] || die "run as yourself, not root; it uses sudo only where needed"
 fdesetup status 2>/dev/null | grep -q 'On' && ok "FileVault is on" || say "   warn: FileVault does not look on. Job files are only as private as the disk."
 command -v git >/dev/null && ok "git present" || die "git missing (run: xcode-select --install)"
 [ -x "$PY" ] && ok "python3 present ($("$PY" -V 2>&1))" || die "/usr/bin/python3 missing"
-avail=$(df -g / | awk 'NR==2{print $4}'); [ "${avail:-0}" -ge 2 ] && ok "disk free: ${avail} GB" || die "less than 2 GB free"
+if [ "$(uname)" = Darwin ]; then
+  avail=$(df -g / | awk 'NR==2{print $4}'); [ "${avail:-0}" -ge 2 ] && ok "disk free: ${avail} GB" || die "less than 2 GB free"
+fi
 
 step 2 "Create the macOS user $JUSER (standard user, never admin)"
 if user_exists; then ok "already exists"; else
