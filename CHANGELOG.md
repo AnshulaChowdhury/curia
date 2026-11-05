@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Sender-plus-keywords rules** — the save prompt suggests words picked from the email; a matching rule becomes a classifier hint (migration 124).
 - **Matrix exporter** — Mac mini job and routes that send per-partner message counts, never text (migration 123).
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
 - **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.

@@ -83,7 +83,7 @@ describe('buildClassifierTask', () => {
       const { bus, published } = fakeBus((t) => response(t, '{"group":"drafted","confidence":0.9}'));
       const lookup = vi.fn(async () => choice);
       await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, preferences: { lookup } }).classify(withAddress);
-      expect(lookup).toHaveBeenCalledWith('moonray', 'shilpa@example.com');
+      expect(lookup).toHaveBeenCalledWith('moonray', 'shilpa@example.com', { subject: 'Q4', preview: 'please read' });
       const content = (published.find((e) => e.type === 'agent.task')!.payload as { content: string }).content;
       expect(content.includes('Earlier choice: Needs a reply')).toBe(choice !== null);
     }

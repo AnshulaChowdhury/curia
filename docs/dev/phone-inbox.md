@@ -74,16 +74,26 @@ in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once 
 - Mail the owner had already read before triage saw it is labelled but never pings the phone.
 - After a category is chosen the answer may also carry `savePrompt: { group, question, options: [{ scope: "sender"|"domain", value, label }] }`
   (no domain option for shared providers like gmail.com; no `savePrompt` when the sender's address is unknown or for `dismiss`).
+  When the email has telling words, a middle option `{ scope: "sender-keywords", value, label, keywords: [...] }` lists up to 5 keywords
+  picked from its subject and preview. The phone lets the owner untick some, then sends the ones kept.
   The phone asks the owner "Save this for next time?" and, on yes, calls `POST /phone/triage/preferences`. "Not now" is just not calling it.
 
 ## Remembering a choice (`/phone/triage/preferences`)
 Only the owner's yes saves anything. A saved preference is given to the classifier as `Earlier choice: <label>` for mail from that
 sender (an exact address beats its domain, per mailbox). It is a hint the model weighs, not a rule: urgent still wins for time-critical
 mail. Stored in `inbox_triage_preferences` (address or domain, group, dates; no mail text).
-- `POST /phone/triage/preferences` with `{ account, scope: "sender"|"domain", value, group }` saves it (`{ ok: true }`). `400` for an
-  unknown account/group, a value that is not a lower-case address (sender) or a non-shared domain (domain).
-- `GET /phone/triage/preferences` → `{ preferences: [{ account, scope, value, group }] }`.
-- `POST /phone/triage/preferences/forget` with `{ account, scope, value }` removes one: `204`, or `404` if it was not saved.
+- `POST /phone/triage/preferences` with `{ account, scope: "sender"|"domain"|"sender-keywords", value, group, keywords? }` saves it
+  (`{ ok: true }`). `400` for an unknown account/group, a value that is not a lower-case address (sender, sender-keywords) or a
+  non-shared domain (domain), or, for sender-keywords, keywords that are not 1 to 5 words of letters only, 3 to 40 characters.
+  A sender can have several keyword rules; each is its sender plus its sorted word set.
+- `GET /phone/triage/preferences` → `{ preferences: [{ account, scope, value, group, keywords? }] }` (`keywords` on keyword rules).
+- `POST /phone/triage/preferences/forget` with `{ account, scope, value, keywords? }` removes one (a keyword rule needs its words): `204`, or `404` if it was not saved.
+
+**Keyword rules** ("from this sender, about these words"). Words are picked by a small extractor in Curia (no model): common words and
+mail boilerplate dropped, subject words weighted above preview words, crude stemming so "invoice" meets "invoices". They come from the
+subject and the short preview only, never the body, and are stored only when the owner says yes. A rule matches a new email from that
+sender when its keywords appear in the subject or preview (all of them for a one-word rule, at least two otherwise). A matching rule
+beats the plain sender rule, which beats the domain rule; the classifier gets it as the same `Earlier choice` hint.
 
 ## Unsubscribing from a newsletter (`POST /phone/unsubscribe`)
 `{ account, messageId }`. Curia reads the email's `List-Unsubscribe` header and always answers `200 { result }` (`Cache-Control: no-store`):

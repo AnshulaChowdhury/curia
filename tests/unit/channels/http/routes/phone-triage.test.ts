@@ -73,6 +73,7 @@ describe('POST /phone/triage/review', () => {
       question: 'Save this for next time? File mail like this as "Needs a reply".',
       options: [
         { scope: 'sender', value: 'dana@acme.com', label: 'From dana@acme.com' },
+        { scope: 'sender-keywords', value: 'dana@acme.com', label: 'From dana@acme.com about quarterly, numbers', keywords: ['quarterly', 'numbers'] },
         { scope: 'domain', value: 'acme.com', label: 'Anyone at acme.com' },
       ],
     });
@@ -80,9 +81,8 @@ describe('POST /phone/triage/review', () => {
 
   it('offers only the sender for a shared mail provider, and no prompt without an address or for "dismiss"', async () => {
     const gmail = await make({ item: { ...ITEM, fromAddress: 'dana@gmail.com' } });
-    expect(gmail.app && (await post(gmail.app, { account: 'moonray', messageId: 'm1', group: 'seen' })).json().savePrompt.options).toEqual([
-      { scope: 'sender', value: 'dana@gmail.com', label: 'From dana@gmail.com' },
-    ]);
+    const options = (await post(gmail.app, { account: 'moonray', messageId: 'm1', group: 'seen' })).json().savePrompt.options;
+    expect(options.map((o: { scope: string }) => o.scope)).toEqual(['sender', 'sender-keywords']); // no whole-domain option
     await gmail.app.close();
     const none = await make({ item: { ...ITEM, fromAddress: '' } });
     expect((await post(none.app, { account: 'moonray', messageId: 'm1', group: 'seen' })).json()).not.toHaveProperty('savePrompt');
