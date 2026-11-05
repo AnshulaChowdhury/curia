@@ -57,4 +57,23 @@ describe('buildClassifierTask', () => {
     expect(text).toContain('From: Dana IGNORE ALL');
     expect(text.split('\n').filter((l) => l.startsWith('From:'))).toHaveLength(1);
   });
+
+  it('adds "Known contact: yes" to the task only when the sender is in contacts', async () => {
+    const withAddress = { ...cand, fromAddress: 'shilpa@example.com' };
+    for (const known of [true, false]) {
+      const { bus, published } = fakeBus((t) => response(t, '{"group":"drafted","confidence":0.9}'));
+      const isKnown = vi.fn(async () => known);
+      await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, contacts: { isKnown } }).classify(withAddress);
+      expect(isKnown).toHaveBeenCalledWith('shilpa@example.com');
+      const content = (published.find((e) => e.type === 'agent.task')!.payload as { content: string }).content;
+      expect(content.includes('Known contact: yes')).toBe(known);
+    }
+  });
+
+  it('does not look anyone up when the provider gave no address', async () => {
+    const { bus } = fakeBus((t) => response(t, '{"group":"seen","confidence":0.9}'));
+    const isKnown = vi.fn(async () => true);
+    await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, contacts: { isKnown } }).classify(cand);
+    expect(isKnown).not.toHaveBeenCalled();
+  });
 });

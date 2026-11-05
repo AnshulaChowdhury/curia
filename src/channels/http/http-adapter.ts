@@ -66,14 +66,29 @@ import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
 import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
+import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
 import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
-import { PgMailboxCategoryStore } from '../../phone-inbox/mailbox-category-store.js';
+import { mineOrganizations } from '../../contacts-import/organizations.js';
+import { PgMailboxCategoryStore, type MailboxCategory } from '../../phone-inbox/mailbox-category-store.js';
 import { loadTriageSource } from '../../inbox-triage/start.js';
 import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
 import { inboxTriageRoutes } from './routes/inbox-triage.js';
 import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
 import { contactsSourcesRoutes } from './routes/contacts-sources.js';
+import { BRIDGES, bridgeVaultKeys } from '../../contacts-import/bridges.js';
+import { contactsImportRunRoutes } from './routes/contacts-import-run.js';
+import { ContactImportService } from '../../contacts-import/import-service.js';
+import { PgImportStore } from '../../contacts-import/import-store.js';
+import { PgRunStore } from '../../contacts-import/run-store.js';
+import { PgFarmStore } from '../../contacts-import/farm-store.js';
+import { MailboxFarmService } from '../../contacts-import/farm-service.js';
+import { FarmFacade } from '../../contacts-import/farm-facade.js';
+import { farmCollector, resolveFarmTarget } from '../../contacts-import/mailbox-contacts.js';
+import { contactsFarmRoutes } from './routes/contacts-farm.js';
+import { ContactsPullService, type Collector } from '../../contacts-import/pull-service.js';
+import { fetchBridgeContacts } from '../../contacts-import/bridge-contacts.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
@@ -707,6 +722,13 @@ export class HttpAdapter implements Channel {
           }
         },
       });
+      // The phone marks threads seen; this marks them read in the mailbox (and only that). Same token.
+      await this.app.register(phoneInboxReadRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        getMarker: (account) => loadPhoneThreadMarker(secrets, account),
+        invalidate: (account) => { phoneInboxCache.good.delete(account); },
+      });
       // Which mailbox is Work or Personal, reported by the phone (the source of truth). Same token as /phone/inbox.
       await this.app.register(phoneMailboxCategoryRoutes, {
         logger,
@@ -828,6 +850,53 @@ export class HttpAdapter implements Channel {
         secrets: sourcesSecrets,
         categories: new PgMailboxCategoryStore(pool),
         loadMailboxes: () => loadPhoneInboxAccounts(sourcesSecrets),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // The mailbox scans: ten years of mail reduced, in the background, to per-person counts (no message content).
+      const farmStore = new PgFarmStore(pool);
+      const farmScans = new MailboxFarmService(farmStore, logger);
+      const farmCategories = new PgMailboxCategoryStore(pool);
+      await this.app.register(contactsFarmRoutes, {
+        logger,
+        service: new FarmFacade(farmStore, farmScans, () => loadPhoneInboxAccounts(sourcesSecrets), farmCategories),
+        organizations: async () => {
+          const cats: Record<string, MailboxCategory | undefined> = {};
+          for (const c of await farmCategories.list()) cats[c.accountId] = c.category;
+          return mineOrganizations(await farmStore.allFacts(200_000), cats);
+        },
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // Preview and Apply for the Sources drawer. Preview is a dry run; Apply does exactly what the preview planned.
+      // It reads the Matrix bridges and every scanned mailbox that is connected and has its category.
+      await this.app.register(contactsImportRunRoutes, {
+        logger,
+        getService: async () => {
+          const collectors: Collector[] = [];
+          for (const bridge of BRIDGES) {
+            const keys = bridgeVaultKeys(bridge.id);
+            const url = (await sourcesSecrets.get(keys.url))?.trim() ?? '';
+            const secret = (await sourcesSecrets.get(keys.secret))?.trim() ?? '';
+            if (!url || !secret) continue;
+            collectors.push({
+              sourceId: `bridge:${bridge.id}`,
+              label: bridge.label,
+              collect: () => fetchBridgeContacts(bridge, url, secret, logger),
+            });
+          }
+          const mailboxes = await loadPhoneInboxAccounts(sourcesSecrets);
+          for (const box of mailboxes) {
+            const t = await resolveFarmTarget(box.id, mailboxes, farmCategories);
+            if (t.ok && (await farmStore.getRun(box.id))) collectors.push(farmCollector(box.id, `${box.id} mailbox`, t.category, farmStore));
+          }
+          return new ContactsPullService(
+            new ContactImportService(this.config.contactService, new PgImportStore(pool), logger),
+            new PgRunStore(pool),
+            collectors,
+            logger,
+          );
+        },
         webAppBootstrapSecret,
         sessions,
       });
