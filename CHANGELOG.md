@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Newsletters that won't leave** — after you unsubscribe, a returning sender is retried up to 3 times, then its mail goes to Trash (migration 122).
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
 - **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Books run inside Curia** — a stateless books service on Railway sorts bank files; Curia reads QuickBooks, asks the model, stores the batch (migration 121, ADR-061).

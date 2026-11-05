@@ -6,31 +6,33 @@ import { createSilentLogger } from '../../../../../src/logger.js';
 
 const AUTH = { authorization: 'Bearer secret' };
 const BODY = { account: 'moonray', messageId: 'm1' };
-type Headers = { listUnsubscribe: string | null; listUnsubscribePost: string | null } | null;
+type Headers = { listUnsubscribe: string | null; listUnsubscribePost: string | null; fromAddress: string | null } | null;
 
 let app: FastifyInstance | undefined;
 afterEach(async () => { await app?.close(); app = undefined; });
 
-async function make(opts: { token?: string | null; headers?: Headers; reader?: 'none' | 'throws' | 'busy'; oneClick?: { ok: boolean; status?: number } } = {}) {
+async function make(opts: { token?: string | null; headers?: Headers; remember?: 'throws'; reader?: 'none' | 'throws' | 'busy'; oneClick?: { ok: boolean; status?: number } } = {}) {
   const read = vi.fn(async () => {
     if (opts.reader === 'throws') throw new Error('nylas down');
     if (opts.reader === 'busy') throw new MailboxRateLimitedError(5);
-    return opts.headers === undefined ? { listUnsubscribe: null, listUnsubscribePost: null } : opts.headers;
+    return opts.headers === undefined ? { listUnsubscribe: null, listUnsubscribePost: null, fromAddress: null } : opts.headers;
   });
+  const onUnsubscribed = vi.fn(async () => { if (opts.remember === 'throws') throw new Error('db'); });
   const oneClick = vi.fn(async () => (opts.oneClick ?? { ok: true, status: 200 }) as never);
   app = Fastify();
   await app.register(phoneUnsubscribeRoutes, {
     logger: createSilentLogger(),
     getToken: async () => (opts.token === undefined ? 'secret' : opts.token),
     getReader: async () => (opts.reader === 'none' ? null : { read }),
+    onUnsubscribed,
     oneClick,
   });
-  return { app, read, oneClick };
+  return { app, read, oneClick, onUnsubscribed };
 }
 const post = (a: FastifyInstance, payload: unknown, headers: Record<string, string> = AUTH) =>
   a.inject({ method: 'POST', url: '/phone/unsubscribe', headers, payload: payload as object });
 
-const ONE_CLICK: Headers = { listUnsubscribe: '<https://news.example.com/u?t=secret>, <mailto:u@news.example.com>', listUnsubscribePost: 'List-Unsubscribe=One-Click' };
+const ONE_CLICK: Headers = { listUnsubscribe: '<https://news.example.com/u?t=secret>, <mailto:u@news.example.com>', listUnsubscribePost: 'List-Unsubscribe=One-Click', fromAddress: 'news@example.com' };
 
 describe('POST /phone/unsubscribe', () => {
   it('is invisible without a token and rejects a wrong one without reading mail', async () => {
@@ -62,17 +64,17 @@ describe('POST /phone/unsubscribe', () => {
   });
 
   it('never requests a link that points inside the network, and hands it back instead', async () => {
-    const { app: a, oneClick } = await make({ headers: { listUnsubscribe: '<https://169.254.169.254/latest>', listUnsubscribePost: 'List-Unsubscribe=One-Click' } });
+    const { app: a, oneClick } = await make({ headers: { listUnsubscribe: '<https://169.254.169.254/latest>', listUnsubscribePost: 'List-Unsubscribe=One-Click', fromAddress: null } });
     expect((await post(a, BODY)).json()).toEqual({ result: 'failed', url: 'https://169.254.169.254/latest' });
     expect(oneClick).not.toHaveBeenCalled();
   });
 
   it('does not POST on its own without one-click support: it returns the link or the mailto address', async () => {
-    const link = await make({ headers: { listUnsubscribe: '<https://x.com/u>', listUnsubscribePost: null } });
+    const link = await make({ headers: { listUnsubscribe: '<https://x.com/u>', listUnsubscribePost: null, fromAddress: null } });
     expect((await post(link.app, BODY)).json()).toEqual({ result: 'open-link', url: 'https://x.com/u' });
     expect(link.oneClick).not.toHaveBeenCalled();
     await link.app.close();
-    const mail = await make({ headers: { listUnsubscribe: '<mailto:u@x.com?subject=unsubscribe>', listUnsubscribePost: null } });
+    const mail = await make({ headers: { listUnsubscribe: '<mailto:u@x.com?subject=unsubscribe>', listUnsubscribePost: null, fromAddress: null } });
     expect((await post(mail.app, BODY)).json()).toEqual({ result: 'open-mailto', mailto: 'mailto:u@x.com?subject=unsubscribe' });
   });
 
@@ -89,5 +91,20 @@ describe('POST /phone/unsubscribe', () => {
     const res = await post(broken.app, BODY);
     expect(res.statusCode).toBe(502);
     expect(res.body).not.toContain('nylas');
+  });
+
+  it('remembers the sender only when the sender accepted the request', async () => {
+    const ok = await make({ headers: ONE_CLICK });
+    expect((await post(ok.app, BODY)).json()).toEqual({ result: 'unsubscribed' });
+    expect(ok.onUnsubscribed).toHaveBeenCalledWith('moonray', 'news@example.com');
+    await ok.app.close();
+    const refused = await make({ headers: ONE_CLICK, oneClick: { ok: false, status: 500 } });
+    await post(refused.app, BODY);
+    expect(refused.onUnsubscribed).not.toHaveBeenCalled();
+  });
+
+  it('still answers "unsubscribed" when remembering it fails', async () => {
+    const m = await make({ headers: ONE_CLICK, remember: 'throws' });
+    expect((await post(m.app, BODY)).json()).toEqual({ result: 'unsubscribed' });
   });
 });
