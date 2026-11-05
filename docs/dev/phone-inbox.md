@@ -104,7 +104,7 @@ beats the plain sender rule, which beats the domain rule; the classifier gets it
 - `none`: no unsubscribe information in this email.
 
 ### When a newsletter keeps coming back
-A sender that accepted the one-click request (`unsubscribed`) is remembered (`inbox_unsubscribes`, migration 122: mailbox, sender
+A sender that accepted the one-click request (`unsubscribed`) is remembered (`inbox_unsubscribes`, migration 125: mailbox, sender
 address, dates, retry count; no mail text). Triage checks each new email against it, before the classifier runs:
 1. For **10 days** after the unsubscribe nothing special happens (senders have that long to comply under CASL).
 2. After that, each new email from the sender makes Curia **repeat the one-click request** (read from the new email's own header),
