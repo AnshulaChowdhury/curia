@@ -4,15 +4,18 @@
 // filed this sender as Needs a reply before"); it is evidence for the model, not a rule that skips it.
 
 import type { DbPool } from '../db/connection.js';
+import { keywordsMatch, keywordHits } from './keywords.js';
 import { TRIAGE_GROUPS, type TriageGroup } from './types.js';
 
-export type PreferenceScope = 'sender' | 'domain';
+export type PreferenceScope = 'sender' | 'domain' | 'sender-keywords';
 
 export interface TriagePreference {
   accountId: string;
   scope: PreferenceScope;
   value: string;
   group: TriageGroup;
+  /** Only for scope 'sender-keywords': 1 to 5 sorted, lower-case words. Empty otherwise. */
+  keywords: string[];
 }
 
 /** Mailbox providers many unrelated people share: a "whole domain" preference for one of these would be wrong. */
@@ -39,48 +42,66 @@ export const isSharedMailDomain = (domain: string): boolean => SHARED_MAIL_DOMAI
 
 /** True when `value` is acceptable for `scope`: a plain address, or a domain that is not a shared mail provider. */
 export function validPreferenceValue(scope: PreferenceScope, value: string): boolean {
-  if (scope === 'sender') return addressParts(value)?.address === value;
+  if (scope === 'sender' || scope === 'sender-keywords') return addressParts(value)?.address === value;
   return value.length <= 253 && DOMAIN.test(value) && !isSharedMailDomain(value);
 }
+
+/** What the classifier knows about the email being asked about, for matching keyword rules. */
+export interface PreferenceContext {
+  subject: string;
+  preview: string;
+}
+
+interface Row { account_id: string; scope: PreferenceScope; value: string; group_name: string; keywords: string[] }
 
 export class PgPreferenceStore {
   constructor(private readonly pool: DbPool) {}
 
-  /** The owner's choice for this sender (an exact address beats its domain), or null. */
-  async lookup(accountId: string, fromAddress: string): Promise<TriageGroup | null> {
+  /**
+   * The owner's choice for this sender, or null. A keyword rule that matches this email wins (the one with the most
+   * matching words first), then the exact sender, then its domain.
+   */
+  async lookup(accountId: string, fromAddress: string, context?: PreferenceContext): Promise<TriageGroup | null> {
     const parts = addressParts(fromAddress);
     if (!parts) return null;
-    const result = await this.pool.query<{ scope: PreferenceScope; group_name: string }>(
-      `SELECT scope, group_name FROM inbox_triage_preferences
-       WHERE account_id = $1 AND ((scope = 'sender' AND value = $2) OR (scope = 'domain' AND value = $3))`,
+    const result = await this.pool.query<Row>(
+      `SELECT account_id, scope, value, group_name, keywords FROM inbox_triage_preferences
+       WHERE account_id = $1 AND ((scope IN ('sender', 'sender-keywords') AND value = $2) OR (scope = 'domain' AND value = $3))`,
       [accountId, parts.address, parts.domain],
     );
+    if (context) {
+      const matched = result.rows
+        .filter((r) => r.scope === 'sender-keywords' && isTriageGroup(r.group_name) && keywordsMatch(r.keywords, context.subject, context.preview))
+        .sort((a, b) => keywordHits(b.keywords, context.subject, context.preview) - keywordHits(a.keywords, context.subject, context.preview));
+      const best = matched[0];
+      if (best && isTriageGroup(best.group_name)) return best.group_name;
+    }
     const pick = result.rows.find((r) => r.scope === 'sender') ?? result.rows.find((r) => r.scope === 'domain');
     return pick && isTriageGroup(pick.group_name) ? pick.group_name : null;
   }
 
-  async save(p: TriagePreference): Promise<void> {
+  async save(p: Omit<TriagePreference, 'keywords'> & { keywords?: string[] }): Promise<void> {
     await this.pool.query(
-      `INSERT INTO inbox_triage_preferences (account_id, scope, value, group_name) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (account_id, scope, value) DO UPDATE SET group_name = EXCLUDED.group_name, updated_at = now()`,
-      [p.accountId, p.scope, p.value, p.group],
+      `INSERT INTO inbox_triage_preferences (account_id, scope, value, group_name, keywords) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (account_id, scope, value, keywords) DO UPDATE SET group_name = EXCLUDED.group_name, updated_at = now()`,
+      [p.accountId, p.scope, p.value, p.group, p.scope === 'sender-keywords' ? (p.keywords ?? []) : []],
     );
   }
 
   async list(): Promise<TriagePreference[]> {
-    const result = await this.pool.query<{ account_id: string; scope: PreferenceScope; value: string; group_name: string }>(
-      `SELECT account_id, scope, value, group_name FROM inbox_triage_preferences ORDER BY account_id, scope, value LIMIT 500`,
+    const result = await this.pool.query<Row>(
+      `SELECT account_id, scope, value, group_name, keywords FROM inbox_triage_preferences ORDER BY account_id, scope, value, keywords LIMIT 500`,
     );
     return result.rows.flatMap((r) => (isTriageGroup(r.group_name)
-      ? [{ accountId: r.account_id, scope: r.scope, value: r.value, group: r.group_name }]
+      ? [{ accountId: r.account_id, scope: r.scope, value: r.value, group: r.group_name, keywords: r.keywords ?? [] }]
       : []));
   }
 
-  /** True if it existed. */
-  async remove(accountId: string, scope: PreferenceScope, value: string): Promise<boolean> {
+  /** True if it existed. `keywords` identify a keyword rule (the sender alone is not enough). */
+  async remove(accountId: string, scope: PreferenceScope, value: string, keywords: string[] = []): Promise<boolean> {
     const result = await this.pool.query(
-      `DELETE FROM inbox_triage_preferences WHERE account_id = $1 AND scope = $2 AND value = $3`,
-      [accountId, scope, value],
+      `DELETE FROM inbox_triage_preferences WHERE account_id = $1 AND scope = $2 AND value = $3 AND keywords = $4`,
+      [accountId, scope, value, scope === 'sender-keywords' ? keywords : []],
     );
     return (result.rowCount ?? 0) > 0;
   }

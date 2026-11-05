@@ -29,7 +29,9 @@ export interface AgentClassifierConfig {
   /** Tells the classifier when the sender is in the principal's contacts. Optional. */
   contacts?: ContactLookup;
   /** What the owner said earlier about this sender or its domain. Optional; a failure just means no hint. */
-  preferences?: { lookup(accountId: string, fromAddress: string): Promise<TriageGroup | null> };
+  preferences?: {
+    lookup(accountId: string, fromAddress: string, context?: { subject: string; preview: string }): Promise<TriageGroup | null>;
+  };
 }
 
 /** The task text. Email fields are fenced and capped so they read as data (FR-ETC-6). */
@@ -68,7 +70,7 @@ export class AgentClassifier implements Classifier {
     const { preferences, logger } = this.config;
     if (!preferences || !candidate.fromAddress) return null;
     try {
-      return await preferences.lookup(candidate.accountId, candidate.fromAddress);
+      return await preferences.lookup(candidate.accountId, candidate.fromAddress, { subject: candidate.subject, preview: candidate.snippet });
     } catch (err) {
       logger.warn({ err }, 'inbox-triage: preference lookup failed, classifying without it');
       return null;

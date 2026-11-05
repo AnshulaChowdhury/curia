@@ -13,6 +13,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import type { UnsortedItem } from '../../../inbox-triage/item-store.js';
 import { TRIAGE_GROUPS, TRIAGE_LABELS, type TriageGroup } from '../../../inbox-triage/types.js';
+import { extractKeywords } from '../../../inbox-triage/keywords.js';
 import { addressParts, isSharedMailDomain } from '../../../inbox-triage/preference-store.js';
 import { cleanText } from '../../../phone-brief/brief-service.js';
 import { authorisePhoneRequest } from './phone-auth.js';
@@ -48,11 +49,16 @@ function savePromptFor(item: UnsortedItem, group: TriageGroup) {
   const parts = addressParts(item.fromAddress);
   if (!parts) return null;
   const label = TRIAGE_LABELS[group];
+  // Words picked from this email's subject and preview. The phone shows them for the owner to keep or drop.
+  const keywords = extractKeywords(item.subject, item.snippet);
   return {
     group,
     question: `Save this for next time? File mail like this as "${label}".`,
     options: [
       { scope: 'sender', value: parts.address, label: `From ${parts.address}` },
+      ...(keywords.length > 0
+        ? [{ scope: 'sender-keywords', value: parts.address, label: `From ${parts.address} about ${keywords.join(', ')}`, keywords }]
+        : []),
       ...(isSharedMailDomain(parts.domain) ? [] : [{ scope: 'domain', value: parts.domain, label: `Anyone at ${parts.domain}` }]),
     ],
   };
