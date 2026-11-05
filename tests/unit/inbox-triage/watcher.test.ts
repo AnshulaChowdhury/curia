@@ -150,6 +150,72 @@ describe('InboxWatcher', () => {
     expect(list).toHaveBeenCalledTimes(1);
   });
 
+  it('doubles the pause while Google keeps refusing, and starts over after a good listing', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-05T12:00:00Z'));
+      const warn = vi.fn();
+      const log = { info: vi.fn(), warn, error: vi.fn(), debug: vi.fn() } as never;
+      let limited = true;
+      const src: TriageSource = {
+        accountId: 'moonray', applyLabel: async () => {},
+        listUntagged: async () => { if (limited) throw new MailboxRateLimitedError(undefined); return []; },
+      };
+      const watcher = new InboxWatcher({ sources: [src], seen: memorySeen(), logger: log, intervalMs: 1000, notifier: { notify: async () => {} }, classifier: { classify: async () => verdict('seen') } });
+      const waits = () => warn.mock.calls.map((c) => (c[0] as { waitSeconds?: number }).waitSeconds).filter((w) => w !== undefined);
+      await watcher.tick();
+      vi.advanceTimersByTime(301_000);
+      await watcher.tick();
+      vi.advanceTimersByTime(601_000);
+      await watcher.tick();
+      expect(waits()).toEqual([300, 600, 1200]);
+      vi.advanceTimersByTime(1201_000);
+      limited = false;
+      await watcher.tick();
+      limited = true;
+      await watcher.tick();
+      expect(waits().at(-1)).toBe(300);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe('commitProgress', () => {
+    const withProgress = (candidates: TriageCandidate[]) => {
+      const commitProgress = vi.fn(async (_all: boolean) => {});
+      const s: TriageSource = { accountId: 'moonray', listUntagged: async () => candidates, applyLabel: async () => {}, commitProgress };
+      return { s, commitProgress };
+    };
+    const run = (s: TriageSource, maxPerTick?: number) => new InboxWatcher({
+      sources: [s], seen: memorySeen(), logger, intervalMs: 1000, notifier: { notify: async () => {} },
+      classifier: { classify: async () => verdict('seen') }, ...(maxPerTick ? { maxPerTick } : {}),
+    }).tick();
+
+    it('reports everything handled when the pass got through the whole listing', async () => {
+      const { s, commitProgress } = withProgress([candidate('a', 1), candidate('b', 2)]);
+      await run(s);
+      expect(commitProgress).toHaveBeenCalledWith(true);
+    });
+
+    it('reports not-everything when the per-pass limit left mail waiting', async () => {
+      const { s, commitProgress } = withProgress([candidate('a', 1), candidate('b', 2), candidate('c', 3)]);
+      await run(s, 2);
+      expect(commitProgress).toHaveBeenCalledWith(false);
+    });
+
+    it('does not report when the listing failed', async () => {
+      const commitProgress = vi.fn(async () => {});
+      const s: TriageSource = { accountId: 'moonray', listUntagged: async () => { throw new Error('504'); }, applyLabel: async () => {}, commitProgress };
+      await run(s);
+      expect(commitProgress).not.toHaveBeenCalled();
+    });
+
+    it('carries on when saving the progress fails', async () => {
+      const s: TriageSource = { accountId: 'moonray', listUntagged: async () => [], applyLabel: async () => {}, commitProgress: async () => { throw new Error('db down'); } };
+      await expect(run(s)).resolves.toBeUndefined();
+    });
+  });
+
   describe('beforeClassify', () => {
     it('skips classification and labelling for mail the hook handled, and records it as tagged', async () => {
       const { s, applied } = source([candidate('a', 1), candidate('b', 2)]);

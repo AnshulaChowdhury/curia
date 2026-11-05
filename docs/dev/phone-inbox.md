@@ -63,7 +63,7 @@ archives or deletes. Idempotent; a thread that no longer exists counts as done.
 - The mailbox's cached `/phone/inbox` answer is dropped after a successful write, so the thread stops counting on the next poll.
 
 ## Sorting unsorted mail from the phone (`/phone/triage/review`)
-Triage looks at every inbox email received since 2026-11-01 (local), read or unread. Mail it cannot sort stays unlabelled and is kept
+Triage looks at every inbox email received since the mailbox's last successful triage (table `inbox_triage_progress`, saved only after a listing reached the end of its window and every message in it was handled; each listing starts an hour earlier to catch late arrivals, and a mailbox with no record looks back 24 hours), read or unread. A rate-limited mailbox is paused 5, 10, 20 then at most 30 minutes. Mail it cannot sort stays unlabelled and is kept
 in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once resolved).
 - `GET /phone/triage/review` → `{ generatedAt, count, cards: [{ id, account, messageId, threadId, from, subject, preview, receivedAt,
   reason: "none"|"failed", options: [{ group, label }] }] }`, newest first, at most 50. `options` are always `urgent`, `drafted`,
