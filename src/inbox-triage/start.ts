@@ -13,7 +13,7 @@ import type { Logger } from '../logger.js';
 import type { SecretsService } from '../secrets/secrets-service.js';
 import { NYLAS_REGIONS, type NylasRegion } from '../phone-inbox/nylas-mailbox.js';
 import { PHONE_INBOX_ACCOUNT_IDS } from '../phone-inbox/phone-inbox-service.js';
-import { AgentClassifier } from './agent-classifier.js';
+import { AgentClassifier, type AgentClassifierConfig } from './agent-classifier.js';
 import type { ContactLookup } from './contact-lookup.js';
 import { NtfyNotifier } from './ntfy-notifier.js';
 import { NylasTriageSource } from './nylas-triage-source.js';
@@ -35,6 +35,8 @@ export interface InboxTriageDeps {
   items: PgTriageStore;
   /** Lets the classifier know when the sender is in the principal's contacts. Optional. */
   contacts?: ContactLookup;
+  /** What the owner has said about senders before; given to the classifier as a hint. Optional. */
+  preferences?: AgentClassifierConfig['preferences'];
   /** IANA timezone that decides where TRIAGE_FROM_DATE starts. */
   timezone: string;
   fetchImpl?: typeof fetch;
@@ -55,7 +57,7 @@ export const TRIAGE_SECRET_KEYS = {
 
 /** Returns the running watcher, or null when triage is off or not fully configured. */
 export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningInboxTriage | null> {
-  const { bus, logger, secrets, items, timezone, contacts, fetchImpl = fetch } = deps;
+  const { bus, logger, secrets, items, timezone, contacts, preferences, fetchImpl = fetch } = deps;
   const read = async (key: string): Promise<string | null> => (await secrets.get(key))?.trim() || null;
 
   if ((await read('inbox_triage_enabled'))?.toLowerCase() !== 'true') {
@@ -96,7 +98,8 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
 
   const watcher = new InboxWatcher({
     sources,
-    classifier: new AgentClassifier({ bus, logger, minConfidence, timeoutMs: CLASSIFY_TIMEOUT_MS, ...(contacts ? { contacts } : {}) }),
+    classifier: new AgentClassifier({ bus, logger, minConfidence, timeoutMs: CLASSIFY_TIMEOUT_MS,
+      ...(contacts ? { contacts } : {}), ...(preferences ? { preferences } : {}) }),
     notifier,
     seen: items,
     outcomes: items,

@@ -66,6 +66,9 @@ import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
 import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { phoneTriagePreferenceRoutes } from './routes/phone-triage-preferences.js';
+import { phoneUnsubscribeRoutes } from './routes/phone-unsubscribe.js';
+import { loadUnsubscribeReader } from '../../phone-inbox/nylas-unsubscribe.js';
 import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
 import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
 import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
@@ -173,6 +176,8 @@ export interface HttpAdapterConfig {
   phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
   /** Unsorted mail for the phone's review cards (GET/POST /phone/triage/review). */
   triageItems?: import('../../inbox-triage/item-store.js').PgTriageStore;
+  /** What the owner told triage to remember about senders (saved from the phone's review cards). */
+  triagePreferences?: import('../../inbox-triage/preference-store.js').PgPreferenceStore;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
@@ -754,6 +759,12 @@ export class HttpAdapter implements Channel {
           service: this.config.phoneBrief,
         });
       }
+      // Unsubscribe from a newsletter, from the phone's email page. Same token.
+      await this.app.register(phoneUnsubscribeRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        getReader: (account) => loadUnsubscribeReader(secrets, account),
+      });
       // Mail triage could not sort, as cards the owner can categorise from the phone.
       if (this.config.triageItems) {
         await this.app.register(phoneTriageRoutes, {
@@ -761,6 +772,13 @@ export class HttpAdapter implements Channel {
           getToken: () => secrets.get('phone_inbox_token'),
           store: this.config.triageItems,
           getSource: (account) => loadTriageSource(secrets, account),
+        });
+      }
+      if (this.config.triagePreferences) {
+        await this.app.register(phoneTriagePreferenceRoutes, {
+          logger,
+          getToken: () => secrets.get('phone_inbox_token'),
+          store: this.config.triagePreferences,
         });
       }
     }

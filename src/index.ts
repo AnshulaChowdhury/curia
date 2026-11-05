@@ -70,6 +70,7 @@ import { EntityMemory } from './memory/entity-memory.js';
 import { InboxTriageController } from './inbox-triage/controller.js';
 import { PgTriageStore } from './inbox-triage/item-store.js';
 import { contactLookupFor } from './inbox-triage/contact-lookup.js';
+import { PgPreferenceStore } from './inbox-triage/preference-store.js';
 import { UnsortedBriefSource } from './phone-brief/unsorted-source.js';
 import { PgBriefStore } from './phone-brief/brief-store.js';
 import { PhoneBriefService } from './phone-brief/brief-service.js';
@@ -3214,12 +3215,14 @@ async function main(): Promise<void> {
   // Real-time inbox triage: off unless the vault says `inbox_triage_enabled` = "true".
   // Started after the scheduler so the email-classifier agent's tasks have a runtime to run in.
   const triageItems = new PgTriageStore(pool);
+  const triagePreferences = new PgPreferenceStore(pool);
   const inboxTriage = new InboxTriageController({
     bus,
     logger,
     secrets: secretsService,
     items: triageItems,
     timezone: config.timezone,
+    preferences: triagePreferences,
     ...(contactService ? { contacts: contactLookupFor(contactService, logger) } : {}),
   });
   try {
@@ -3488,6 +3491,7 @@ async function main(): Promise<void> {
     secretsService,
     inboxTriage,
     triageItems,
+    triagePreferences,
     phoneBrief,
     booksMonitor,
     secretCaptureService,

@@ -14,6 +14,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Unsubscribe from the phone** — `POST /phone/unsubscribe` sends the sender's one-click request, else returns the link.
+- **Remember a triage choice** — after a review card, the phone can save the sender; the classifier gets it as a hint (migration 121).
 - **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **`skipKgNode` for `createContact`** — creates a contact with no knowledge-graph node (no person node, no org routing).
