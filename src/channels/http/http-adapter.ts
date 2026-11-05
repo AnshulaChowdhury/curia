@@ -72,7 +72,8 @@ import { loadUnsubscribeReader } from '../../phone-inbox/nylas-unsubscribe.js';
 import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
 import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
 import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
-import { PgMailboxCategoryStore } from '../../phone-inbox/mailbox-category-store.js';
+import { mineOrganizations } from '../../contacts-import/organizations.js';
+import { PgMailboxCategoryStore, type MailboxCategory } from '../../phone-inbox/mailbox-category-store.js';
 import { loadTriageSource } from '../../inbox-triage/start.js';
 import { phoneBooksRoutes } from './routes/phone-books.js';
 import { quickbooksRoutes } from './routes/quickbooks.js';
@@ -877,6 +878,11 @@ export class HttpAdapter implements Channel {
       await this.app.register(contactsFarmRoutes, {
         logger,
         service: new FarmFacade(farmStore, farmScans, () => loadPhoneInboxAccounts(sourcesSecrets), farmCategories),
+        organizations: async () => {
+          const cats: Record<string, MailboxCategory | undefined> = {};
+          for (const c of await farmCategories.list()) cats[c.accountId] = c.category;
+          return mineOrganizations(await farmStore.allFacts(200_000), cats);
+        },
         webAppBootstrapSecret,
         sessions,
       });

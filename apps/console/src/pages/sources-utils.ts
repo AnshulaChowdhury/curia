@@ -91,6 +91,24 @@ export function applyOutcomeText(r: ApplyResult): string {
   return t.failed > 0 ? `${base}. ${t.failed} could not be saved; run the preview again to retry.` : `${base}.`;
 }
 
+// ---- Organisations found in scanned mail (GET /api/contacts/import/organizations) ----
+
+export interface OrganizationRow {
+  domain: string;
+  name: string;
+  people: number;
+  received: number;
+  sent: number;
+  lastSeen: string;
+  label: 'work' | 'personal' | 'hybrid' | null;
+  mailboxes: string[];
+}
+
+/** "12 people · 340 emails in, 120 out · work" */
+export function orgLine(o: OrganizationRow): string {
+  const label = o.label ? ` · ${o.label}` : '';
+  return `${o.people} ${o.people === 1 ? 'person' : 'people'} · ${o.received.toLocaleString('en-US')} in, ${o.sent.toLocaleString('en-US')} out${label}`;
+}
 // ---- Mailbox scans (GET/POST /api/contacts/import/farm) ----
 
 export interface FarmMailbox {
