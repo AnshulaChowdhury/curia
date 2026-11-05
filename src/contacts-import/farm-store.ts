@@ -31,7 +31,11 @@ export interface FarmFact {
   lastSeen: string;
 }
 
+export interface FarmFactRow extends FarmFact { accountId: string }
+
 export interface FarmStore {
+  /** Every mailbox's facts, for cross-mailbox grouping (organisations). */
+  allFacts(limit: number): Promise<FarmFactRow[]>;
   getRun(accountId: string): Promise<FarmRun | null>;
   /** Starts a fresh scan (clears that mailbox's old facts) or, with resume, keeps the cursor and counts. */
   startRun(accountId: string, windowStart: Date, resume: boolean): Promise<FarmRun>;
@@ -87,6 +91,10 @@ export class InMemoryFarmStore implements FarmStore {
     if (!run) return;
     const now = new Date().toISOString();
     this.runs.set(accountId, { ...run, status, errorKind: errorKind ?? null, updatedAt: now, finishedAt: status === 'done' ? now : null });
+  }
+
+  async allFacts(limit: number): Promise<FarmFactRow[]> {
+    return [...this.rows.entries()].map(([k, v]) => ({ ...v, accountId: k.split('\u0000')[0]! })).slice(0, limit);
   }
 
   async facts(accountId: string, limit: number): Promise<FarmFact[]> {
@@ -178,6 +186,12 @@ export class PgFarmStore implements FarmStore {
       `UPDATE contact_farm_runs SET status = $2, error_kind = $3, updated_at = now(),
          finished_at = CASE WHEN $2 = 'done' THEN now() ELSE NULL END WHERE account_id = $1`,
       [accountId, status, errorKind ?? null]);
+  }
+
+  async allFacts(limit: number): Promise<FarmFactRow[]> {
+    const r = await this.pool.query<{ account_id: string; email: string; domain: string; display_name: string | null; received: number; sent: number; copied: number; first_seen: Date; last_seen: Date }>(
+      'SELECT * FROM contact_farm_facts ORDER BY (received + sent) DESC, email LIMIT $1', [limit]);
+    return r.rows.map((x) => ({ accountId: x.account_id, email: x.email, domain: x.domain, displayName: x.display_name, received: x.received, sent: x.sent, copied: x.copied, firstSeen: x.first_seen.toISOString(), lastSeen: x.last_seen.toISOString() }));
   }
 
   async facts(accountId: string, limit: number): Promise<FarmFact[]> {
