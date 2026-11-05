@@ -154,19 +154,82 @@ describe('NylasTriageSource', () => {
     expect(urls[1]).toContain('page_token=p2');
   });
 
-  it('catches up on the whole window once, then lists only recent mail', async () => {
-    const urls: string[] = [];
-    const fetchImpl = vi.fn(async (url: string) => {
+  describe('resuming from the last successful triage', () => {
+    const mailbox = (urls: string[]) => vi.fn(async (url: string) => {
       if (url.includes('/folders')) return json({ data: [{ id: 'INBOX', name: 'INBOX' }] });
       urls.push(url);
       return json({ data: [{ id: 'a', folders: ['INBOX'] }] });
     }) as unknown as typeof fetch;
-    const source = new NylasTriageSource('moonray', 'k', 'g', fetchImpl, 'us', 1000);
-    await source.listUntagged();
-    await source.listUntagged();
-    expect(urls[0]).toContain('received_after=1000');
-    const recent = Number(new URL(urls[1]!).searchParams.get('received_after'));
-    expect(recent).toBeGreaterThan(Date.now() / 1000 - 6 * 3600 - 5);
+    const after = (url: string) => Number(new URL(url).searchParams.get('received_after'));
+    const progressWith = (saved: number | null) => ({ get: vi.fn(async (_id: string) => saved), set: vi.fn(async (_id: string, _at: number) => {}) });
+
+    it('starts one hour before the saved mark', async () => {
+      const urls: string[] = [];
+      const progress = progressWith(1_800_000_000_000);
+      await new NylasTriageSource('moonray', 'k', 'g', mailbox(urls), 'us', 0, progress).listUntagged();
+      expect(after(urls[0]!)).toBe(1_800_000_000 - 3600);
+      expect(progress.get).toHaveBeenCalledWith('moonray');
+    });
+
+    it('looks back 24 hours when the mailbox has never been triaged', async () => {
+      const urls: string[] = [];
+      await new NylasTriageSource('moonray', 'k', 'g', mailbox(urls), 'us', 0, progressWith(null)).listUntagged();
+      const now = Date.now() / 1000;
+      expect(after(urls[0]!)).toBeGreaterThan(now - 24 * 3600 - 5);
+      expect(after(urls[0]!)).toBeLessThan(now - 24 * 3600 + 5);
+    });
+
+    it('never starts before the explicit floor', async () => {
+      const urls: string[] = [];
+      await new NylasTriageSource('moonray', 'k', 'g', mailbox(urls), 'us', 1_900_000_000, progressWith(1_800_000_000_000)).listUntagged();
+      expect(after(urls[0]!)).toBe(1_900_000_000);
+    });
+
+    it('saves the time the listing began once the watcher handled everything, and the next listing starts there', async () => {
+      const urls: string[] = [];
+      const progress = progressWith(1_800_000_000_000);
+      const source = new NylasTriageSource('moonray', 'k', 'g', mailbox(urls), 'us', 0, progress);
+      const before = Date.now();
+      await source.listUntagged();
+      await source.commitProgress(true);
+      const saved = progress.set.mock.calls[0]![1] as number;
+      expect(progress.set.mock.calls[0]![0]).toBe('moonray');
+      expect(saved).toBeGreaterThanOrEqual(Math.floor(before / 1000) * 1000);
+      await source.listUntagged();
+      expect(after(urls[1]!)).toBe(saved / 1000 - 3600);
+    });
+
+    it('keeps the old mark when some mail was left unhandled', async () => {
+      const urls: string[] = [];
+      const progress = progressWith(1_800_000_000_000);
+      const source = new NylasTriageSource('moonray', 'k', 'g', mailbox(urls), 'us', 0, progress);
+      await source.listUntagged();
+      await source.commitProgress(false);
+      await source.listUntagged();
+      expect(progress.set).not.toHaveBeenCalled();
+      expect(after(urls[1]!)).toBe(after(urls[0]!));
+    });
+
+    it('keeps the old mark when the listing stopped before the end of the window', async () => {
+      const fetchImpl = vi.fn(async (url: string) => {
+        if (url.includes('/folders')) return json({ data: [{ id: 'INBOX', name: 'INBOX' }] });
+        return json({ data: [{ id: `m${Math.random()}`, folders: ['INBOX'] }], next_cursor: 'more' });
+      }) as unknown as typeof fetch;
+      const progress = progressWith(1_800_000_000_000);
+      const source = new NylasTriageSource('moonray', 'k', 'g', fetchImpl, 'us', 0, progress);
+      await source.listUntagged(async () => true); // everything known, so it pages to the cap without finding the end
+      await source.commitProgress(true);
+      expect(progress.set).not.toHaveBeenCalled();
+    });
+
+    it('does not move the mark after a failed listing', async () => {
+      const fetchImpl = (async () => new Response('{}', { status: 500 })) as unknown as typeof fetch;
+      const progress = progressWith(1_800_000_000_000);
+      const source = new NylasTriageSource('moonray', 'k', 'g', fetchImpl, 'us', 0, progress);
+      await expect(source.listUntagged()).rejects.toThrow();
+      await source.commitProgress(true);
+      expect(progress.set).not.toHaveBeenCalled();
+    });
   });
 
   it('throws a rate-limit error carrying the wait when Nylas answers 429', async () => {

@@ -16,6 +16,8 @@ export interface TriageSource {
   applyLabel(messageId: string, group: TriageGroup): Promise<void>;
   /** Moves a message to Trash. Optional; used only by the unsubscribe follow-up, never by classification. */
   moveToTrash?(messageId: string): Promise<void>;
+  /** Told after each pass whether every message in the listing was handled; a source that keeps a progress mark saves it then. */
+  commitProgress?(allHandled: boolean): Promise<void>;
 }
 
 export interface Classifier {
@@ -49,12 +51,16 @@ export interface InboxWatcherConfig {
 
 const DEFAULT_MAX_PER_TICK = 5;
 const DEFAULT_COOLDOWN_SECONDS = 300;
+/** Repeated rate limits double the pause each time, up to this. */
+const MAX_COOLDOWN_SECONDS = 1800;
 
 export class InboxWatcher {
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
   /** Per mailbox: when a rate-limited mailbox may be asked again. */
   private readonly blockedUntil = new Map<string, number>();
+  /** Per mailbox: rate limits in a row, so the pause can grow while Google keeps refusing. */
+  private readonly rateLimitStreak = new Map<string, number>();
 
   constructor(private readonly config: InboxWatcherConfig) {}
 
@@ -94,9 +100,11 @@ export class InboxWatcher {
     } catch (err) {
       if (err instanceof MailboxRateLimitedError) {
         // Leave the mailbox alone for a while: hammering a rate-limited Google account only prolongs it.
-        const waitMs = (err.retryAfterSeconds ?? DEFAULT_COOLDOWN_SECONDS) * 1000;
-        this.blockedUntil.set(source.accountId, Date.now() + waitMs);
-        logger.warn({ accountId: source.accountId, waitSeconds: waitMs / 1000 }, 'inbox-triage: mailbox rate-limited, pausing it');
+        const streak = (this.rateLimitStreak.get(source.accountId) ?? 0) + 1;
+        this.rateLimitStreak.set(source.accountId, streak);
+        const waitSeconds = err.retryAfterSeconds ?? Math.min(DEFAULT_COOLDOWN_SECONDS * 2 ** (streak - 1), MAX_COOLDOWN_SECONDS);
+        this.blockedUntil.set(source.accountId, Date.now() + waitSeconds * 1000);
+        logger.warn({ accountId: source.accountId, waitSeconds, streak }, 'inbox-triage: mailbox rate-limited, pausing it');
         return;
       }
       // FR-ETW-3: retry on the next tick; the sweep covers the gap.
@@ -104,11 +112,16 @@ export class InboxWatcher {
       return;
     }
 
+    this.rateLimitStreak.delete(source.accountId);
     const limit = this.config.maxPerTick ?? DEFAULT_MAX_PER_TICK;
     let handled = 0;
+    let allHandled = true;
     // Oldest first, like the sweep.
     for (const candidate of [...candidates].sort((a, b) => a.receivedAt - b.receivedAt)) {
-      if (handled >= limit) break;
+      if (handled >= limit) {
+        allHandled = false; // more waiting than one pass may take; the next listing starts from the same place
+        break;
+      }
       const key = `${candidate.accountId}:${candidate.messageId}`;
       if (await seen.has(key)) continue;
       // Marked before classifying (FR-ETW-2): a crash mid-call must not loop on one message.
@@ -164,6 +177,15 @@ export class InboxWatcher {
       } catch (err) {
         // FR-ETP-3: a push failure never blocks tagging.
         logger.warn({ err, group: verdict.group }, 'inbox-triage: push failed');
+      }
+    }
+
+    if (source.commitProgress) {
+      try {
+        await source.commitProgress(allHandled);
+      } catch (err) {
+        // The mark is only a resume point: if it is not saved, the next pass simply starts a little earlier.
+        logger.warn({ err, accountId: source.accountId }, 'inbox-triage: could not save the triage progress');
       }
     }
   }
