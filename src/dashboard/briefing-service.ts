@@ -17,6 +17,7 @@ import {
   AGGREGATE_CACHE_MS,
   BULLPEN_IN_FLIGHT_MS,
   HISTOGRAM_DAYS,
+  MINUTES_PER_BOOKS_ROW,
   MINUTES_PER_SUCCESSFUL_ACTION,
   STATS_WINDOW_DAYS,
   addCalendarDays,
@@ -73,6 +74,10 @@ export interface StatsResponse {
   /** Echo of {@link MINUTES_PER_SUCCESSFUL_ACTION} so the console does not keep a second copy. */
   minutesPerAction: number;
   successfulActions: { current: number; previous: number };
+  /** Bank rows Curia sorted without a person, in books batches made in each window. */
+  booksRows: { current: number; previous: number };
+  /** Echo of {@link MINUTES_PER_BOOKS_ROW}. */
+  minutesPerBooksRow: number;
   done: { current: number; previous: number };
   contacts: { total: number; newThisWeek: number };
   hiccups: { current: number; byDay: number[] };
@@ -179,8 +184,9 @@ export class BriefingService {
     const currentStart = localMidnight(model.days[HISTOGRAM_DAYS - STATS_WINDOW_DAYS]!.key, timezone);
     const previousStart = localMidnight(model.days[0]!.key, timezone);
 
-    const [actions, contacts] = await Promise.all([
+    const [actions, booksRows, contacts] = await Promise.all([
       this.actionCounts(previousStart, currentStart, now),
+      this.booksRowCounts(previousStart, currentStart, now),
       this.contactCounts(currentStart),
     ]);
 
@@ -188,6 +194,8 @@ export class BriefingService {
       timezone,
       minutesPerAction: MINUTES_PER_SUCCESSFUL_ACTION,
       successfulActions: actions,
+      booksRows,
+      minutesPerBooksRow: MINUTES_PER_BOOKS_ROW,
       done: {
         current: outcomeTotal(last7, DONE_OUTCOMES),
         previous: outcomeTotal(prev7, DONE_OUTCOMES),
@@ -335,6 +343,26 @@ export class BriefingService {
       current: Number(row?.current ?? 0),
       previous: Number(row?.previous ?? 0),
     };
+  }
+
+  private async booksRowCounts(
+    previousStart: Date,
+    currentStart: Date,
+    now: Date,
+  ): Promise<{ current: number; previous: number }> {
+    const result = await this.deps.pool.query<{ current: number; previous: number }>(
+      `SELECT
+         count(*) FILTER (WHERE b.created_at >= $2 AND b.created_at < $3)::int AS current,
+         count(*) FILTER (WHERE b.created_at >= $1 AND b.created_at < $2)::int AS previous
+       FROM books_batch_rows r
+       JOIN books_batches b USING (batch_id)
+       WHERE b.created_at >= $1 AND b.created_at < $3
+         AND COALESCE(r.data->>'category_source', '') <> ALL($4::text[])`,
+      // Whatever the service filled in itself counts (a rule, vendor history, a guess, a transfer); lines it could not sort do not.
+      [previousStart, currentStart, now, ['', 'Needs your input', 'Month-end rules']],
+    );
+    const row = result.rows[0];
+    return { current: Number(row?.current ?? 0), previous: Number(row?.previous ?? 0) };
   }
 
   private async contactCounts(since: Date): Promise<{ total: number; newThisWeek: number }> {

@@ -113,6 +113,10 @@ const STANDARD_TIER_EXTRACTS: Readonly<Record<string, number>> = {
   // Meeting minutes are the document, not a short verdict. The 8,000-token cap is
   // the minutes themselves (#2322). Fast stays the tier for small structured extracts.
   'src/meetings/minutes-writer.ts': 1,
+  // The books service asks for a structured JSON answer per request (categorisations with a
+  // schema), so the 8,000-token cap is the reply itself. A failed call leaves those lines
+  // as "needs input", so the run still completes.
+  'src/books/books-runner.ts': 1,
 };
 
 const REPO = join(import.meta.dirname, '../../../..');

@@ -16,6 +16,9 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Added
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
 - **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
+- **Books run inside Curia** — a stateless books service on Railway sorts bank files; Curia reads QuickBooks, asks the model, stores the batch (migration 121, ADR-061).
+- **Books "Run now"** — a button on the Books page starts a run at once; waiting files are also checked every five minutes.
+- **Time saved counts bookkeeping** — rows Curia sorted itself add about three minutes each (rough estimate) to the Time saved tile.
 - **Contacts mailbox scan** — reads ten years of a connected mailbox into per-person counts, resumable, no message content (migration 120).
 - **`skipKgNode` for `createContact`** — creates a contact with no knowledge-graph node (no person node, no org routing).
 - **Contacts import Preview and Apply** — dry-run the Matrix bridges' contact lists, then apply exactly that preview as `unknown` contacts (migration 119).

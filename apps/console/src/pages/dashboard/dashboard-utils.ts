@@ -379,8 +379,8 @@ export function caughtUpDetail(clearedToday: number, curiaHandling: number): str
   return `${clearedToday} cleared today · ${handling}`;
 }
 
-export function formatTimeSaved(actions: number, minutesPerAction: number): string {
-  const hours = (actions * minutesPerAction) / 60;
+export function formatTimeSaved(actions: number, minutesPerAction: number, booksRows = 0, minutesPerBooksRow = 0): string {
+  const hours = hoursFromActions(actions, minutesPerAction, booksRows, minutesPerBooksRow);
   return `≈${(Math.round(hours * 10) / 10).toFixed(1)}h`;
 }
 
@@ -407,8 +407,8 @@ export function formatHoursDelta(currentHours: number, previousHours: number): S
   return { direction, text: `${arrow} ${rounded.toFixed(1)}h vs last wk` };
 }
 
-export function hoursFromActions(actions: number, minutesPerAction: number): number {
-  return (actions * minutesPerAction) / 60;
+export function hoursFromActions(actions: number, minutesPerAction: number, booksRows = 0, minutesPerBooksRow = 0): number {
+  return (actions * minutesPerAction + booksRows * minutesPerBooksRow) / 60;
 }
 
 function localDayKey(date: Date, timeZone: string): string {
@@ -568,6 +568,8 @@ export interface StatsData {
   timezone: string;
   minutesPerAction: number;
   successfulActions: { current: number; previous: number };
+  booksRows: { current: number; previous: number };
+  minutesPerBooksRow: number;
   done: { current: number; previous: number };
   contacts: { total: number; newThisWeek: number };
   hiccups: { current: number; byDay: number[] };
@@ -642,9 +644,16 @@ export async function fetchStats(signal?: AbortSignal): Promise<StatsData> {
   if (typeof timezone !== 'string' || timezone.length === 0) {
     throw new Error('/api/dashboard/stats returned an unexpected response');
   }
+  // Bookkeeping rows are an addition to the stats: an older server without them counts as none.
+  const books = data['booksRows'] === undefined ? { current: 0, previous: 0 } : requireRecord(data['booksRows'], '/api/dashboard/stats booksRows');
   return {
     timezone,
     minutesPerAction: requireNumber(data['minutesPerAction'], '/api/dashboard/stats'),
+    booksRows: {
+      current: requireNumber(books['current'], '/api/dashboard/stats booksRows'),
+      previous: requireNumber(books['previous'], '/api/dashboard/stats booksRows'),
+    },
+    minutesPerBooksRow: typeof data['minutesPerBooksRow'] === 'number' ? data['minutesPerBooksRow'] : 0,
     successfulActions: {
       current: requireNumber(actions['current'], '/api/dashboard/stats actions'),
       previous: requireNumber(actions['previous'], '/api/dashboard/stats actions'),
