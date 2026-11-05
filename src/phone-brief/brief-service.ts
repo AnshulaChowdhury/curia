@@ -4,6 +4,7 @@
 // sections, more than 10 items, text over 280 characters), and stores the result for the local date. A source that
 // throws only loses its own section. Sections are always sent in the contract's order.
 
+import { PHONE_INBOX_ACCOUNT_IDS } from '../phone-inbox/phone-inbox-service.js';
 import type { Logger } from '../logger.js';
 import { localDate, previousLocalDate, startOfLocalDay } from './local-time.js';
 import {
@@ -37,6 +38,13 @@ function cleanItem(item: BriefItem): BriefItem | null {
   if (text) out.text = text;
   if (from) out.from = from;
   if (subject) out.subject = subject;
+  // The pair names one email so the phone can act on it (unsubscribe). One without the other is dropped.
+  if (typeof item.account === 'string' && (PHONE_INBOX_ACCOUNT_IDS as readonly string[]).includes(item.account)
+      && typeof item.messageId === 'string' && item.messageId.length > 0 && item.messageId.length <= 256
+      && item.messageId === cleanText(item.messageId, 256)) {
+    out.account = item.account;
+    out.messageId = item.messageId;
+  }
   // An item needs something to show.
   return out.text || out.subject ? out : null;
 }

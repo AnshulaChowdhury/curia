@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Unsubscribe from brief newsletters** — newsletter items in `/phone/brief` carry `account` and `messageId` for the phone's Unsubscribe button.
 - **Organisations from mailbox scans** — people grouped by email domain, webmail excluded, shown in the Sources drawer.
 - **Mailbox scans in the Sources drawer** — start, watch and resume each mailbox's ten-year scan from the Contacts page.
 - **Books run inside Curia** — a stateless books service on Railway sorts bank files; Curia reads QuickBooks, asks the model, stores the batch (migration 121, ADR-061).
