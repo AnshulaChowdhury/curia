@@ -93,6 +93,8 @@ import { contactsFarmRoutes } from './routes/contacts-farm.js';
 import { ContactsPullService, type Collector } from '../../contacts-import/pull-service.js';
 import { fetchBridgeContacts } from '../../contacts-import/bridge-contacts.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
+import { PgExportStore } from '../../contacts-import/export-store.js';
+import { contactsExportRoutes } from './routes/contacts-export.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { loadPhoneMessageReader } from '../../phone-inbox/nylas-message.js';
@@ -877,6 +879,14 @@ export class HttpAdapter implements Channel {
         secrets: sourcesSecrets,
         categories: new PgMailboxCategoryStore(pool),
         loadMailboxes: () => loadPhoneInboxAccounts(sourcesSecrets),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // The Matrix exporter on the Mac mini: run requests in, per-room message counts out (bearer: the import token).
+      await this.app.register(contactsExportRoutes, {
+        logger,
+        store: new PgExportStore(pool),
+        importToken: new ContactsImportToken(sourcesSecrets),
         webAppBootstrapSecret,
         sessions,
       });
