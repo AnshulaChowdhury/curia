@@ -4,6 +4,8 @@
 //
 // Curia reads the email's List-Unsubscribe header. If the sender supports one-click unsubscribe (RFC 8058) Curia sends
 // that request itself. Otherwise it hands the link back for the owner to open on the phone. It never sends email.
+// A sender that accepted the request is remembered: if it keeps mailing, triage repeats the request up to three times and then
+// moves its mail to Trash (see inbox-triage/unsubscribe-enforcer.ts).
 // The answer is always 200 with a `result`:
 //   unsubscribed   the sender accepted the one-click request
 //   open-link      no one-click support: `url` is the sender's page; the phone opens it for the owner
@@ -26,6 +28,8 @@ export interface PhoneUnsubscribeRouteOptions {
   getToken: () => Promise<string | null>;
   /** The reader for one mailbox, or null when it is not connected. */
   getReader: (account: PhoneInboxAccountId) => Promise<Pick<NylasUnsubscribeReader, 'read'> | null>;
+  /** Told when a sender was unsubscribed, so triage can repeat the request if they keep mailing. Failures are logged only. */
+  onUnsubscribed?: (account: PhoneInboxAccountId, senderAddress: string) => Promise<void>;
   /** Sends the one-click request. Replaceable in tests. */
   oneClick?: (url: URL) => Promise<OneClickResult>;
 }
@@ -33,7 +37,7 @@ export interface PhoneUnsubscribeRouteOptions {
 const MAX_ID_LENGTH = 256;
 
 export async function phoneUnsubscribeRoutes(app: FastifyInstance, options: PhoneUnsubscribeRouteOptions): Promise<void> {
-  const { logger, getToken, getReader, oneClick = (url) => postOneClick(url) } = options;
+  const { logger, getToken, getReader, onUnsubscribed, oneClick = (url) => postOneClick(url) } = options;
 
   app.post('/phone/unsubscribe', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
     if (!(await authorisePhoneRequest(request, reply, getToken, logger, 'phone-unsubscribe'))) return reply;
@@ -61,6 +65,14 @@ export async function phoneUnsubscribeRoutes(app: FastifyInstance, options: Phon
         if (target) {
           const outcome = await oneClick(target);
           logger.info({ account, host: target.hostname, ok: outcome.ok, status: outcome.status }, 'phone-unsubscribe: one-click request');
+          if (outcome.ok && onUnsubscribed && headers.fromAddress) {
+            try {
+              await onUnsubscribed(account, headers.fromAddress);
+            } catch (err) {
+              // The unsubscribe itself worked; only the follow-up memory is lost.
+              logger.warn({ err, account }, 'phone-unsubscribe: could not remember the unsubscribe');
+            }
+          }
           return send(outcome.ok ? { result: 'unsubscribed' } : { result: 'failed', url: link });
         }
         logger.warn({ account }, 'phone-unsubscribe: one-click link refused (not an https link on a public host)');

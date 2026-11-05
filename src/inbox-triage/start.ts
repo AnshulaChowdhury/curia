@@ -19,6 +19,7 @@ import { NtfyNotifier } from './ntfy-notifier.js';
 import { NylasTriageSource } from './nylas-triage-source.js';
 import { startOfLocalDay } from '../phone-brief/local-time.js';
 import type { PgTriageStore } from './item-store.js';
+import type { UnsubscribeEnforcer } from './unsubscribe-enforcer.js';
 import { InboxWatcher, type TriageNotifier } from './watcher.js';
 
 const POLL_INTERVAL_MS = 30_000;
@@ -37,6 +38,8 @@ export interface InboxTriageDeps {
   contacts?: ContactLookup;
   /** What the owner has said about senders before; given to the classifier as a hint. Optional. */
   preferences?: AgentClassifierConfig['preferences'];
+  /** Repeats the unsubscribe request, then trashes, mail from senders the owner unsubscribed from. Optional. */
+  unsubscribeEnforcer?: UnsubscribeEnforcer;
   /** IANA timezone that decides where TRIAGE_FROM_DATE starts. */
   timezone: string;
   fetchImpl?: typeof fetch;
@@ -57,7 +60,7 @@ export const TRIAGE_SECRET_KEYS = {
 
 /** Returns the running watcher, or null when triage is off or not fully configured. */
 export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningInboxTriage | null> {
-  const { bus, logger, secrets, items, timezone, contacts, preferences, fetchImpl = fetch } = deps;
+  const { bus, logger, secrets, items, timezone, contacts, preferences, unsubscribeEnforcer, fetchImpl = fetch } = deps;
   const read = async (key: string): Promise<string | null> => (await secrets.get(key))?.trim() || null;
 
   if ((await read('inbox_triage_enabled'))?.toLowerCase() !== 'true') {
@@ -103,6 +106,7 @@ export async function startInboxTriage(deps: InboxTriageDeps): Promise<RunningIn
     notifier,
     seen: items,
     outcomes: items,
+    ...(unsubscribeEnforcer ? { beforeClassify: (c, s) => unsubscribeEnforcer.check(c, s) } : {}),
     logger,
     intervalMs: POLL_INTERVAL_MS,
   });

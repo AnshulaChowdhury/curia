@@ -71,6 +71,9 @@ import { InboxTriageController } from './inbox-triage/controller.js';
 import { PgTriageStore } from './inbox-triage/item-store.js';
 import { contactLookupFor } from './inbox-triage/contact-lookup.js';
 import { PgPreferenceStore } from './inbox-triage/preference-store.js';
+import { PgUnsubscribeStore } from './inbox-triage/unsubscribe-store.js';
+import { UnsubscribeEnforcer } from './inbox-triage/unsubscribe-enforcer.js';
+import { loadUnsubscribeReader } from './phone-inbox/nylas-unsubscribe.js';
 import { UnsortedBriefSource } from './phone-brief/unsorted-source.js';
 import { PgBriefStore } from './phone-brief/brief-store.js';
 import { PhoneBriefService } from './phone-brief/brief-service.js';
@@ -3219,6 +3222,7 @@ async function main(): Promise<void> {
   // Started after the scheduler so the email-classifier agent's tasks have a runtime to run in.
   const triageItems = new PgTriageStore(pool);
   const triagePreferences = new PgPreferenceStore(pool);
+  const triageUnsubscribes = new PgUnsubscribeStore(pool);
   const inboxTriage = new InboxTriageController({
     bus,
     logger,
@@ -3226,6 +3230,12 @@ async function main(): Promise<void> {
     items: triageItems,
     timezone: config.timezone,
     preferences: triagePreferences,
+    unsubscribeEnforcer: new UnsubscribeEnforcer({
+      logger,
+      store: triageUnsubscribes,
+      preferences: triagePreferences,
+      readHeaders: async (accountId, messageId) => (await loadUnsubscribeReader(secretsService, accountId))?.read(messageId) ?? null,
+    }),
     ...(contactService ? { contacts: contactLookupFor(contactService, logger) } : {}),
   });
   try {
@@ -3514,6 +3524,7 @@ async function main(): Promise<void> {
     inboxTriage,
     triageItems,
     triagePreferences,
+    triageUnsubscribes,
     phoneBrief,
     booksMonitor,
     booksRunner,

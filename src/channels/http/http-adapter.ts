@@ -182,6 +182,8 @@ export interface HttpAdapterConfig {
   triageItems?: import('../../inbox-triage/item-store.js').PgTriageStore;
   /** What the owner told triage to remember about senders (saved from the phone's review cards). */
   triagePreferences?: import('../../inbox-triage/preference-store.js').PgPreferenceStore;
+  /** Remembers senders the owner unsubscribed from, so triage can repeat the request if they keep mailing. */
+  triageUnsubscribes?: import('../../inbox-triage/unsubscribe-store.js').PgUnsubscribeStore;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
@@ -770,6 +772,9 @@ export class HttpAdapter implements Channel {
         logger,
         getToken: () => secrets.get('phone_inbox_token'),
         getReader: (account) => loadUnsubscribeReader(secrets, account),
+        ...(this.config.triageUnsubscribes
+          ? { onUnsubscribed: (account, sender) => this.config.triageUnsubscribes!.record(account, sender) }
+          : {}),
       });
       // Mail triage could not sort, as cards the owner can categorise from the phone.
       if (this.config.triageItems) {

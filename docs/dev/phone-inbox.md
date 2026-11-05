@@ -93,6 +93,18 @@ mail. Stored in `inbox_triage_preferences` (address or domain, group, dates; no 
 - `failed` (+ `url`): the one-click request was refused or timed out (or the link was not a public https address); open `url` instead.
 - `none`: no unsubscribe information in this email.
 
+### When a newsletter keeps coming back
+A sender that accepted the one-click request (`unsubscribed`) is remembered (`inbox_unsubscribes`, migration 122: mailbox, sender
+address, dates, retry count; no mail text). Triage checks each new email against it, before the classifier runs:
+1. For **10 days** after the unsubscribe nothing special happens (senders have that long to comply under CASL).
+2. After that, each new email from the sender makes Curia **repeat the one-click request** (read from the new email's own header),
+   at most **3 retries**, at least **3 days apart**. The mail itself is classified as usual.
+3. When the sender still mails after the third retry (and 3 more days), that email is labelled **Likely spam**, marked read and
+   **moved to Trash**, and the sender is saved as spam (a classifier hint). Every later email from it goes straight to Trash.
+Only senders unsubscribed through Curia are affected, and only by one-click: a link or mailto the owner followed themselves is
+not tracked. Trash is the one delete-like action Curia takes on mail (`NylasTriageSource.moveToTrash`): it never deletes for good,
+never creates a folder, and Gmail keeps trashed mail 30 days. Each retry and each trash is logged (mailbox and host/domain only).
+
 Errors: `400` bad input, `404` message gone, `429` mailbox busy, `502` mailbox error, `503` mailbox not connected. Rate limit 10/min.
 The link comes from the sender, so Curia only POSTs to an https link on a named public host (port 443, no login in the URL, no redirects),
 checking every resolved address at connect time. The full link is never logged, only the host name.

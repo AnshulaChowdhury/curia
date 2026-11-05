@@ -7,17 +7,17 @@ const reader = (impl: (u: string, i: RequestInit) => Promise<Response>) => new N
 
 describe('NylasUnsubscribeReader', () => {
   it('asks for the headers of one message and finds the unsubscribe ones, ignoring case', async () => {
-    const fetchImpl = vi.fn(async (_u: string, _i: RequestInit) => json({ headers: [
+    const fetchImpl = vi.fn(async (_u: string, _i: RequestInit) => json({ from: [{ email: 'News@X.com' }], headers: [
       { name: 'Subject', value: 'x' }, { name: 'List-Unsubscribe', value: '<https://x.com/u>' }, { name: 'list-unsubscribe-post', value: 'List-Unsubscribe=One-Click' },
     ] }));
-    expect(await reader(fetchImpl).read('m 1')).toEqual({ listUnsubscribe: '<https://x.com/u>', listUnsubscribePost: 'List-Unsubscribe=One-Click' });
+    expect(await reader(fetchImpl).read('m 1')).toEqual({ listUnsubscribe: '<https://x.com/u>', listUnsubscribePost: 'List-Unsubscribe=One-Click', fromAddress: 'news@x.com' });
     const [url, init] = fetchImpl.mock.calls[0]!;
     expect(url).toBe('https://api.us.nylas.com/v3/grants/g%2F1/messages/m%201?fields=include_headers');
     expect(init.method).toBeUndefined(); // a GET
   });
 
   it('gives nulls when the headers are absent, and null for a missing message', async () => {
-    expect(await reader(async () => json({})).read('m')).toEqual({ listUnsubscribe: null, listUnsubscribePost: null });
+    expect(await reader(async () => json({})).read('m')).toEqual({ listUnsubscribe: null, listUnsubscribePost: null, fromAddress: null });
     expect(await reader(async () => new Response('{}', { status: 404 })).read('m')).toBeNull();
   });
 

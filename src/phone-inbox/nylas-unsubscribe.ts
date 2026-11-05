@@ -8,9 +8,12 @@ import { MailboxRateLimitedError } from './phone-inbox-service.js';
 export interface UnsubscribeHeaders {
   listUnsubscribe: string | null;
   listUnsubscribePost: string | null;
+  /** The sender's address as Nylas parsed it, lower-case, or null. */
+  fromAddress: string | null;
 }
 
 interface NylasHeaderMessage {
+  from?: Array<{ email?: string }>;
   headers?: Array<{ name?: string; value?: string }>;
 }
 
@@ -40,7 +43,11 @@ export class NylasUnsubscribeReader {
     const json = (await res.json()) as { data?: NylasHeaderMessage };
     const headers = json.data?.headers ?? [];
     const find = (name: string) => headers.find((h) => h.name?.toLowerCase() === name)?.value ?? null;
-    return { listUnsubscribe: find('list-unsubscribe'), listUnsubscribePost: find('list-unsubscribe-post') };
+    return {
+      listUnsubscribe: find('list-unsubscribe'),
+      listUnsubscribePost: find('list-unsubscribe-post'),
+      fromAddress: json.data?.from?.[0]?.email?.trim().toLowerCase() || null,
+    };
   }
 }
 
