@@ -26,3 +26,9 @@ class Curia:
         if error_kind:
             body["errorKind"] = error_kind
         self._call("POST", "/contacts/export/finish", body)
+
+    def post_log(self, run_id, lines):
+        body = {"lines": lines}
+        if run_id:
+            body["runId"] = run_id
+        self._call("POST", "/contacts/export/log", body)

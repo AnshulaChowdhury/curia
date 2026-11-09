@@ -33,7 +33,16 @@ export interface RoomFacts {
   members: MemberFact[];
 }
 
+export type LogLevel = 'info' | 'warn' | 'error';
+export interface LogLine { level: LogLevel; message: string }
+export interface LogEntry extends LogLine { at: string; runId: string | null }
+export const LOG_KEEP = 500;
+
 export interface ExportStore {
+  /** Appends the job's status lines (trimmed to the newest 500). */
+  appendLog(runId: string | null, lines: LogLine[]): Promise<void>;
+  /** The newest lines, oldest first. */
+  recentLog(limit: number): Promise<LogEntry[]>;
   /** Makes a run request unless one is already open; returns the open one. */
   request(since: Date): Promise<{ run: ExportRun; created: boolean }>;
   /** The run the job should work on (requested or running), marked running, with the rooms already done. */
@@ -52,6 +61,7 @@ export class InMemoryExportStore implements ExportStore {
   runs: ExportRun[] = [];
   done = new Map<string, Set<string>>();
   facts = new Map<string, MemberFact & { network: string; runId: string }>();
+  log: LogEntry[] = [];
   constructor(private readonly now: () => number = Date.now) {}
 
   private open(): ExportRun | undefined {
@@ -73,6 +83,12 @@ export class InMemoryExportStore implements ExportStore {
   }
   async getRun(runId: string) { return this.runs.find((r) => r.runId === runId) ?? null; }
   async latest() { return this.runs[this.runs.length - 1] ?? null; }
+  async appendLog(runId: string | null, lines: LogLine[]) {
+    const at = new Date(this.now()).toISOString();
+    this.log.push(...lines.map((l) => ({ ...l, at, runId })));
+    if (this.log.length > LOG_KEEP) this.log.splice(0, this.log.length - LOG_KEEP);
+  }
+  async recentLog(limit: number) { return this.log.slice(-limit); }
   async saveRooms(runId: string, rooms: RoomFacts[]) {
     const run = this.runs.find((r) => r.runId === runId);
     if (!run || (run.status !== 'running' && run.status !== 'requested')) return false;
@@ -167,6 +183,19 @@ export class PgExportStore implements ExportStore {
       `UPDATE contact_export_runs SET status = $2, error_kind = $3, finished_at = now(), updated_at = now()
        WHERE run_id = $1 AND status IN ('requested','running')`, [runId, status, errorKind ?? null]);
     return (r.rowCount ?? 0) > 0;
+  }
+
+  async appendLog(runId: string | null, lines: LogLine[]) {
+    for (const l of lines) {
+      await this.pool.query('INSERT INTO contact_export_log (run_id, level, message) VALUES ($1,$2,$3)', [runId, l.level, l.message]);
+    }
+    await this.pool.query('DELETE FROM contact_export_log WHERE id <= (SELECT max(id) FROM contact_export_log) - $1', [LOG_KEEP]);
+  }
+
+  async recentLog(limit: number) {
+    const r = await this.pool.query<{ at: Date; run_id: string | null; level: LogLevel; message: string }>(
+      'SELECT at, run_id, level, message FROM contact_export_log ORDER BY id DESC LIMIT $1', [limit]);
+    return r.rows.reverse().map((x) => ({ at: x.at.toISOString(), runId: x.run_id, level: x.level, message: x.message }));
   }
 
   async countFacts() {

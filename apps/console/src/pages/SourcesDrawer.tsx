@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api.js';
 import {
-  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, categoryLabel, exportAction, exportInProgress, exportStatusText, farmAction, farmName, farmStatusText, orgLine, reviewReasonText, sourcesSummary,
+  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, categoryLabel, exportAction, exportInProgress, exportLogText, exportStatusText, farmAction, farmName, farmStatusText, orgLine, reviewReasonText, sourcesSummary,
   type ApplyResult, type ExportStatus, type FarmMailbox, type ImportSourceRow, type OrganizationRow, type PreviewResult,
 } from './sources-utils.js';
 
@@ -237,6 +237,14 @@ export default function SourcesDrawer({ onClose }: Props) {
                 )}
               </div>
             </div>
+            {exp.log && exp.log.length > 0 && (
+              <details style={{ marginTop: 8, fontSize: 12 }}>
+                <summary style={{ cursor: 'pointer' }}>Job log ({exp.log.length} lines)</summary>
+                <pre style={{ margin: '6px 0 0', maxHeight: 240, overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 }}>
+                  {exp.log.map(exportLogText).join('\n')}
+                </pre>
+              </details>
+            )}
             {expError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: '8px 0 0' }}>{expError}</p>}
           </div>
         )}

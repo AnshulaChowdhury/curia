@@ -2,7 +2,7 @@
 // text or ids cannot ride along by accident. Counts, a display name, a phone, two dates per partner. Nothing else.
 
 import { BRIDGES } from './bridges.js';
-import type { RoomFacts, MemberFact } from './export-store.js';
+import type { RoomFacts, MemberFact, LogLine } from './export-store.js';
 
 export const MAX_ROOMS_PER_POST = 50;
 export const MAX_MEMBERS_PER_ROOM = 500;
@@ -48,4 +48,22 @@ export function parseRooms(body: unknown): { ok: true; rooms: RoomFacts[] } | { 
     out.push({ roomHash: r['roomHash'], network: r['network'], members });
   }
   return { ok: true, rooms: out };
+}
+
+export const MAX_LOG_LINES_PER_POST = 50;
+export const MAX_LOG_MESSAGE = 400;
+
+/** The job's status lines. Free text by design (names, phones and room ids are allowed); length-capped, nothing else accepted. */
+export function parseLog(body: unknown): { ok: true; lines: LogLine[] } | { ok: false; error: string } {
+  if (!isObj(body) || Object.keys(body).some((k) => k !== 'runId' && k !== 'lines') || !Array.isArray(body['lines'])) return { ok: false, error: 'lines must be a list' };
+  const lines = body['lines'] as unknown[];
+  if (lines.length === 0 || lines.length > MAX_LOG_LINES_PER_POST) return { ok: false, error: `send 1 to ${MAX_LOG_LINES_PER_POST} lines per request` };
+  const out: LogLine[] = [];
+  for (const l of lines) {
+    if (!isObj(l) || Object.keys(l).some((k) => k !== 'level' && k !== 'message')) return { ok: false, error: 'a line has a field that is not allowed' };
+    if (l['level'] !== 'info' && l['level'] !== 'warn' && l['level'] !== 'error') return { ok: false, error: 'level must be info, warn or error' };
+    if (typeof l['message'] !== 'string' || l['message'].length === 0 || l['message'].length > MAX_LOG_MESSAGE) return { ok: false, error: `message must be 1 to ${MAX_LOG_MESSAGE} characters` };
+    out.push({ level: l['level'], message: l['message'] });
+  }
+  return { ok: true, lines: out };
 }

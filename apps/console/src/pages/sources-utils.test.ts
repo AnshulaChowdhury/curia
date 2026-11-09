@@ -89,7 +89,7 @@ describe('mailbox scan text and actions', () => {
   });
 });
 
-import { exportAction, exportInProgress, exportStatusText, type ExportStatus } from './sources-utils.js';
+import { exportAction, exportInProgress, exportLogText, exportStatusText, type ExportStatus } from './sources-utils.js';
 
 const exp = (over: Partial<ExportStatus>, run?: Partial<NonNullable<ExportStatus['run']>> | null): ExportStatus => ({
   tokenSet: true, partnerRows: 0,
@@ -119,5 +119,10 @@ describe('Matrix export text and actions', () => {
   it('reports a failure and offers to request again', () => {
     expect(exportStatusText(exp({ partnerRows: 3 }, { status: 'failed', errorKind: 'http_500' }))).toContain('http_500');
     expect(exportAction(exp({}, { status: 'failed' }))).toBe('Request again');
+  });
+  it('formats a log line with a marker only for warnings and errors', () => {
+    expect(exportLogText({ at: 'not a date', level: 'info', message: 'run started' })).toBe('run started');
+    expect(exportLogText({ at: 'not a date', level: 'error', message: 'HTTP 500 from matrix' })).toBe('ERROR: HTTP 500 from matrix');
+    expect(exportLogText({ at: '2026-11-08T22:00:05Z', level: 'warn', message: 'slow' })).toMatch(/\d\d:\d\d:\d\d WARN: slow$/);
   });
 });

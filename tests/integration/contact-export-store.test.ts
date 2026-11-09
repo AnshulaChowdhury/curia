@@ -13,7 +13,7 @@ describeIf('contact export store', () => {
   let pool: pg.Pool;
   let store: PgExportStore;
   beforeAll(async () => { pool = new Pool({ connectionString: DATABASE_URL }); await requireCuriaTestDatabase(pool); store = new PgExportStore(pool); });
-  const clean = async () => { await pool.query('DELETE FROM contact_message_facts'); await pool.query('DELETE FROM contact_export_runs'); };
+  const clean = async () => { await pool.query('DELETE FROM contact_message_facts'); await pool.query('DELETE FROM contact_export_runs'); await pool.query('DELETE FROM contact_export_log'); };
   beforeEach(clean);
   afterAll(async () => { await clean(); await pool.end(); });
 
@@ -41,5 +41,14 @@ describeIf('contact export store', () => {
     expect(await store.saveRooms(run.runId, [room('cccccccccccccccc', 1)])).toBe(false);
     expect(await store.finish(run.runId, 'done')).toBe(false);
     expect((await store.request(new Date(0))).created).toBe(true);
+  });
+
+  it('keeps the newest 500 log lines, oldest first when read', async () => {
+    await store.appendLog('exp-1-aaaaaaaa', Array.from({ length: 505 }, (_, i) => ({ level: 'info' as const, message: `l${i}` })));
+    const all = await store.recentLog(1000);
+    expect(all).toHaveLength(500);
+    expect(all[0]!.message).toBe('l5');
+    expect(all[499]!.message).toBe('l504');
+    expect((await store.recentLog(2)).map((l) => l.message)).toEqual(['l503', 'l504']);
   });
 });
