@@ -13,6 +13,8 @@ import type { FarmRun, FarmStore } from './farm-store.js';
 export const FARM_YEARS = 10;
 const MAX_RATE_LIMIT_WAITS = 20;
 const MAX_WAIT_SECONDS = 120;
+// A short pause between pages keeps a ten-year scan under the provider's per-minute quota instead of hitting it and waiting.
+const PAGE_PAUSE_MS = 1000;
 
 export interface FarmTarget {
   accountId: string;
@@ -72,6 +74,7 @@ export class MailboxFarmService {
         await this.store.commitPage(accountId, page.nextCursor ?? null, page.messages.length, deltas);
         if (!page.nextCursor) break;
         cursor = page.nextCursor;
+        await this.sleep(PAGE_PAUSE_MS);
       }
       await this.store.finish(accountId, 'done');
       this.logger.info({ accountId }, 'contacts-farm: scan finished');
