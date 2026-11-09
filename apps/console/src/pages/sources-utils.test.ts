@@ -88,3 +88,36 @@ describe('mailbox scan text and actions', () => {
     expect(anyFarmRunning([farm({})])).toBe(false);
   });
 });
+
+import { exportAction, exportInProgress, exportStatusText, type ExportStatus } from './sources-utils.js';
+
+const exp = (over: Partial<ExportStatus>, run?: Partial<NonNullable<ExportStatus['run']>> | null): ExportStatus => ({
+  tokenSet: true, partnerRows: 0,
+  run: run === null ? null : { status: 'requested', roomsDone: 0, errorKind: null, requestedAt: '', finishedAt: null, ...run },
+  ...over,
+});
+
+describe('Matrix export text and actions', () => {
+  it('asks for the token first, then offers a first request', () => {
+    expect(exportStatusText(exp({ tokenSet: false }, null))).toContain('import token');
+    expect(exportAction(exp({ tokenSet: false }, null))).toBeNull();
+    expect(exportAction(exp({}, null))).toBe('Request Matrix export');
+  });
+  it('shows waiting and running with counts and offers no button while busy', () => {
+    expect(exportStatusText(exp({}, { status: 'requested' }))).toContain('Waiting for the Mac mini');
+    expect(exportStatusText(exp({ partnerRows: 1200 }, { status: 'running', roomsDone: 340 }))).toBe('Running… 340 chats counted, 1,200 people so far.');
+    expect(exportAction(exp({}, { status: 'running' }))).toBeNull();
+    expect(exportInProgress(exp({}, { status: 'requested' }))).toBe(true);
+    expect(exportInProgress(exp({}, { status: 'done' }))).toBe(false);
+    expect(exportInProgress(null)).toBe(false);
+  });
+  it('says plainly when a finished run found nobody, so a wrong bridge name is not silent', () => {
+    expect(exportStatusText(exp({ partnerRows: 0 }, { status: 'done', roomsDone: 80 }))).toContain('no chat partners were found');
+    expect(exportStatusText(exp({ partnerRows: 55 }, { status: 'done', roomsDone: 80 }))).toBe('Done. 80 chats counted, 55 people found.');
+    expect(exportAction(exp({}, { status: 'done' }))).toBe('Run again');
+  });
+  it('reports a failure and offers to request again', () => {
+    expect(exportStatusText(exp({ partnerRows: 3 }, { status: 'failed', errorKind: 'http_500' }))).toContain('http_500');
+    expect(exportAction(exp({}, { status: 'failed' }))).toBe('Request again');
+  });
+});

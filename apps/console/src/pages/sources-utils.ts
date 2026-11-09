@@ -162,3 +162,42 @@ export function farmAction(m: FarmMailbox): { label: string; resume: boolean } |
 }
 
 export const anyFarmRunning = (ms: FarmMailbox[]): boolean => ms.some((m) => m.running);
+
+// ---- Matrix message-activity export (GET/POST /api/contacts/export/*) ----
+
+export interface ExportStatus {
+  tokenSet: boolean;
+  run: { status: 'requested' | 'running' | 'done' | 'failed'; roomsDone: number; errorKind: string | null; requestedAt: string; finishedAt: string | null } | null;
+  partnerRows: number;
+}
+
+const num = (n: number): string => n.toLocaleString('en-US');
+
+/** One plain line: where the Matrix export is. Counts only. */
+export function exportStatusText(s: ExportStatus): string {
+  if (!s.tokenSet) return 'Make the import token first (Settings → API connections).';
+  const r = s.run;
+  if (!r) return 'Not requested yet. The Mac mini job picks the request up within about five minutes and sends only counts.';
+  switch (r.status) {
+    case 'requested': return 'Requested. Waiting for the Mac mini job to pick it up (it checks every five minutes).';
+    case 'running': return `Running… ${num(r.roomsDone)} chats counted, ${num(s.partnerRows)} people so far.`;
+    case 'done':
+      return s.partnerRows === 0
+        ? `Finished (${num(r.roomsDone)} chats looked at) but no chat partners were found. The bridge accounts may be named differently than expected; check the job's log on the Mac mini.`
+        : `Done. ${num(r.roomsDone)} chats counted, ${num(s.partnerRows)} people found.`;
+    case 'failed': return `Stopped by an error (${r.errorKind ?? 'unknown'}). ${num(s.partnerRows)} people so far. Request again to continue.`;
+    default: return 'Unknown state.';
+  }
+}
+
+/** The button the export offers, or null when none applies. */
+export function exportAction(s: ExportStatus): string | null {
+  if (!s.tokenSet) return null;
+  const r = s.run;
+  if (!r) return 'Request Matrix export';
+  if (r.status === 'done') return 'Run again';
+  if (r.status === 'failed') return 'Request again';
+  return null;
+}
+
+export const exportInProgress = (s: ExportStatus | null): boolean => s?.run?.status === 'requested' || s?.run?.status === 'running';
