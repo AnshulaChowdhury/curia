@@ -80,6 +80,28 @@ describe('contacts export routes', () => {
     expect((await app.inject({ method: 'POST', url: '/contacts/export/rooms', headers: auth, payload: { runId, rooms: [room()] } })).statusCode).toBe(409);
     expect((await app.inject({ method: 'POST', url: '/contacts/export/finish', headers: auth, payload: { runId, status: 'weird' } })).statusCode).toBe(400);
   });
+
+  it('stores the job lines and shows them to the console, newest last; bad lines are refused', async () => {
+    const { auth, store } = await build(true);
+    expect((await app.inject({ method: 'POST', url: '/contacts/export/log', payload: { lines: [{ level: 'info', message: 'x' }] } })).statusCode).toBe(401);
+    const ok = await app.inject({ method: 'POST', url: '/contacts/export/log', headers: auth, payload: { runId: 'exp-1-aaaaaaaa', lines: [{ level: 'info', message: 'counted !a:x [whatsapp]: Dana +14155550142 (they 3, you 2)' }, { level: 'warn', message: 'second' }] } });
+    expect(ok.statusCode).toBe(204);
+    expect((await store.recentLog(10)).map((l) => l.message)).toHaveLength(2);
+    const status = await app.inject({ method: 'GET', url: '/api/contacts/export/status', headers: COOKIE });
+    expect(status.json().log.map((l: { message: string }) => l.message)[1]).toBe('second');
+    for (const payload of [{}, { lines: [] }, { lines: [{ level: 'debug', message: 'x' }] }, { lines: [{ level: 'info', message: 'x'.repeat(401) }] }, { lines: [{ level: 'info', message: 'x', extra: 1 }] }]) {
+      expect((await app.inject({ method: 'POST', url: '/contacts/export/log', headers: auth, payload })).statusCode).toBe(400);
+    }
+  });
+});
+
+describe('export log', () => {
+  it('keeps only the newest 500 lines', async () => {
+    const store = new InMemoryExportStore();
+    await store.appendLog(null, Array.from({ length: 520 }, (_, i) => ({ level: 'info' as const, message: `l${i}` })));
+    expect(store.log).toHaveLength(500);
+    expect(store.log[0]!.message).toBe('l20');
+  });
 });
 
 describe('parseRooms', () => {

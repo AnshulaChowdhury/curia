@@ -169,6 +169,17 @@ export interface ExportStatus {
   tokenSet: boolean;
   run: { status: 'requested' | 'running' | 'done' | 'failed'; roomsDone: number; errorKind: string | null; requestedAt: string; finishedAt: string | null } | null;
   partnerRows: number;
+  log?: ExportLogLine[];
+}
+
+export interface ExportLogLine { at: string; level: 'info' | 'warn' | 'error'; message: string }
+
+/** One log line as shown in the drawer: local time, level marker for problems, then the text. */
+export function exportLogText(l: ExportLogLine): string {
+  const d = new Date(l.at);
+  const time = Number.isNaN(d.getTime()) ? '' : `${d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} `;
+  const mark = l.level === 'info' ? '' : `${l.level.toUpperCase()}: `;
+  return `${time}${mark}${l.message}`;
 }
 
 const num = (n: number): string => n.toLocaleString('en-US');

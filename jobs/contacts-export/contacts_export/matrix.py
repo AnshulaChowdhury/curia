@@ -34,6 +34,11 @@ class Matrix:
                 names[ghost] = (info or {}).get("display_name") or ""
         return names, len(joined)
 
+    def peek(self, room_id):
+        """[(user_id, display_name)] of the joined members, for the log when a room is skipped. No messages are read."""
+        joined = self._get("/rooms/%s/joined_members" % urllib.parse.quote(room_id, safe=""), "matrix members").get("joined", {})
+        return [(u, (i or {}).get("display_name") or "") for u, i in joined.items()]
+
     def count_room(self, room_id, my_user_id, since_ms):
         """Walks the room backwards, counting senders; stops at the window start. Returns (RoomCounter, names) or None to skip."""
         names, size = self.member_names(room_id)

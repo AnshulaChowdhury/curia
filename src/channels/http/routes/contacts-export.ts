@@ -4,6 +4,7 @@
 //     GET  /contacts/export/ping           the job's own check: proves the token works
 //     GET  /contacts/export/run-request    the open run (200 { runId, since, doneRooms }) or 204 when nothing is asked
 //     POST /contacts/export/rooms          { runId, rooms: [...] } counts per room; idempotent, marks rooms done
+//     POST /contacts/export/log            { runId?, lines: [{ level, message }] }  the job's status lines (no message text)
 //     POST /contacts/export/finish         { runId, status: 'done' | 'failed', errorKind? }
 //   Session (the console):
 //     POST /api/contacts/export/request    ask for a run (ten years back)
@@ -15,7 +16,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import type { ContactsImportToken } from '../../../contacts-import/import-token.js';
 import type { ExportStore } from '../../../contacts-import/export-store.js';
-import { parseRooms } from '../../../contacts-import/export-validate.js';
+import { parseLog, parseRooms } from '../../../contacts-import/export-validate.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 
 export const EXPORT_YEARS = 10;
@@ -69,6 +70,15 @@ export async function contactsExportRoutes(app: FastifyInstance, options: Contac
     return reply.send({ saved: parsed.rooms.length });
   });
 
+  app.post('/contacts/export/log', RATE, async (request, reply) => {
+    if (!(await tokenOk(request, reply))) return reply;
+    const parsed = parseLog(request.body);
+    if (!parsed.ok) return reply.status(400).send({ error: parsed.error });
+    const runId = (request.body as { runId?: unknown }).runId;
+    await store.appendLog(typeof runId === 'string' && RUN_ID_RX.test(runId) ? runId : null, parsed.lines);
+    return reply.status(204).send();
+  });
+
   app.post<{ Body: { runId?: unknown; status?: unknown; errorKind?: unknown } }>('/contacts/export/finish', RATE, async (request, reply) => {
     if (!(await tokenOk(request, reply))) return reply;
     const { runId, status, errorKind } = request.body ?? {};
@@ -94,6 +104,7 @@ export async function contactsExportRoutes(app: FastifyInstance, options: Contac
       tokenSet: await importToken.isSet(),
       run: run ? { status: run.status, roomsDone: run.roomsDone, errorKind: run.errorKind, requestedAt: run.requestedAt, finishedAt: run.finishedAt } : null,
       partnerRows: await store.countFacts(),
+      log: await store.recentLog(100),
     });
   });
 }

@@ -18,6 +18,7 @@ Standard library only, so it runs on Apple's `/usr/bin/python3` (3.9) with no `p
 - `GET /contacts/export/ping` → `{ok:true}` (the installer's check)
 - `GET /contacts/export/run-request` → `200 {runId, since, doneRooms:[hash]}` or `204` when nothing is asked
 - `POST /contacts/export/rooms` `{runId, rooms:[{roomHash, network, members:[{ghostId, displayName?, phone?, fromThem, fromMe, firstSeen?, lastSeen?}]}]}` — absolute counts per room, so re-sending replaces; at most 50 rooms per call; unknown fields are refused
+- `POST /contacts/export/log` `{runId?, lines:[{level:'info'|'warn'|'error', message}]}` — status lines for the console's job log (at most 50 lines of 400 characters; Curia keeps the newest 500). They may name chat partners, phones and room ids; they never contain message text.
 - `POST /contacts/export/finish` `{runId, status:'done'|'failed', errorKind?}`
 
 A run is requested from the console (`POST /api/contacts/export/request`, ten years back). The job polls; if the mini was off it

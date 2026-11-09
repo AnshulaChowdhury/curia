@@ -21,6 +21,9 @@ class FakeCuria:
     def finish(self, run_id, status, kind=None):
         self.finished = (run_id, status, kind)
 
+    def post_log(self, run_id, lines):
+        self.logged = getattr(self, "logged", []) + lines
+
 
 class FakeMatrix:
     def __init__(self, rooms, fail_on=None):
@@ -31,6 +34,9 @@ class FakeMatrix:
 
     def joined_rooms(self):
         return list(self.rooms)
+
+    def peek(self, room_id):
+        return [(ev[0], "") for ev in self.rooms[room_id]][:3]
 
     def count_room(self, room_id, me, since_ms):
         self.counted.append(room_id)
@@ -64,6 +70,24 @@ class RunTests(unittest.TestCase):
         curia = FakeCuria({"runId": "exp-1-aaaaaaaa", "since": "2016-01-01T00:00:00Z", "doneRooms": []})
         self.assertEqual(run_once(curia, FakeMatrix(rooms, fail_on="!boom:x"), log=lambda *_: None), "failed")
         self.assertEqual(curia.finished, ("exp-1-aaaaaaaa", "failed", "http_500"))
+
+    def test_the_log_names_partners_and_lists_skipped_chats_but_never_message_text(self):
+        rooms = {"!a:x": [("@whatsapp_14155550142:x", 1000), (ME, 2000)], "!b:x": [("@dana:x", 1)]}
+        curia = FakeCuria({"runId": "exp-1-aaaaaaaa", "since": "2016-01-01T00:00:00Z", "doneRooms": []})
+        run_once(curia, FakeMatrix(rooms), log=lambda *_: None)
+        text = "\n".join(l["message"] for l in curia.logged)
+        self.assertIn("counted !a:x [whatsapp]", text)
+        self.assertIn("+14155550142", text)  # phone shown in the log, as the owner asked
+        self.assertIn("skipped !b:x: @dana:x", text)  # shows how the unmatched account is named
+        self.assertIn("run finished", text)
+
+    def test_an_unexpected_error_still_closes_the_run(self):
+        class Boom(FakeMatrix):
+            def whoami(self):
+                raise ValueError("bad json")
+        curia = FakeCuria({"runId": "exp-1-aaaaaaaa", "since": None, "doneRooms": []})
+        self.assertEqual(run_once(curia, Boom({}), log=lambda *_: None), "failed")
+        self.assertEqual(curia.finished, ("exp-1-aaaaaaaa", "failed", "ValueError"))
 
     def test_config_requires_every_setting_and_http_urls(self):
         with self.assertRaises(ConfigError):
