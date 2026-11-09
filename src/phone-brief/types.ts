@@ -13,6 +13,10 @@ export interface BriefItem {
   text?: string;
   from?: string;
   subject?: string;
+  /** Mailbox id, as on /phone/inbox. Set together with messageId, only when the item is one email the phone can act on. */
+  account?: string;
+  /** The email's id in that mailbox: the `messageId` POST /phone/unsubscribe takes. */
+  messageId?: string;
 }
 
 export interface BriefSection {

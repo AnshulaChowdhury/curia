@@ -31,7 +31,7 @@ an email. `/phone/inbox` itself still never returns bodies.
   502 when Nylas fails, 503 (with `Retry-After` when Nylas gave one) when it rate-limits.
 
 ## The morning brief (`GET /phone/brief`)
-`{ date, generatedAt, signalNumber, sections: [{ id, items: [{ text?, from?, subject? }] }] }`, for the Command Hub Home row.
+`{ date, generatedAt, signalNumber, sections: [{ id, items: [{ text?, from?, subject?, account?, messageId? }] }] }`, for the Command Hub Home row.
 Sections are `accounting`, `contacts`, `newsletters`, `unsorted`, always in that order, only those with items, at most 10 items each, text
 at most 280 characters, plain text. `204` when there is nothing to report; `404` with no token. It never serves a previous
 day's brief.
@@ -41,7 +41,9 @@ day's brief.
 - **`signalNumber`** is the number the Signal channel runs on (`SIGNAL_PHONE_NUMBER`), only if it is E.164, else `null`.
 - **Newsletters:** yesterday's mail (local day) that triage labelled `Newsletter`, newest first. Each item has sender, subject and a
   one-to-two sentence summary written by the fast model from the email's text (the only place email text leaves Curia for the
-  brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only.
+  brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only. Each newsletter item also
+  carries `account` (same ids as `/phone/inbox`) and `messageId` (the one `POST /phone/unsubscribe` takes) so the phone can offer
+  Unsubscribe; both or neither, and a brief built before this change has neither.
 - **Unsorted:** mail triage could not sort (the classifier said `none`, the call failed, or the label could not be written), one
   item per email with sender, subject and why. Not limited to yesterday: it lists everything still waiting, until the owner sorts it.
 - **Other sections** are supplied by their owners: `PhoneBriefService.registerSource({ id, items(ctx) })` with `ctx.yesterday`
@@ -70,9 +72,55 @@ in `inbox_triage_items` (sender, subject, a 300-character preview; cleared once 
   marked read) and removes the card; `group: "dismiss"` removes it and leaves the mail alone. `{ ok, id, remaining }` on success;
   400 bad input, 404 not waiting (so a double tap does nothing), 502 the mailbox write failed (card stays), 503 mailbox not connected.
 - Mail the owner had already read before triage saw it is labelled but never pings the phone.
+- After a category is chosen the answer may also carry `savePrompt: { group, question, options: [{ scope: "sender"|"domain", value, label }] }`
+  (no domain option for shared providers like gmail.com; no `savePrompt` when the sender's address is unknown or for `dismiss`).
+  When the email has telling words, a middle option `{ scope: "sender-keywords", value, label, keywords: [...] }` lists up to 5 keywords
+  picked from its subject and preview. The phone lets the owner untick some, then sends the ones kept.
+  The phone asks the owner "Save this for next time?" and, on yes, calls `POST /phone/triage/preferences`. "Not now" is just not calling it.
+
+## Remembering a choice (`/phone/triage/preferences`)
+Only the owner's yes saves anything. A saved preference is given to the classifier as `Earlier choice: <label>` for mail from that
+sender (an exact address beats its domain, per mailbox). It is a hint the model weighs, not a rule: urgent still wins for time-critical
+mail. Stored in `inbox_triage_preferences` (address or domain, group, dates; no mail text).
+- `POST /phone/triage/preferences` with `{ account, scope: "sender"|"domain"|"sender-keywords", value, group, keywords? }` saves it
+  (`{ ok: true }`). `400` for an unknown account/group, a value that is not a lower-case address (sender, sender-keywords) or a
+  non-shared domain (domain), or, for sender-keywords, keywords that are not 1 to 5 words of letters only, 3 to 40 characters.
+  A sender can have several keyword rules; each is its sender plus its sorted word set.
+- `GET /phone/triage/preferences` → `{ preferences: [{ account, scope, value, group, keywords? }] }` (`keywords` on keyword rules).
+- `POST /phone/triage/preferences/forget` with `{ account, scope, value, keywords? }` removes one (a keyword rule needs its words): `204`, or `404` if it was not saved.
+
+**Keyword rules** ("from this sender, about these words"). Words are picked by a small extractor in Curia (no model): common words and
+mail boilerplate dropped, subject words weighted above preview words, crude stemming so "invoice" meets "invoices". They come from the
+subject and the short preview only, never the body, and are stored only when the owner says yes. A rule matches a new email from that
+sender when its keywords appear in the subject or preview (all of them for a one-word rule, at least two otherwise). A matching rule
+beats the plain sender rule, which beats the domain rule; the classifier gets it as the same `Earlier choice` hint.
+
+## Unsubscribing from a newsletter (`POST /phone/unsubscribe`)
+`{ account, messageId }`. Curia reads the email's `List-Unsubscribe` header and always answers `200 { result }` (`Cache-Control: no-store`):
+- `unsubscribed`: the sender supports one-click unsubscribe (RFC 8058) and accepted Curia's request.
+- `open-link` + `url`: no one-click support; the phone opens the sender's page for the owner. Curia sends nothing.
+- `open-mailto` + `mailto`: the sender only offers an address; the phone opens it for the owner. Curia never sends the email itself.
+- `failed` (+ `url`): the one-click request was refused or timed out (or the link was not a public https address); open `url` instead.
+- `none`: no unsubscribe information in this email.
+
+### When a newsletter keeps coming back
+A sender that accepted the one-click request (`unsubscribed`) is remembered (`inbox_unsubscribes`, migration 125: mailbox, sender
+address, dates, retry count; no mail text). Triage checks each new email against it, before the classifier runs:
+1. For **10 days** after the unsubscribe nothing special happens (senders have that long to comply under CASL).
+2. After that, each new email from the sender makes Curia **repeat the one-click request** (read from the new email's own header),
+   at most **3 retries**, at least **3 days apart**. The mail itself is classified as usual.
+3. When the sender still mails after the third retry (and 3 more days), that email is labelled **Likely spam**, marked read and
+   **moved to Trash**, and the sender is saved as spam (a classifier hint). Every later email from it goes straight to Trash.
+Only senders unsubscribed through Curia are affected, and only by one-click: a link or mailto the owner followed themselves is
+not tracked. Trash is the one delete-like action Curia takes on mail (`NylasTriageSource.moveToTrash`): it never deletes for good,
+never creates a folder, and Gmail keeps trashed mail 30 days. Each retry and each trash is logged (mailbox and host/domain only).
+
+Errors: `400` bad input, `404` message gone, `429` mailbox busy, `502` mailbox error, `503` mailbox not connected. Rate limit 10/min.
+The link comes from the sender, so Curia only POSTs to an https link on a named public host (port 443, no login in the URL, no redirects),
+checking every resolved address at connect time. The full link is never logged, only the host name.
 
 ## Auth
-One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review`, `/phone/triage/review` and `/phone/inbox/read` (owner's decision,
+One bearer token, vault secret `phone_inbox_token`, shared by `/phone/inbox`, `/phone/message`, `/phone/brief`, `/phone/books/review`, `/phone/triage/review`, `/phone/triage/preferences`, `/phone/unsubscribe` and `/phone/inbox/read` (owner's decision,
 2026-11-02). Because it now also unlocks email text, treat it as sensitive: a leaked token exposes the text of any email you
 can name by thread id. It sits outside `/api`, so `api_token` does not work here and the phone token works on nothing else.
 With no token in the vault the phone routes answer 404.

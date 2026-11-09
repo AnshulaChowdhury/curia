@@ -149,4 +149,30 @@ describe('InboxWatcher', () => {
     await watcher.tick();
     expect(list).toHaveBeenCalledTimes(1);
   });
+
+  describe('beforeClassify', () => {
+    it('skips classification and labelling for mail the hook handled, and records it as tagged', async () => {
+      const { s, applied } = source([candidate('a', 1), candidate('b', 2)]);
+      const classify = vi.fn(async () => verdict('seen'));
+      const record = vi.fn(async () => {});
+      const beforeClassify = vi.fn(async (c: TriageCandidate) => (c.messageId === 'a' ? ('handled' as const) : ('continue' as const)));
+      await new InboxWatcher({
+        sources: [s], classifier: { classify }, notifier: { notify: async () => {} }, seen: memorySeen(), outcomes: { record },
+        beforeClassify, logger, intervalMs: 1000,
+      }).tick();
+      expect(classify).toHaveBeenCalledTimes(1);
+      expect(applied).toEqual([['b', 'seen']]);
+      expect(record).toHaveBeenCalledWith(expect.objectContaining({ messageId: 'a' }), 'tagged');
+    });
+
+    it('classifies the mail normally when the hook throws', async () => {
+      const { s, applied } = source([candidate('a', 1)]);
+      const beforeClassify = vi.fn(async () => { throw new Error('db down'); });
+      await new InboxWatcher({
+        sources: [s], classifier: { classify: async () => verdict('seen') }, notifier: { notify: async () => {} }, seen: memorySeen(),
+        beforeClassify, logger, intervalMs: 1000,
+      }).tick();
+      expect(applied).toEqual([['a', 'seen']]);
+    });
+  });
 });

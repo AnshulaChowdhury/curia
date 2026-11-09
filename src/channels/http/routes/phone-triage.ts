@@ -1,7 +1,8 @@
 // phone-triage.ts — the phone's review cards for mail triage could not sort.
 //
 //   GET  /phone/triage/review   one card per unsorted email, each with the category options
-//   POST /phone/triage/review   { account, messageId, group } applies that category, or group "dismiss" to leave it unlabelled
+//   POST /phone/triage/review   { account, messageId, group } applies that category, or group "dismiss" to leave it unlabelled;
+//                               the answer may carry a savePrompt (see POST /phone/triage/preferences)
 //
 // Same bearer token as the other /phone routes (vault secret `phone_inbox_token`); outside /api; no token → 404.
 // Unlike /phone/books/review this one writes: choosing a category adds the triage label to the email in the mailbox
@@ -12,6 +13,8 @@ import type { FastifyInstance } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import type { UnsortedItem } from '../../../inbox-triage/item-store.js';
 import { TRIAGE_GROUPS, TRIAGE_LABELS, type TriageGroup } from '../../../inbox-triage/types.js';
+import { extractKeywords } from '../../../inbox-triage/keywords.js';
+import { addressParts, isSharedMailDomain } from '../../../inbox-triage/preference-store.js';
 import { cleanText } from '../../../phone-brief/brief-service.js';
 import { authorisePhoneRequest } from './phone-auth.js';
 
@@ -36,6 +39,30 @@ export const REVIEW_OPTIONS = [
   ...TRIAGE_GROUPS.map((group) => ({ group: group as string, label: TRIAGE_LABELS[group] })),
   { group: DISMISS, label: 'Leave as is' },
 ];
+
+/**
+ * The follow-up question after a category was chosen: "save this for next time?". Null when the sender's address is
+ * unknown. The domain choice is left out for shared mail providers (gmail.com and the like). The phone sends the answer
+ * to POST /phone/triage/preferences; "not now" is simply not calling it.
+ */
+function savePromptFor(item: UnsortedItem, group: TriageGroup) {
+  const parts = addressParts(item.fromAddress);
+  if (!parts) return null;
+  const label = TRIAGE_LABELS[group];
+  // Words picked from this email's subject and preview. The phone shows them for the owner to keep or drop.
+  const keywords = extractKeywords(item.subject, item.snippet);
+  return {
+    group,
+    question: `Save this for next time? File mail like this as "${label}".`,
+    options: [
+      { scope: 'sender', value: parts.address, label: `From ${parts.address}` },
+      ...(keywords.length > 0
+        ? [{ scope: 'sender-keywords', value: parts.address, label: `From ${parts.address} about ${keywords.join(', ')}`, keywords }]
+        : []),
+      ...(isSharedMailDomain(parts.domain) ? [] : [{ scope: 'domain', value: parts.domain, label: `Anyone at ${parts.domain}` }]),
+    ],
+  };
+}
 
 const cardId = (accountId: string, messageId: string): string => `${accountId}:${messageId}`;
 
@@ -98,7 +125,13 @@ export async function phoneTriageRoutes(app: FastifyInstance, options: PhoneTria
       }
       await store.resolve(account, messageId, isGroup ? choice : null);
       logger.info({ account, group: isGroup ? choice : DISMISS }, 'phone-triage: resolved from the phone');
-      return reply.header('Cache-Control', 'no-store').send({ ok: true, id: cardId(account, messageId), remaining: await store.countUnsorted() });
+      const savePrompt = isGroup ? savePromptFor(item, choice as TriageGroup) : null; // choice checked against TRIAGE_GROUPS above
+      return reply.header('Cache-Control', 'no-store').send({
+        ok: true,
+        id: cardId(account, messageId),
+        remaining: await store.countUnsorted(),
+        ...(savePrompt ? { savePrompt } : {}),
+      });
     } catch (err) {
       logger.error({ err }, 'phone-triage: unexpected failure');
       return reply.status(500).send({ error: 'Internal error' });

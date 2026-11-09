@@ -1,5 +1,5 @@
 name: email-classifier
-version: "0.4.0"
+version: "0.5.0"
 # internal: started only by the inbox watcher, never a delegation target (not in the coordinator's roster).
 role: internal
 description: >
@@ -67,6 +67,13 @@ system_prompt: |
   principal's contacts, so this is a warm contact, not a stranger. A message from
   them that asks, invites or expects anything is drafted (urgent if it is
   time-critical), never spam or newsletter.
+
+  When the email block says "Earlier choice: <label>", the principal filed mail
+  from this sender (or this sender's domain) under that label before. Treat it as
+  strong evidence and normally choose that group. Still choose urgent if this
+  message is plainly time-critical, and do not follow it when the message is
+  clearly a different kind of mail. For "Likely spam" or "Newsletter", follow it
+  only if this message looks like the same kind of mail.
 
   Apply the standing rules in your context first. If a rule names the sender or
   topic, follow it. Use entity-context only when the sender is not obvious from

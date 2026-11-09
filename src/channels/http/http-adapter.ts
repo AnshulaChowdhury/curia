@@ -66,6 +66,9 @@ import { phoneInboxRoutes } from './routes/phone-inbox.js';
 import { phoneMessageRoutes } from './routes/phone-message.js';
 import { phoneBriefRoutes } from './routes/phone-brief.js';
 import { phoneTriageRoutes } from './routes/phone-triage.js';
+import { phoneTriagePreferenceRoutes } from './routes/phone-triage-preferences.js';
+import { phoneUnsubscribeRoutes } from './routes/phone-unsubscribe.js';
+import { loadUnsubscribeReader } from '../../phone-inbox/nylas-unsubscribe.js';
 import { phoneInboxReadRoutes } from './routes/phone-inbox-read.js';
 import { loadPhoneThreadMarker } from '../../phone-inbox/nylas-thread-marker.js';
 import { phoneMailboxCategoryRoutes } from './routes/phone-mailbox-category.js';
@@ -90,6 +93,8 @@ import { contactsFarmRoutes } from './routes/contacts-farm.js';
 import { ContactsPullService, type Collector } from '../../contacts-import/pull-service.js';
 import { fetchBridgeContacts } from '../../contacts-import/bridge-contacts.js';
 import { ContactsImportToken } from '../../contacts-import/import-token.js';
+import { PgExportStore } from '../../contacts-import/export-store.js';
+import { contactsExportRoutes } from './routes/contacts-export.js';
 import { PhoneInboxCache, PhoneInboxService } from '../../phone-inbox/phone-inbox-service.js';
 import { loadPhoneInboxAccounts } from '../../phone-inbox/accounts.js';
 import { loadPhoneMessageReader } from '../../phone-inbox/nylas-message.js';
@@ -102,6 +107,7 @@ import { MonitorStore } from '../../books/monitor-store.js';
 import { BooksNotifier } from '../../books/notifier.js';
 import { booksInboxRoutes } from './routes/books-inbox.js';
 import { booksBatchRoutes } from './routes/books-batches.js';
+import { booksRunRoutes } from './routes/books-run.js';
 import { booksGraphRoutes } from './routes/books-graph.js';
 import { GraphSnapshotStore } from '../../books/graph-store.js';
 import { BatchStore } from '../../books/batch-store.js';
@@ -174,10 +180,16 @@ export interface HttpAdapterConfig {
   phoneBrief?: import('../../phone-brief/brief-service.js').PhoneBriefService;
   /** Unsorted mail for the phone's review cards (GET/POST /phone/triage/review). */
   triageItems?: import('../../inbox-triage/item-store.js').PgTriageStore;
+  /** What the owner told triage to remember about senders (saved from the phone's review cards). */
+  triagePreferences?: import('../../inbox-triage/preference-store.js').PgPreferenceStore;
+  /** Remembers senders the owner unsubscribed from, so triage can repeat the request if they keep mailing. */
+  triageUnsubscribes?: import('../../inbox-triage/unsubscribe-store.js').PgUnsubscribeStore;
   /** Backs the Inbox triage form on Settings → API connections (restarts the watcher on save). */
   inboxTriage?: import('../../inbox-triage/controller.js').InboxTriageController;
   /** The books deadline/heartbeat monitor (FR-INT-5/7); started in index.ts, routes mounted here. */
   booksMonitor?: import('../../books/monitor.js').BooksMonitor;
+  /** Runs the books pipeline in Curia (POST /api/books/run); absent when the books service is not configured. */
+  booksRunner?: import('../../books/books-runner.js').BooksRunner;
   /** Backs the public /api/secret-capture/* routes (one-time tokenized secret capture, #971).
    *  Token-authed, so mounted independently of the bootstrap secret. */
   secretCaptureService?: import('../../secrets/secret-capture-service.js').SecretCaptureService;
@@ -755,6 +767,15 @@ export class HttpAdapter implements Channel {
           service: this.config.phoneBrief,
         });
       }
+      // Unsubscribe from a newsletter, from the phone's email page. Same token.
+      await this.app.register(phoneUnsubscribeRoutes, {
+        logger,
+        getToken: () => secrets.get('phone_inbox_token'),
+        getReader: (account) => loadUnsubscribeReader(secrets, account),
+        ...(this.config.triageUnsubscribes
+          ? { onUnsubscribed: (account, sender) => this.config.triageUnsubscribes!.record(account, sender) }
+          : {}),
+      });
       // Mail triage could not sort, as cards the owner can categorise from the phone.
       if (this.config.triageItems) {
         await this.app.register(phoneTriageRoutes, {
@@ -762,6 +783,13 @@ export class HttpAdapter implements Channel {
           getToken: () => secrets.get('phone_inbox_token'),
           store: this.config.triageItems,
           getSource: (account) => loadTriageSource(secrets, account),
+        });
+      }
+      if (this.config.triagePreferences) {
+        await this.app.register(phoneTriagePreferenceRoutes, {
+          logger,
+          getToken: () => secrets.get('phone_inbox_token'),
+          store: this.config.triagePreferences,
         });
       }
     }
@@ -805,6 +833,12 @@ export class HttpAdapter implements Channel {
           sessions,
         });
       }
+      await this.app.register(booksRunRoutes, {
+        logger,
+        runner: this.config.booksRunner ?? null,
+        webAppBootstrapSecret,
+        sessions,
+      });
       await this.app.register(booksBatchRoutes, {
         logger,
         batchStore: new BatchStore(pool),
@@ -850,6 +884,14 @@ export class HttpAdapter implements Channel {
         secrets: sourcesSecrets,
         categories: new PgMailboxCategoryStore(pool),
         loadMailboxes: () => loadPhoneInboxAccounts(sourcesSecrets),
+        webAppBootstrapSecret,
+        sessions,
+      });
+      // The Matrix exporter on the Mac mini: run requests in, per-room message counts out (bearer: the import token).
+      await this.app.register(contactsExportRoutes, {
+        logger,
+        store: new PgExportStore(pool),
+        importToken: new ContactsImportToken(sourcesSecrets),
         webAppBootstrapSecret,
         sessions,
       });

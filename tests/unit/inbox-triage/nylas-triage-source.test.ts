@@ -173,4 +173,44 @@ describe('NylasTriageSource', () => {
     const fetchImpl = (async () => new Response('{}', { status: 429, headers: { 'retry-after': '42' } })) as unknown as typeof fetch;
     await expect(new NylasTriageSource('moonray', 'k', 'g', fetchImpl).listUntagged()).rejects.toMatchObject({ retryAfterSeconds: 42 });
   });
+
+  describe('moveToTrash', () => {
+    const run = async (folders: unknown[], message: unknown) => {
+      const calls: Array<[string, string, unknown]> = [];
+      const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+        calls.push([init.method ?? 'GET', url, init.body ? JSON.parse(init.body as string) : undefined]);
+        if (url.endsWith('/folders')) return json({ data: folders });
+        return json({ data: message });
+      }) as unknown as typeof fetch;
+      const source = new NylasTriageSource('moonray', 'k', 'g', fetchImpl);
+      return { calls, source };
+    };
+
+    it('takes the message out of the inbox, keeps its labels, and puts it in Trash', async () => {
+      const { calls, source } = await run(
+        [{ id: 'INBOX', name: 'INBOX' }, { id: 'TRASH', name: 'TRASH' }, { id: 'L9', name: 'Likely spam' }],
+        { id: 'm1', folders: ['INBOX', 'L9'] },
+      );
+      await source.moveToTrash('m1');
+      expect(calls.find(([m]) => m === 'PUT')![2]).toEqual({ folders: ['L9', 'TRASH'], unread: false });
+    });
+
+    it('finds Trash by its \\Trash attribute on providers whose folder has another id', async () => {
+      const { calls, source } = await run(
+        [{ id: 'f-in', name: 'Inbox', attributes: ['\\Inbox'] }, { id: 'f-del', name: 'Deleted Items', attributes: ['\\Trash'] }],
+        { id: 'm1', folders: ['f-in'] },
+      );
+      await source.moveToTrash('m1');
+      expect(calls.find(([m]) => m === 'PUT')![2]).toEqual({ folders: ['f-del'], unread: false });
+    });
+
+    it('writes nothing when it is already in Trash, and never creates a folder when there is no Trash', async () => {
+      const done = await run([{ id: 'TRASH', name: 'TRASH' }], { id: 'm1', folders: ['TRASH'] });
+      await done.source.moveToTrash('m1');
+      expect(done.calls.some(([m]) => m === 'PUT')).toBe(false);
+      const none = await run([{ id: 'INBOX', name: 'INBOX' }], { id: 'm1', folders: ['INBOX'] });
+      await expect(none.source.moveToTrash('m1')).rejects.toThrow(/no Trash folder/);
+      expect(none.calls.some(([m]) => m === 'POST' || m === 'PUT')).toBe(false);
+    });
+  });
 });

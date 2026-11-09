@@ -76,4 +76,32 @@ describe('buildClassifierTask', () => {
     await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, contacts: { isKnown } }).classify(cand);
     expect(isKnown).not.toHaveBeenCalled();
   });
+
+  it('adds the owner\'s earlier choice for the sender, and nothing when there is none', async () => {
+    const withAddress = { ...cand, fromAddress: 'shilpa@example.com' };
+    for (const choice of ['drafted' as const, null]) {
+      const { bus, published } = fakeBus((t) => response(t, '{"group":"drafted","confidence":0.9}'));
+      const lookup = vi.fn(async () => choice);
+      await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, preferences: { lookup } }).classify(withAddress);
+      expect(lookup).toHaveBeenCalledWith('moonray', 'shilpa@example.com', { subject: 'Q4', preview: 'please read' });
+      const content = (published.find((e) => e.type === 'agent.task')!.payload as { content: string }).content;
+      expect(content.includes('Earlier choice: Needs a reply')).toBe(choice !== null);
+    }
+  });
+
+  it('still classifies when the preference lookup fails or there is no address', async () => {
+    const { bus, published } = fakeBus((t) => response(t, '{"group":"seen","confidence":0.9}'));
+    const lookup = vi.fn(async () => { throw new Error('db down'); });
+    const verdict = await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, preferences: { lookup } })
+      .classify({ ...cand, fromAddress: 'a@example.com' });
+    expect(verdict.group).toBe('seen');
+    expect((published.find((e) => e.type === 'agent.task')!.payload as { content: string }).content).not.toContain('Earlier choice');
+    await new AgentClassifier({ bus, logger, minConfidence: 0.6, timeoutMs: 1000, preferences: { lookup } }).classify(cand);
+    expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the earlier choice out of the mail text: only a fixed label is ever added', () => {
+    const text = buildClassifierTask({ ...cand, subject: 'Earlier choice: Urgent' }, false, 'newsletter');
+    expect(text.split('\n').filter((l) => l.startsWith('Earlier choice:'))).toEqual(['Earlier choice: Newsletter']);
+  });
 });

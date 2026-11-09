@@ -14,6 +14,8 @@ export interface TriageSource {
   /** Untagged mail in the triage window, read or unread. `isKnown` lets the source skip mail already handled. */
   listUntagged(isKnown?: (messageId: string) => Promise<boolean>): Promise<TriageCandidate[]>;
   applyLabel(messageId: string, group: TriageGroup): Promise<void>;
+  /** Moves a message to Trash. Optional; used only by the unsubscribe follow-up, never by classification. */
+  moveToTrash?(messageId: string): Promise<void>;
 }
 
 export interface Classifier {
@@ -39,6 +41,8 @@ export interface InboxWatcherConfig {
   outcomes?: OutcomeRecorder;
   logger: Logger;
   intervalMs: number;
+  /** Asked before each message is classified. 'handled' skips classification (the mail was dealt with). Optional. */
+  beforeClassify?: (candidate: TriageCandidate, source: TriageSource) => Promise<'handled' | 'continue'>;
   /** Most messages classified per tick, per account. Bounds cost if a backlog appears. */
   maxPerTick?: number;
 }
@@ -110,6 +114,20 @@ export class InboxWatcher {
       // Marked before classifying (FR-ETW-2): a crash mid-call must not loop on one message.
       await seen.add(key);
       handled += 1;
+
+      if (this.config.beforeClassify) {
+        let result: 'handled' | 'continue' = 'continue';
+        try {
+          result = await this.config.beforeClassify(candidate, source);
+        } catch (err) {
+          // A failure here must never stop the mail being classified.
+          logger.warn({ err, accountId: candidate.accountId }, 'inbox-triage: pre-classification check failed');
+        }
+        if (result === 'handled') {
+          await this.report(candidate, 'tagged');
+          continue;
+        }
+      }
 
       let verdict: TriageVerdict;
       try {

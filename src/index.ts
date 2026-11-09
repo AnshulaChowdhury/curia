@@ -70,6 +70,10 @@ import { EntityMemory } from './memory/entity-memory.js';
 import { InboxTriageController } from './inbox-triage/controller.js';
 import { PgTriageStore } from './inbox-triage/item-store.js';
 import { contactLookupFor } from './inbox-triage/contact-lookup.js';
+import { PgPreferenceStore } from './inbox-triage/preference-store.js';
+import { PgUnsubscribeStore } from './inbox-triage/unsubscribe-store.js';
+import { UnsubscribeEnforcer } from './inbox-triage/unsubscribe-enforcer.js';
+import { loadUnsubscribeReader } from './phone-inbox/nylas-unsubscribe.js';
 import { UnsortedBriefSource } from './phone-brief/unsorted-source.js';
 import { PgBriefStore } from './phone-brief/brief-store.js';
 import { PhoneBriefService } from './phone-brief/brief-service.js';
@@ -264,6 +268,9 @@ import { DriveInbox } from './books/drive-inbox.js';
 import { BooksToken } from './quickbooks/books-token.js';
 import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.js';
 import { BooksReader } from './books/books-reader.js';
+import { BooksRunner } from './books/books-runner.js';
+import { booksServiceFromEnv } from './books/books-service-client.js';
+import { PipelineStateStore } from './books/pipeline-state-store.js';
 import { BatchStore } from './books/batch-store.js';
 import { UploadStore } from './books/upload-store.js';
 
@@ -3214,12 +3221,21 @@ async function main(): Promise<void> {
   // Real-time inbox triage: off unless the vault says `inbox_triage_enabled` = "true".
   // Started after the scheduler so the email-classifier agent's tasks have a runtime to run in.
   const triageItems = new PgTriageStore(pool);
+  const triagePreferences = new PgPreferenceStore(pool);
+  const triageUnsubscribes = new PgUnsubscribeStore(pool);
   const inboxTriage = new InboxTriageController({
     bus,
     logger,
     secrets: secretsService,
     items: triageItems,
     timezone: config.timezone,
+    preferences: triagePreferences,
+    unsubscribeEnforcer: new UnsubscribeEnforcer({
+      logger,
+      store: triageUnsubscribes,
+      preferences: triagePreferences,
+      readHeaders: async (accountId, messageId) => (await loadUnsubscribeReader(secretsService, accountId))?.read(messageId) ?? null,
+    }),
     ...(contactService ? { contacts: contactLookupFor(contactService, logger) } : {}),
   });
   try {
@@ -3252,6 +3268,25 @@ async function main(): Promise<void> {
     logger,
   });
   booksMonitor.start();
+
+  // The books run itself, in Curia: bank files -> the books service -> a batch to review. Needs BOOKS_SERVICE_URL and
+  // BOOKS_SERVICE_TOKEN (Railway sets both); without them nothing runs and "Run now" says so.
+  const booksService = booksServiceFromEnv(process.env, logger);
+  const booksRunner = booksService
+    ? new BooksRunner({
+        service: booksService,
+        state: new PipelineStateStore(pool),
+        uploads: new UploadStore(pool),
+        drive: new DriveInbox(secretsService),
+        batches: new BatchStore(pool),
+        monitorStore: new MonitorStore(pool),
+        monitor: booksMonitor,
+        qbo: qboConnection,
+        llm: infraLlmService.scoped({ toolName: 'books-categorise' }),
+        logger,
+      })
+    : undefined;
+  booksRunner?.start();
 
   // Reaction → approval mapper (#1479): channel-agnostic inbound.reaction handling.
   // Registered after ExecutionLayer so approve can re-invoke the blocked skill.
@@ -3488,8 +3523,11 @@ async function main(): Promise<void> {
     secretsService,
     inboxTriage,
     triageItems,
+    triagePreferences,
+    triageUnsubscribes,
     phoneBrief,
     booksMonitor,
+    booksRunner,
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
@@ -3537,6 +3575,7 @@ async function main(): Promise<void> {
     inboxTriage.stop();
     phoneBriefScheduler.stop();
     booksMonitor.stop();
+    booksRunner?.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace
     // before Signal, Slack, and the pool close (#2254).

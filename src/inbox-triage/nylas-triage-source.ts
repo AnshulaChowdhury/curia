@@ -9,7 +9,7 @@ import { MailboxRateLimitedError } from '../phone-inbox/phone-inbox-service.js';
 import { TRIAGE_LABELS, marksRead, triageGroupOfLabel, type TriageCandidate, type TriageGroup } from './types.js';
 import type { TriageSource } from './watcher.js';
 
-interface NylasFolder { id: string; name?: string }
+interface NylasFolder { id: string; name?: string; attributes?: string[] }
 interface NylasMessage {
   id: string;
   thread_id?: string;
@@ -114,6 +114,28 @@ export class NylasTriageSource implements TriageSource {
     if (marksRead(group)) update.unread = false;
     if (Object.keys(update).length === 0) return;
     await this.request('PUT', `/messages/${encodeURIComponent(messageId)}`, update);
+  }
+
+  /**
+   * Moves one message to Trash: out of the inbox, into the Trash folder. Never creates a folder and never deletes for good.
+   * Used only for mail from a sender the owner unsubscribed from (see unsubscribe-enforcer.ts).
+   */
+  async moveToTrash(messageId: string): Promise<void> {
+    const folders = await this.request<NylasList<NylasFolder>>('GET', '/folders');
+    const all = folders.data ?? [];
+    const isSystem = (f: NylasFolder, attribute: string, id: string) =>
+      (f.attributes ?? []).some((a) => a.replace(/^\\/, '').toLowerCase() === attribute) || f.id.toUpperCase() === id;
+    const trash = all.find((f) => isSystem(f, 'trash', 'TRASH'));
+    if (!trash) throw new Error('Nylas mailbox has no Trash folder');
+    const inboxId = all.find((f) => isSystem(f, 'inbox', 'INBOX'))?.id;
+
+    const message = await this.request<{ data: NylasMessage }>('GET', `/messages/${encodeURIComponent(messageId)}`);
+    const current = message.data.folders ?? [];
+    if (current.includes(trash.id)) return;
+    await this.request('PUT', `/messages/${encodeURIComponent(messageId)}`, {
+      folders: [...current.filter((id) => id !== inboxId), trash.id],
+      unread: false,
+    });
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
