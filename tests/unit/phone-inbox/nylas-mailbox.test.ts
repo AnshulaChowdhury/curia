@@ -103,6 +103,17 @@ describe('NylasMailbox', () => {
     expect((err3 as MailboxRateLimitedError).detail).toContain('not readable');
   });
 
+  it('scans in pages of 20 with only the fields it needs and passes the cursor on', async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ data: [], next_cursor: 'c2' }));
+    const page = await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch).scanPage(1500, 'c1');
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain('limit=20');
+    expect(url).toContain('received_after=1500');
+    expect(url).toContain('page_token=c1');
+    expect(decodeURIComponent(url)).toContain('select=from,to,cc,date,folders');
+    expect(page.nextCursor).toBe('c2');
+  });
+
   it('throws with the status only on an error response', async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ error: 'bad key sk-123' }, 401));
     const err = await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);

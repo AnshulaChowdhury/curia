@@ -17,6 +17,9 @@ import {
 export const NYLAS_REGIONS = { us: 'https://api.us.nylas.com', eu: 'https://api.eu.nylas.com' } as const;
 export type NylasRegion = keyof typeof NYLAS_REGIONS;
 // Per triage tag. More than this tagged and unread is already far past "needs you".
+// Nylas answers a 429 with "set your limit=20 or lower" when a page is too big for the account's provider quota; the
+// ten-year contacts scan reads thousands of pages, so it uses the small size.
+const SCAN_PAGE_LIMIT = 20;
 const TAG_PAGE_LIMIT = 50;
 // Sent mail since the oldest candidate arrived; a few days of sent mail is well inside this.
 const SENT_PAGE_LIMIT = 50;
@@ -120,7 +123,7 @@ export class NylasMailbox implements MailboxReader {
    * One page of every message (newest first) back to `receivedAfter`, reduced to participants and a date. Asks Nylas to
    * send only those fields, and keeps only those fields, so no subject, body or message id is ever held.
    */
-  async scanPage(receivedAfter: number, cursor?: string, pageSize = 200): Promise<ScanPage> {
+  async scanPage(receivedAfter: number, cursor?: string, pageSize = SCAN_PAGE_LIMIT): Promise<ScanPage> {
     const query = new URLSearchParams({
       limit: String(pageSize),
       received_after: String(receivedAfter),

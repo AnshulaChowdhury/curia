@@ -304,6 +304,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
+- **Mailbox scan** — reads 20 messages a page with a pause between pages, as Nylas's 429 advises.
 - **Local-jobs installer** — secret prompts now read from the keyboard instead of looping on empty input.
 - **Inbox triage start point** — resumes from each mailbox's last successful triage, not a fixed date (migration 126).
 - **Rate-limited mailboxes** — triage pauses 5, 10, 20, then 30 minutes instead of a flat 5.
