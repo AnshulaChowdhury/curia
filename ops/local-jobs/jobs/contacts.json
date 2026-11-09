@@ -1,18 +1,22 @@
 {
   "id": "contacts",
-  "label": "Contacts export",
-  "repo": "git@github.com:CHANGE-ME/CHANGE-ME.git",
-  "ref": "v0.1.0",
+  "label": "Contacts export (Matrix message counts)",
+  "repo": "git@github.com:AnshulaChowdhury/curia.git",
+  "ref": "contacts-export-v0.1.0",
+  "subdir": "jobs/contacts-export",
   "macos_user": "contacts",
   "entry": "scripts/run.sh",
-  "interval_seconds": 60,
-  "install": ["/usr/bin/python3 -m pip install --user -r requirements.txt"],
-  "import_check": ["requests"],
-  "test": "/usr/bin/python3 -m pytest -q",
-  "secrets": [
-    { "name": "CONTACTS_API_TOKEN", "source": "curia", "help": "Curia > Settings > Local jobs > Contacts export > Make a token (shown once)" },
-    { "name": "MATRIX_ACCESS_TOKEN", "source": "manual", "help": "A separate Matrix login for this job (Element > Settings > Help & About > Access Token). Approved exception: this token can read every chat." },
-    { "name": "CLAUDE_CODE_OAUTH_TOKEN", "source": "claude-setup-token", "optional": true, "help": "Run 'claude setup-token' on your own login and paste the result" }
+  "interval_seconds": 300,
+  "install": [],
+  "import_check": ["contacts_export.run"],
+  "test": "/usr/bin/python3 -m unittest discover -s . -p 'test_*.py'",
+  "settings": [
+    { "name": "CURIA_URL", "help": "Where Curia is reachable from this Mac, e.g. https://your-curia.example.com" },
+    { "name": "MATRIX_HOMESERVER_URL", "help": "Your Synapse address as this Mac reaches it, e.g. https://matrix.example.com" }
   ],
-  "check": "/usr/bin/python3 -m contacts.check"
+  "secrets": [
+    { "name": "CONTACTS_API_TOKEN", "source": "curia", "help": "Curia > Settings > API connections > Contacts import > Make a token (shown once)" },
+    { "name": "MATRIX_ACCESS_TOKEN", "source": "manual", "help": "A separate Matrix login for this job (Element > Settings > Help & About > Access Token). Approved exception: this token can read every chat." }
+  ],
+  "check": "/usr/bin/python3 -m contacts_export.check"
 }

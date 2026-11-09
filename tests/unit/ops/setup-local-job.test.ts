@@ -35,9 +35,27 @@ describe('setup-local-job', () => {
     ['absolute entry', { entry: '/etc/x.sh' }],
     ['shell in ref', { ref: 'v1;ls' }],
     ['placeholder repo', { repo: 'git@github.com:CHANGE-ME/CHANGE-ME.git' }],
+    ['path traversal in subdir', { subdir: '../x' }],
+    ['absolute subdir', { subdir: '/etc' }],
   ])('rejects %s', (_n, patch) => {
     const r = run({ ...base, ...patch }, '--dry-run');
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/Stopped:/);
+  });
+
+  it('installs a job that lives in a folder of a bigger repo: only that folder, run from there', () => {
+    const r = run({ ...base, subdir: 'jobs/demo', settings: [{ name: 'DEMO_URL' }] }, '--dry-run');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('--no-checkout --filter=blob:none');
+    expect(r.stdout).toContain("git sparse-checkout set --cone 'jobs/demo'");
+    expect(r.stdout).toContain('would prompt for DEMO_URL (setting)');
+  });
+
+  it('the shipped contacts manifest passes a dry run', () => {
+    const r = spawnSync('/bin/bash', [SCRIPT, 'install', 'contacts', '--dry-run'], { encoding: 'utf8', input: '' });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('folder jobs/contacts-export');
+    expect(r.stdout).toContain('would prompt for MATRIX_ACCESS_TOKEN');
+    expect(r.stdout).toContain('would prompt for MATRIX_HOMESERVER_URL (setting)');
   });
 });

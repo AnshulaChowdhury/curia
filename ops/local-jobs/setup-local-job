@@ -42,10 +42,13 @@ mfl() { "$PY" -I -c 'import json,sys; [print(x) for x in json.load(open(sys.argv
 mfsecrets() { "$PY" -I -c '
 import json,sys
 for s in json.load(open(sys.argv[1])).get("secrets",[]):
-    print("\t".join([s["name"], s.get("source","manual"), "1" if s.get("optional") else "0", s.get("help","").replace("\t"," ")]))' "$MANIFEST"; }
+    print("\t".join([s["name"], s.get("source","manual"), "1" if s.get("optional") else "0", s.get("help","").replace("\t"," ")]))
+# plain settings (a web address, not a secret): shown while typed, checked as an http(s) address
+for s in json.load(open(sys.argv[1])).get("settings",[]):
+    print("\t".join([s["name"], "setting", "0", s.get("help","").replace("\t"," ")]))' "$MANIFEST"; }
 
 ID="$(mf id)"; LABEL="$(mf label)"; REPO="$(mf repo)"; REF="$(mf ref)"; JUSER="$(mf macos_user)"
-ENTRY="$(mf entry)"; INTERVAL="$(mf interval_seconds)"; TESTCMD="$(mf test)"; CHECK="$(mf check)"
+SUBDIR="$(mf subdir)"; ENTRY="$(mf entry)"; INTERVAL="$(mf interval_seconds)"; TESTCMD="$(mf test)"; CHECK="$(mf check)"
 # Validate every manifest value that reaches a shell, a path or a plist.
 re() { [[ "$2" =~ $1 ]] || die "manifest field '$3' has an unsafe or empty value"; }
 re '^[a-z][a-z0-9_-]{1,31}$' "$ID" id
@@ -56,9 +59,14 @@ re '^[0-9]{2,5}$' "$INTERVAL" interval_seconds
 re '^[A-Za-z0-9@:/._-]+$' "$REPO" repo
 case "$REPO" in *CHANGE-ME*) die "manifest repo is still a placeholder (CHANGE-ME)";; esac
 [ "$ENTRY" != "${ENTRY#/}" ] && die "entry must be relative"
+if [ -n "$SUBDIR" ]; then
+  re '^[A-Za-z0-9._/-]+$' "$SUBDIR" subdir
+  [ "$SUBDIR" != "${SUBDIR#/}" ] && die "subdir must be relative"
+  case "$SUBDIR" in *..*) die "subdir must not contain '..'";; esac
+fi
 case "$ENTRY" in *..*) die "entry must not contain '..'";; esac
 
-HOME_DIR="/Users/$JUSER"; REPO_DIR="$HOME_DIR/$ID"; DATA="$HOME_DIR/data"; ENVF="$HOME_DIR/.$ID-env"
+HOME_DIR="/Users/$JUSER"; REPO_DIR="$HOME_DIR/$ID"; WORK_DIR="$REPO_DIR${SUBDIR:+/$SUBDIR}"; DATA="$HOME_DIR/data"; ENVF="$HOME_DIR/.$ID-env"
 LABEL_ID="ventures.moonray.$ID-run"; PLIST="/Library/LaunchDaemons/$LABEL_ID.plist"
 MANIFEST_SHA="$(shasum -a 256 "$MANIFEST" | cut -d' ' -f1)"
 
@@ -73,10 +81,15 @@ user_exists() { id "$JUSER" >/dev/null 2>&1; }
 say "Local job installer: $LABEL ($ID)"
 say "  manifest  $MANIFEST"
 say "  sha256    $MANIFEST_SHA   <- compare with the hash shown on the Curia Local jobs page"
-say "  macOS user $JUSER   repo $REPO @ $REF"
+say "  macOS user $JUSER   repo $REPO @ $REF${SUBDIR:+  folder $SUBDIR}"
 [ "$DRY" = 1 ] && say "  DRY RUN: nothing will be changed."
 
 # ---- secret prompt: silent, by stdin, validated, length echoed ----
+valid_setting() { # a web address; prints reason on failure
+  local v="$1"
+  [[ "$v" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { echo "not a web address (it must start with http:// or https:// and contain no spaces or quotes)"; return 1; }
+  return 0
+}
 valid_secret() { # prints reason on failure
   local v="$1"
   [ -n "$v" ] || { echo "empty"; return 1; }
@@ -96,6 +109,11 @@ collect_secrets() {
     fi
     say ""; say "   $name  ($src)"; [ -n "$help" ] && say "   $help"
     while :; do
+      if [ "$src" = setting ]; then
+        printf '   Type it (this is an address, not a secret): '; IFS= read -r val
+        if why="$(valid_setting "$val")"; then say "   received $val"; pairs+="$name=$val"$'\n'; break; fi
+        say "   rejected: $why. Try again."; continue
+      fi
       printf '   Paste it now (nothing will show)%s: ' "$([ "$opt" = 1 ] && echo ', or press Enter to skip')"
       IFS= read -rs val; echo
       if [ -z "$val" ] && [ "$opt" = 1 ]; then say "   skipped"; break; fi
@@ -134,10 +152,10 @@ doctor() {
   CHK_DESC="repo is checked out at $REF"; chk sudo -H -u "$JUSER" /bin/sh -c "cd '$REPO_DIR' && git describe --tags --exact-match 2>/dev/null | grep -qx '$REF'"
   CHK_DESC="plist exists, owned by root, mode 644"; chk bash -c "[ \"\$(stat -f '%Su:%Lp' '$PLIST')\" = root:644 ]"
   CHK_DESC="daemon is loaded in launchd"; chk sudo launchctl print "system/$LABEL_ID"
-  CHK_DESC="entry runs as $JUSER (as /bin/sh)"; chk sudo -H -u "$JUSER" /bin/sh -c "cd '$REPO_DIR' && [ -f '$ENTRY' ]"
+  CHK_DESC="entry runs as $JUSER (as /bin/sh)"; chk sudo -H -u "$JUSER" /bin/sh -c "cd '$WORK_DIR' && [ -f '$ENTRY' ]"
   if [ -n "$CHECK" ]; then
     CHK_DESC="the job's own check reaches Curia with its token"
-    chk sudo -H -u "$JUSER" /bin/sh -c "cd '$REPO_DIR' && set -a && . '$ENVF' && set +a && $CHECK"
+    chk sudo -H -u "$JUSER" /bin/sh -c "cd '$WORK_DIR' && set -a && . '$ENVF' && set +a && $CHECK"
   fi
   [ "$FAILS" = 0 ] && say "All checks passed." || say "$FAILS check(s) failed. Re-run: ./setup-local-job install $ID"
   return "$FAILS"
@@ -153,7 +171,7 @@ write_plist() {
   <key>UserName</key><string>$JUSER</string>
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>-c</string>
-    <string>set -a; . '$ENVF'; set +a; cd '$REPO_DIR'; exec /bin/sh '$ENTRY'</string>
+    <string>set -a; . '$ENVF'; set +a; cd '$WORK_DIR'; exec /bin/sh '$ENTRY'</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>$INTERVAL</integer>
@@ -218,21 +236,23 @@ if [ "$DRY" = 0 ]; then
 fi
 
 step 5 "Clone and pin to $REF"
-if [ "$DRY" = 0 ] && asjob "[ -d '$REPO_DIR/.git' ]" 2>/dev/null; then asjob "cd '$REPO_DIR' && git fetch --tags -q"; else asjob "git clone -q '$REPO' '$REPO_DIR'"; fi
+if [ "$DRY" = 0 ] && asjob "[ -d '$REPO_DIR/.git' ]" 2>/dev/null; then asjob "cd '$REPO_DIR' && git fetch --tags -q"; else asjob "git clone -q ${SUBDIR:+--no-checkout --filter=blob:none }'$REPO' '$REPO_DIR'"; fi
+# A job that lives inside a bigger repo gets only its own folder on disk (the rest of the repo is never checked out).
+[ -n "$SUBDIR" ] && asjob "cd '$REPO_DIR' && git sparse-checkout set --cone '$SUBDIR'"
 asjob "cd '$REPO_DIR' && git checkout -q 'tags/$REF' && git rev-parse HEAD"
 say "   Compare the commit above with the tag on GitHub."
 
 step 6 "Install dependencies, verify by importing, run the tests"
-while IFS= read -r c; do [ -n "$c" ] && asjob "cd '$REPO_DIR' && $c"; done < <(mfl install)
-while IFS= read -r m; do [ -n "$m" ] || continue; re '^[A-Za-z0-9_.]+$' "$m" import_check; asjob "cd '$REPO_DIR' && $PY -c 'import $m'" && { [ "$DRY" = 1 ] || ok "import $m"; }; done < <(mfl import_check)
-[ -n "$TESTCMD" ] && { asjob "cd '$REPO_DIR' && $TESTCMD" && { [ "$DRY" = 1 ] || ok "tests pass"; } || die "tests failed as $JUSER; fix before installing a daemon"; }
+while IFS= read -r c; do [ -n "$c" ] && asjob "cd '$WORK_DIR' && $c"; done < <(mfl install)
+while IFS= read -r m; do [ -n "$m" ] || continue; re '^[A-Za-z0-9_.]+$' "$m" import_check; asjob "cd '$WORK_DIR' && $PY -c 'import $m'" && { [ "$DRY" = 1 ] || ok "import $m"; }; done < <(mfl import_check)
+[ -n "$TESTCMD" ] && { asjob "cd '$WORK_DIR' && $TESTCMD" && { [ "$DRY" = 1 ] || ok "tests pass"; } || die "tests failed as $JUSER; fix before installing a daemon"; }
 
 step 7 "Secrets (silent prompts; values never shown or put on a command line)"
 collect_secrets
 
 step 8 "Dry run: the job's own check, end to end, with its token"
 if [ -n "$CHECK" ]; then
-  asjob "cd '$REPO_DIR' && set -a && . '$ENVF' && set +a && $CHECK" && { [ "$DRY" = 1 ] || ok "check passed"; } || die "check failed; the daemon is NOT installed. Fix, then re-run (it resumes)."
+  asjob "cd '$WORK_DIR' && set -a && . '$ENVF' && set +a && $CHECK" && { [ "$DRY" = 1 ] || ok "check passed"; } || die "check failed; the daemon is NOT installed. Fix, then re-run (it resumes)."
 fi
 
 step 9 "Install the daemon"
@@ -247,7 +267,7 @@ fi
 
 step 10 "First check"
 if [ "$DRY" = 0 ] && [ -n "$CHECK" ]; then
-  n=0; until asjob "cd '$REPO_DIR' && set -a && . '$ENVF' && set +a && $CHECK" >/dev/null 2>&1 || [ $n -ge 12 ]; do n=$((n+1)); sleep 10; done
+  n=0; until asjob "cd '$WORK_DIR' && set -a && . '$ENVF' && set +a && $CHECK" >/dev/null 2>&1 || [ $n -ge 12 ]; do n=$((n+1)); sleep 10; done
   [ $n -lt 12 ] && ok "job reaches Curia" || bad "no successful check within 2 minutes; run: ./setup-local-job doctor $ID"
   doctor || true
 fi

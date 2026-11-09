@@ -4,6 +4,12 @@
 **Grounded in:** the Books runbook (`docs/mac-mini-setup.md` in the books repo), `ops/ventures.moonray.books-run.plist`,
 `scripts/run-batch.sh`, `src/quickbooks/books-token.ts`, `docs/dev/books-quickbooks.md`, ADR-059/060.
 
+> **Update 2026-11-08.** Books moved into Curia (#66), so it is no longer a local job. The first job is the contacts export
+> (`jobs/contacts-export`, manifest `ops/local-jobs/jobs/contacts.json`). Two manifest fields were added for it: `subdir` (a job that
+> lives in a folder of a bigger repo; the clone is partial and sparse, so only that folder is on the Mac) and `settings` (plain
+> addresses such as `CURIA_URL`, typed visibly and checked as http(s) addresses, never treated as secrets). Wherever this document
+> says Books is the first job, read it as the contacts export.
+
 ## 1. Problem
 
 Setting up the first local job (Books) took ten manual sections: create a macOS user, lock folders, make a deploy key, clone,
