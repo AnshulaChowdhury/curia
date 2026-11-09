@@ -1,0 +1,274 @@
+#!/bin/bash
+# setup-local-job — one-command, idempotent, guided installer for a Curia "local job" on the Mac mini.
+# Design: docs/wip/2026-11-02-local-jobs-installer-design.md
+#
+#   ./setup-local-job install <job-id|manifest.json> [--dry-run]    (default command)
+#   ./setup-local-job doctor <job-id|manifest.json>                  (checks only, changes nothing)
+#   ./setup-local-job rotate-token <job-id|manifest.json>
+#   ./setup-local-job uninstall <job-id|manifest.json> [--dry-run]   (removes the daemon; keeps data)
+#
+# Run it as yourself (the owner) from a file, never pasted. It asks before every sudo step.
+# It never reads or prints a token, never puts a secret on a command line, opens no port, edits no sudoers.
+set -u
+set -o pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+DRY=0
+CMD=install
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    install|doctor|rotate-token|uninstall) CMD="$a" ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+TARGET="${ARGS[0]:-}"
+[ -n "$TARGET" ] || { sed -n '2,10p' "$0"; exit 2; }
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n== Step %s: %s\n' "$1" "$2"; }
+ok()   { printf '   ok   %s\n' "$*"; }
+bad()  { printf '   FAIL %s\n' "$*"; }
+die()  { printf '\nStopped: %s\n' "$*" >&2; exit 1; }
+confirm() { [ "$DRY" = 1 ] && return 0; local r; printf '   %s [y/N] ' "$1"; read -r r; [ "$r" = y ] || [ "$r" = Y ]; }
+
+# ---- manifest (standard library only: a fresh mini has Apple's python 3.9 and nothing else) ----
+if [ -f "$TARGET" ]; then MANIFEST="$TARGET"; else MANIFEST="$HERE/jobs/$TARGET.json"; fi
+[ -f "$MANIFEST" ] || die "no manifest at $MANIFEST"
+PY=/usr/bin/python3
+mf()  { "$PY" -I -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2],""); print(v if not isinstance(v,(list,dict)) else "")' "$MANIFEST" "$1"; }
+mfl() { "$PY" -I -c 'import json,sys; [print(x) for x in json.load(open(sys.argv[1])).get(sys.argv[2],[])]' "$MANIFEST" "$1"; }
+# one line per secret: name<TAB>source<TAB>optional(0/1)<TAB>help
+mfsecrets() { "$PY" -I -c '
+import json,sys
+for s in json.load(open(sys.argv[1])).get("secrets",[]):
+    print("\t".join([s["name"], s.get("source","manual"), "1" if s.get("optional") else "0", s.get("help","").replace("\t"," ")]))
+# plain settings (a web address, not a secret): shown while typed, checked as an http(s) address
+for s in json.load(open(sys.argv[1])).get("settings",[]):
+    print("\t".join([s["name"], "setting", "0", s.get("help","").replace("\t"," ")]))' "$MANIFEST"; }
+
+ID="$(mf id)"; LABEL="$(mf label)"; REPO="$(mf repo)"; REF="$(mf ref)"; JUSER="$(mf macos_user)"
+SUBDIR="$(mf subdir)"; ENTRY="$(mf entry)"; INTERVAL="$(mf interval_seconds)"; TESTCMD="$(mf test)"; CHECK="$(mf check)"
+# Validate every manifest value that reaches a shell, a path or a plist.
+re() { [[ "$2" =~ $1 ]] || die "manifest field '$3' has an unsafe or empty value"; }
+re '^[a-z][a-z0-9_-]{1,31}$' "$ID" id
+re '^[a-z][a-z0-9_]{1,31}$' "$JUSER" macos_user
+re '^[A-Za-z0-9._/-]+$' "$ENTRY" entry
+re '^[A-Za-z0-9._-]+$' "$REF" ref
+re '^[0-9]{2,5}$' "$INTERVAL" interval_seconds
+re '^[A-Za-z0-9@:/._-]+$' "$REPO" repo
+case "$REPO" in *CHANGE-ME*) die "manifest repo is still a placeholder (CHANGE-ME)";; esac
+[ "$ENTRY" != "${ENTRY#/}" ] && die "entry must be relative"
+if [ -n "$SUBDIR" ]; then
+  re '^[A-Za-z0-9._/-]+$' "$SUBDIR" subdir
+  [ "$SUBDIR" != "${SUBDIR#/}" ] && die "subdir must be relative"
+  case "$SUBDIR" in *..*) die "subdir must not contain '..'";; esac
+fi
+case "$ENTRY" in *..*) die "entry must not contain '..'";; esac
+
+HOME_DIR="/Users/$JUSER"; REPO_DIR="$HOME_DIR/$ID"; WORK_DIR="$REPO_DIR${SUBDIR:+/$SUBDIR}"; DATA="$HOME_DIR/data"; ENVF="$HOME_DIR/.$ID-env"
+LABEL_ID="ventures.moonray.$ID-run"; PLIST="/Library/LaunchDaemons/$LABEL_ID.plist"
+MANIFEST_SHA="$(shasum -a 256 "$MANIFEST" | cut -d' ' -f1)"
+
+# ---- command runners ----
+# Every command that changes the system goes through run/priv/asjob so --dry-run prints instead of doing.
+run()  { if [ "$DRY" = 1 ]; then printf '   [dry-run] %s\n' "$*"; else "$@"; fi; }
+priv() { printf '   needs sudo: %s\n' "$*"; if [ "$DRY" = 1 ]; then return 0; fi; confirm "Run it?" || die "declined"; sudo "$@"; }
+# As the job user: start in its home (it cannot read the caller's cwd) and use absolute paths.
+asjob() { local c="cd '$HOME_DIR' && $1"; if [ "$DRY" = 1 ]; then printf '   [dry-run] as %s: %s\n' "$JUSER" "$1"; else sudo -H -u "$JUSER" /bin/sh -c "$c"; fi; }
+user_exists() { id "$JUSER" >/dev/null 2>&1; }
+
+say "Local job installer: $LABEL ($ID)"
+say "  manifest  $MANIFEST"
+say "  sha256    $MANIFEST_SHA   <- compare with the hash shown on the Curia Local jobs page"
+say "  macOS user $JUSER   repo $REPO @ $REF${SUBDIR:+  folder $SUBDIR}"
+[ "$DRY" = 1 ] && say "  DRY RUN: nothing will be changed."
+
+# ---- secret prompt: silent, by stdin, validated, length echoed ----
+valid_setting() { # a web address; prints reason on failure
+  local v="$1"
+  [[ "$v" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || { echo "not a web address (it must start with http:// or https:// and contain no spaces or quotes)"; return 1; }
+  return 0
+}
+valid_secret() { # prints reason on failure
+  local v="$1"
+  [ -n "$v" ] || { echo "empty"; return 1; }
+  [ "${#v}" -ge 20 ] || { echo "shorter than 20 characters (got ${#v})"; return 1; }
+  [[ "$v" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || { echo "contains characters a token never has (spaces, quotes, or shell symbols): this looks like a pasted command, not a token"; return 1; }
+  return 0
+}
+env_has() { sudo -H -u "$JUSER" /bin/sh -c "cd '$HOME_DIR' && [ -f '$ENVF' ] && grep -q '^$1=' '$ENVF'" 2>/dev/null; }
+collect_secrets() {
+  local pairs="" name src opt help val why
+  while IFS=$'\t' read -r name src opt help; do
+    [ -n "$name" ] || continue
+    if [ "$DRY" = 1 ]; then printf '   [dry-run] would prompt for %s (%s)%s\n' "$name" "$src" "$([ "$opt" = 1 ] && echo ', optional')"; continue; fi
+    if env_has "$name"; then
+      printf '   %s is already set. Replace it? [y/N] ' "$name"; read -r r
+      [ "$r" = y ] || [ "$r" = Y ] || continue
+    fi
+    say ""; say "   $name  ($src)"; [ -n "$help" ] && say "   $help"
+    while :; do
+      if [ "$src" = setting ]; then
+        printf '   Type it (this is an address, not a secret): '; IFS= read -r val
+        if why="$(valid_setting "$val")"; then say "   received $val"; pairs+="$name=$val"$'\n'; break; fi
+        say "   rejected: $why. Try again."; continue
+      fi
+      printf '   Paste it now (nothing will show)%s: ' "$([ "$opt" = 1 ] && echo ', or press Enter to skip')"
+      IFS= read -rs val; echo
+      if [ -z "$val" ] && [ "$opt" = 1 ]; then say "   skipped"; break; fi
+      if why="$(valid_secret "$val")"; then say "   received ${#val} characters"; pairs+="$name=$val"$'\n'; break; fi
+      say "   rejected: $why. Try again."
+    done
+  done < <(mfsecrets)
+  [ "$DRY" = 1 ] && return 0
+  [ -n "$pairs" ] || return 0
+  # Merge with the existing file (parsed, never sourced), single-quote every value, write 600 by rename.
+  local existing merged
+  existing="$(sudo -H -u "$JUSER" /bin/sh -c "cd '$HOME_DIR' && cat '$ENVF' 2>/dev/null" || true)"
+  merged="$(printf '%s\n%s' "$existing" "$pairs" | "$PY" -I -c '
+import sys,re
+d={}
+for line in sys.stdin.read().splitlines():
+    m=re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$",line)
+    if m:
+        v=m.group(2)
+        if len(v)>=2 and v[0]=="\x27" and v[-1]=="\x27": v=v[1:-1]
+        d[m.group(1)]=v
+for k,v in d.items(): print("%s=\x27%s\x27"%(k,v))')"
+  printf '%s\n' "$merged" | sudo -H -u "$JUSER" /bin/sh -c "cd '$HOME_DIR' && umask 077 && cat > '$ENVF.tmp' && mv '$ENVF.tmp' '$ENVF' && chmod 600 '$ENVF'" || die "could not write $ENVF"
+  ok "wrote $ENVF (mode 600): $(sudo -H -u "$JUSER" /bin/sh -c "wc -c < '$ENVF'" | tr -d ' ') bytes"
+}
+
+# ---- doctor: checks only ----
+FAILS=0
+chk() { if "$@" >/dev/null 2>&1; then ok "$CHK_DESC"; else bad "$CHK_DESC"; FAILS=$((FAILS+1)); fi; }
+doctor() {
+  say ""; say "Doctor: $LABEL (read-only)"
+  CHK_DESC="macOS user $JUSER exists"; chk user_exists
+  CHK_DESC="$JUSER is not an admin"; chk bash -c "! dseditgroup -o checkmember -m '$JUSER' admin 2>/dev/null | grep -q '^yes'"
+  CHK_DESC="home $HOME_DIR is mode 700"; chk bash -c "[ \"\$(stat -f %Lp '$HOME_DIR')\" = 700 ]"
+  CHK_DESC="env file $ENVF is mode 600"; chk sudo -H -u "$JUSER" /bin/sh -c "[ \"\$(stat -f %Lp '$ENVF')\" = 600 ]"
+  CHK_DESC="repo is checked out at $REF"; chk sudo -H -u "$JUSER" /bin/sh -c "cd '$REPO_DIR' && git describe --tags --exact-match 2>/dev/null | grep -qx '$REF'"
+  CHK_DESC="plist exists, owned by root, mode 644"; chk bash -c "[ \"\$(stat -f '%Su:%Lp' '$PLIST')\" = root:644 ]"
+  CHK_DESC="daemon is loaded in launchd"; chk sudo launchctl print "system/$LABEL_ID"
+  CHK_DESC="entry runs as $JUSER (as /bin/sh)"; chk sudo -H -u "$JUSER" /bin/sh -c "cd '$WORK_DIR' && [ -f '$ENTRY' ]"
+  if [ -n "$CHECK" ]; then
+    CHK_DESC="the job's own check reaches Curia with its token"
+    chk sudo -H -u "$JUSER" /bin/sh -c "cd '$WORK_DIR' && set -a && . '$ENVF' && set +a && $CHECK"
+  fi
+  [ "$FAILS" = 0 ] && say "All checks passed." || say "$FAILS check(s) failed. Re-run: ./setup-local-job install $ID"
+  return "$FAILS"
+}
+
+write_plist() {
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL_ID</string>
+  <key>UserName</key><string>$JUSER</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>set -a; . '$ENVF'; set +a; cd '$WORK_DIR'; exec /bin/sh '$ENTRY'</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>$INTERVAL</integer>
+  <key>StandardOutPath</key><string>$DATA/logs/launchd.out</string>
+  <key>StandardErrorPath</key><string>$DATA/logs/launchd.err</string>
+</dict></plist>
+PL
+  plutil -lint "$tmp" >/dev/null || die "generated plist is invalid"
+  echo "$tmp"
+}
+
+case "$CMD" in
+doctor) doctor; exit $? ;;
+uninstall)
+  step 1 "Stop and remove the daemon (data and the macOS user are kept)"
+  priv launchctl bootout "system/$LABEL_ID" || true
+  priv rm -f "$PLIST"
+  say "Done. $DATA and the user $JUSER are untouched; delete them by hand if you ever want to."; exit 0 ;;
+rotate-token)
+  step 1 "Replace the Curia token"
+  say "   First make a new token on the Curia Local jobs page (this revokes the old one)."
+  "$PY" -I -c 'import json,sys; print([s["name"] for s in json.load(open(sys.argv[1]))["secrets"] if s.get("source")=="curia"][0])' "$MANIFEST" >/dev/null || die "manifest has no curia-sourced secret"
+  collect_secrets; say "Run: ./setup-local-job doctor $ID"; exit 0 ;;
+esac
+
+# ================= install =================
+step 1 "Preflight"
+# A dry run only prints the plan, so it may run anywhere (CI is Linux); a real run needs macOS.
+if [ "$(uname)" != Darwin ]; then
+  [ "$DRY" = 1 ] && say "   warn: not macOS; showing the plan only" || die "this installer is for macOS"
+fi
+[ "$(id -u)" != 0 ] || [ "$DRY" = 1 ] || die "run as yourself, not root; it uses sudo only where needed"
+fdesetup status 2>/dev/null | grep -q 'On' && ok "FileVault is on" || say "   warn: FileVault does not look on. Job files are only as private as the disk."
+command -v git >/dev/null && ok "git present" || die "git missing (run: xcode-select --install)"
+[ -x "$PY" ] && ok "python3 present ($("$PY" -V 2>&1))" || die "/usr/bin/python3 missing"
+if [ "$(uname)" = Darwin ]; then
+  avail=$(df -g / | awk 'NR==2{print $4}'); [ "${avail:-0}" -ge 2 ] && ok "disk free: ${avail} GB" || die "less than 2 GB free"
+fi
+
+step 2 "Create the macOS user $JUSER (standard user, never admin)"
+if user_exists; then ok "already exists"; else
+  say "   You will be asked to choose a password for $JUSER. Store it in your password manager. Nobody logs in as this user; it only runs the job."
+  priv sysadminctl -addUser "$JUSER" -fullName "$LABEL" -password - -home "$HOME_DIR"
+  priv createhomedir -c -u "$JUSER"
+fi
+priv chmod 700 "$HOME_DIR"
+
+step 3 "Folders"
+priv mkdir -p "$DATA/inbox" "$DATA/state" "$DATA/out" "$DATA/logs"
+priv chown -R "$JUSER" "$DATA"; priv chmod -R 700 "$DATA"
+
+step 4 "Read-only deploy key for GitHub"
+if asjob "[ -f '$HOME_DIR/.ssh/id_ed25519.pub' ]" 2>/dev/null && [ "$DRY" = 0 ]; then ok "key exists"; else
+  asjob "mkdir -p .ssh && chmod 700 .ssh && ssh-keygen -t ed25519 -N '' -C '$ID deploy key' -f .ssh/id_ed25519 -q"
+fi
+if [ "$DRY" = 0 ]; then
+  say ""; say "   Add this PUBLIC key in GitHub: repo > Settings > Deploy keys > Add (leave 'Allow write access' OFF):"; say ""
+  asjob "cat .ssh/id_ed25519.pub"; say ""
+  asjob "ssh-keyscan -t ed25519 github.com >> .ssh/known_hosts 2>/dev/null"
+  until asjob "git ls-remote '$REPO' >/dev/null 2>&1"; do printf '   Cannot read the repo yet. Press Enter after adding the key (Ctrl-C to stop)... '; read -r _; done
+  ok "repo is readable with the deploy key"
+fi
+
+step 5 "Clone and pin to $REF"
+if [ "$DRY" = 0 ] && asjob "[ -d '$REPO_DIR/.git' ]" 2>/dev/null; then asjob "cd '$REPO_DIR' && git fetch --tags -q"; else asjob "git clone -q ${SUBDIR:+--no-checkout --filter=blob:none }'$REPO' '$REPO_DIR'"; fi
+# A job that lives inside a bigger repo gets only its own folder on disk (the rest of the repo is never checked out).
+[ -n "$SUBDIR" ] && asjob "cd '$REPO_DIR' && git sparse-checkout set --cone '$SUBDIR'"
+asjob "cd '$REPO_DIR' && git checkout -q 'tags/$REF' && git rev-parse HEAD"
+say "   Compare the commit above with the tag on GitHub."
+
+step 6 "Install dependencies, verify by importing, run the tests"
+while IFS= read -r c; do [ -n "$c" ] && asjob "cd '$WORK_DIR' && $c"; done < <(mfl install)
+while IFS= read -r m; do [ -n "$m" ] || continue; re '^[A-Za-z0-9_.]+$' "$m" import_check; asjob "cd '$WORK_DIR' && $PY -c 'import $m'" && { [ "$DRY" = 1 ] || ok "import $m"; }; done < <(mfl import_check)
+[ -n "$TESTCMD" ] && { asjob "cd '$WORK_DIR' && $TESTCMD" && { [ "$DRY" = 1 ] || ok "tests pass"; } || die "tests failed as $JUSER; fix before installing a daemon"; }
+
+step 7 "Secrets (silent prompts; values never shown or put on a command line)"
+collect_secrets
+
+step 8 "Dry run: the job's own check, end to end, with its token"
+if [ -n "$CHECK" ]; then
+  asjob "cd '$WORK_DIR' && set -a && . '$ENVF' && set +a && $CHECK" && { [ "$DRY" = 1 ] || ok "check passed"; } || die "check failed; the daemon is NOT installed. Fix, then re-run (it resumes)."
+fi
+
+step 9 "Install the daemon"
+if [ "$DRY" = 1 ]; then say "   [dry-run] would write $PLIST (root:wheel 644) and run: launchctl bootstrap system $PLIST"; else
+  tmp="$(write_plist)"
+  priv cp "$tmp" "$PLIST"; priv chown root:wheel "$PLIST"; priv chmod 644 "$PLIST"; rm -f "$tmp"
+  sudo launchctl print "system/$LABEL_ID" >/dev/null 2>&1 && priv launchctl bootout "system/$LABEL_ID"
+  priv launchctl bootstrap system "$PLIST"
+  sleep 5; say "   Last log lines (a loaded daemon is not proof it ran):"
+  asjob "tail -n 5 '$DATA/logs/launchd.out' '$DATA/logs/launchd.err' 2>/dev/null || true"
+fi
+
+step 10 "First check"
+if [ "$DRY" = 0 ] && [ -n "$CHECK" ]; then
+  n=0; until asjob "cd '$WORK_DIR' && set -a && . '$ENVF' && set +a && $CHECK" >/dev/null 2>&1 || [ $n -ge 12 ]; do n=$((n+1)); sleep 10; done
+  [ $n -lt 12 ] && ok "job reaches Curia" || bad "no successful check within 2 minutes; run: ./setup-local-job doctor $ID"
+  doctor || true
+fi
+say ""; say "Done. Open Curia > Settings > Local jobs to see $LABEL's status."
