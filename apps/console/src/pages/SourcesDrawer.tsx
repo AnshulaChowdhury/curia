@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api.js';
 import {
-  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, categoryLabel, farmAction, farmName, farmStatusText, orgLine, reviewReasonText, sourcesSummary,
-  type ApplyResult, type FarmMailbox, type ImportSourceRow, type OrganizationRow, type PreviewResult,
+  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, categoryLabel, exportAction, exportInProgress, exportStatusText, farmAction, farmName, farmStatusText, orgLine, reviewReasonText, sourcesSummary,
+  type ApplyResult, type ExportStatus, type FarmMailbox, type ImportSourceRow, type OrganizationRow, type PreviewResult,
 } from './sources-utils.js';
 
 // The Contacts page "Sources" drawer: every place the contact import reads people from, and whether it will.
@@ -22,6 +22,32 @@ export default function SourcesDrawer({ onClose }: Props) {
   const [farm, setFarm] = useState<FarmMailbox[] | null>(null);
   const [farmError, setFarmError] = useState<string | null>(null);
   const [orgs, setOrgs] = useState<OrganizationRow[] | null>(null);
+  const [exp, setExp] = useState<ExportStatus | null>(null);
+  const [expError, setExpError] = useState<string | null>(null);
+
+  async function loadExport() {
+    try {
+      const res = await apiFetch('/api/contacts/export/status');
+      if (!res.ok) { setExpError(`Could not load the Matrix export (HTTP ${res.status})`); return; }
+      setExp(await res.json() as ExportStatus);
+      setExpError(null);
+    } catch (err) {
+      setExpError('Could not load the Matrix export');
+      console.error('[SourcesDrawer] export status failed:', err);
+    }
+  }
+
+  async function requestExport() {
+    setExpError(null);
+    try {
+      const res = await apiFetch('/api/contacts/export/request', { method: 'POST' });
+      if (!res.ok) setExpError(await errorOf(res));
+    } catch (err) {
+      setExpError('Could not reach Curia');
+      console.error('[SourcesDrawer] export request failed:', err);
+    }
+    await loadExport();
+  }
 
   async function loadFarm() {
     try {
@@ -53,7 +79,14 @@ export default function SourcesDrawer({ onClose }: Props) {
     await loadFarm();
   }
 
-  useEffect(() => { void loadFarm(); }, []);
+  useEffect(() => { void loadFarm(); void loadExport(); }, []);
+  // While the Mac mini job is working on a request, refresh its progress every few seconds.
+  const exporting = exportInProgress(exp);
+  useEffect(() => {
+    if (!exporting) return;
+    const t = setInterval(() => void loadExport(), 5000);
+    return () => clearInterval(t);
+  }, [exporting]);
   // While a scan runs, refresh its counts every few seconds.
   const scanning = farm ? anyFarmRunning(farm) : false;
   useEffect(() => {
@@ -187,6 +220,24 @@ export default function SourcesDrawer({ onClose }: Props) {
               })}
             </ul>
             {farmError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: '8px 0 0' }}>{farmError}</p>}
+          </div>
+        )}
+
+        {exp && (
+          <div style={{ marginTop: 16 }}>
+            <strong style={{ fontSize: 13 }}>Matrix message activity</strong>
+            <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '4px 0 8px' }}>
+              A job on the Mac mini counts messages per chat partner (WhatsApp, Signal and the other bridges) and sends only the counts. No message text leaves the Mac.
+            </p>
+            <div style={{ border: '1px solid var(--app-border)', borderRadius: 6, padding: '8px 12px', fontSize: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+                <span style={{ color: 'var(--app-fg-muted)' }}>{exportStatusText(exp)}</span>
+                {exportAction(exp) && (
+                  <button className="btn btn-secondary btn-sm" onClick={() => void requestExport()}>{exportAction(exp)}</button>
+                )}
+              </div>
+            </div>
+            {expError && <p style={{ color: 'var(--app-destructive)', fontSize: 12, margin: '8px 0 0' }}>{expError}</p>}
           </div>
         )}
 
