@@ -68,6 +68,7 @@ import { KnowledgeGraphStore } from './memory/knowledge-graph.js';
 import { MemoryValidator } from './memory/validation.js';
 import { EntityMemory } from './memory/entity-memory.js';
 import { InboxTriageController } from './inbox-triage/controller.js';
+import { PgTriageProgressStore } from './inbox-triage/progress-store.js';
 import { PgTriageStore } from './inbox-triage/item-store.js';
 import { contactLookupFor } from './inbox-triage/contact-lookup.js';
 import { PgPreferenceStore } from './inbox-triage/preference-store.js';
@@ -3228,7 +3229,7 @@ async function main(): Promise<void> {
     logger,
     secrets: secretsService,
     items: triageItems,
-    timezone: config.timezone,
+    progress: new PgTriageProgressStore(pool),
     preferences: triagePreferences,
     unsubscribeEnforcer: new UnsubscribeEnforcer({
       logger,
