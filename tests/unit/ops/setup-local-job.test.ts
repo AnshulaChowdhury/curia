@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -57,5 +57,13 @@ describe('setup-local-job', () => {
     expect(r.stdout).toContain('folder jobs/contacts-export');
     expect(r.stdout).toContain('would prompt for MATRIX_ACCESS_TOKEN');
     expect(r.stdout).toContain('would prompt for MATRIX_HOMESERVER_URL (setting)');
+  });
+
+  it('every prompt in the secrets loop reads from the keyboard, not the loop\'s piped list', () => {
+    const src = readFileSync(SCRIPT, 'utf8');
+    const body = src.slice(src.indexOf('collect_secrets() {'), src.indexOf('# ---- doctor'));
+    const reads = body.split('\n').filter((l) => /\bread -r/.test(l) && !l.includes('IFS=$'));
+    expect(reads.length).toBeGreaterThanOrEqual(3);
+    for (const l of reads) expect(l).toContain('</dev/tty');
   });
 });

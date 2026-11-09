@@ -104,18 +104,18 @@ collect_secrets() {
     [ -n "$name" ] || continue
     if [ "$DRY" = 1 ]; then printf '   [dry-run] would prompt for %s (%s)%s\n' "$name" "$src" "$([ "$opt" = 1 ] && echo ', optional')"; continue; fi
     if env_has "$name"; then
-      printf '   %s is already set. Replace it? [y/N] ' "$name"; read -r r
+      printf '   %s is already set. Replace it? [y/N] ' "$name"; read -r r </dev/tty
       [ "$r" = y ] || [ "$r" = Y ] || continue
     fi
     say ""; say "   $name  ($src)"; [ -n "$help" ] && say "   $help"
     while :; do
       if [ "$src" = setting ]; then
-        printf '   Type it (this is an address, not a secret): '; IFS= read -r val
+        printf '   Type it (this is an address, not a secret): '; IFS= read -r val </dev/tty || die "no keyboard input (run this in a Terminal window)"
         if why="$(valid_setting "$val")"; then say "   received $val"; pairs+="$name=$val"$'\n'; break; fi
         say "   rejected: $why. Try again."; continue
       fi
       printf '   Paste it now (nothing will show)%s: ' "$([ "$opt" = 1 ] && echo ', or press Enter to skip')"
-      IFS= read -rs val; echo
+      IFS= read -rs val </dev/tty || die "no keyboard input (run this in a Terminal window)"; echo
       if [ -z "$val" ] && [ "$opt" = 1 ]; then say "   skipped"; break; fi
       if why="$(valid_secret "$val")"; then say "   received ${#val} characters"; pairs+="$name=$val"$'\n'; break; fi
       say "   rejected: $why. Try again."
