@@ -154,12 +154,25 @@ export class NylasMailbox implements MailboxReader {
       method: 'GET',
       headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/json' },
     });
-    // The status is enough to debug; the response body is never logged or surfaced.
+    // The response body is never logged or surfaced, with one exception: on a 429 only Nylas's own error type and
+    // message (a short sentence about the limit, no mail content) are kept, so we can tell whose limit was hit.
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get('retry-after'));
-      throw new MailboxRateLimitedError(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined);
+      throw new MailboxRateLimitedError(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined, await rateLimitDetail(res));
     }
     if (!res.ok) throw new NylasMailboxError(res.status, endpoint);
     return (await res.json()) as J;
+  }
+}
+
+/** "type: message" from a Nylas error body, cut to 200 characters; a note when the body is not the expected shape. */
+async function rateLimitDetail(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: { type?: unknown; message?: unknown; provider_error?: unknown } };
+    const e = body.error ?? {};
+    const text = [e.type, e.message].filter((x): x is string => typeof x === 'string').join(': ');
+    return (text || 'no error text in the 429 response').slice(0, 200);
+  } catch (err) {
+    return `429 response was not readable (${err instanceof Error ? err.name : 'unknown'})`;
   }
 }

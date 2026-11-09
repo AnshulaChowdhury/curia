@@ -116,7 +116,8 @@ function senderOf(message: InboxMessage): string {
 
 /** A mailbox read was refused because the provider is rate limiting us (HTTP 429). */
 export class MailboxRateLimitedError extends Error {
-  constructor(public readonly retryAfterSeconds: number | undefined) {
+  /** `detail` is the provider's own error type and message when it gave one (never message content), so a 429 can be diagnosed. */
+  constructor(public readonly retryAfterSeconds: number | undefined, public readonly detail?: string) {
     super('Mailbox provider is rate limiting requests');
     this.name = 'MailboxRateLimitedError';
   }

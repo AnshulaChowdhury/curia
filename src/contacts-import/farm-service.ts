@@ -59,6 +59,7 @@ export class MailboxFarmService {
         } catch (err) {
           if (err instanceof MailboxRateLimitedError && waits < MAX_RATE_LIMIT_WAITS) {
             waits += 1;
+            this.logger.info({ accountId, wait: waits, retryAfterSeconds: err.retryAfterSeconds ?? null, detail: err.detail ?? null }, 'contacts-farm: rate limited, waiting');
             await this.sleep(Math.min(err.retryAfterSeconds ?? 30, MAX_WAIT_SECONDS) * 1000);
             continue;
           }

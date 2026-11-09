@@ -14,6 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+- **Rate-limit diagnosis** — Nylas 429s now log the provider's error text, so we can see whose limit was hit.
 - **Matrix export job log** — the Mac mini job's status lines show in the Sources drawer (migration 127).
 - **Matrix export button** — request the Mac mini message-count run from the Sources drawer and watch its progress.
 - **Local-jobs installer** — guided Mac mini setup for background jobs; the first is the contacts export.

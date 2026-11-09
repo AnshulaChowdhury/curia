@@ -90,6 +90,19 @@ describe('NylasMailbox', () => {
     expect((err2 as MailboxRateLimitedError).retryAfterSeconds).toBeUndefined();
   });
 
+  it('keeps only the provider\'s error type and message from a 429, cut short, and survives an unreadable body', async () => {
+    const body = { request_id: 'r1', error: { type: 'provider_error', message: 'Quota exceeded for quota metric Queries per minute per user', provider_error: { secret: 'x' } } };
+    const limited = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response(JSON.stringify(body), { status: 429 }));
+    const err = await new NylasMailbox('key', 'g', limited as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);
+    expect((err as MailboxRateLimitedError).detail).toBe('provider_error: Quota exceeded for quota metric Queries per minute per user');
+    const long = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response(JSON.stringify({ error: { type: 't', message: 'x'.repeat(500) } }), { status: 429 }));
+    const err2 = await new NylasMailbox('key', 'g', long as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);
+    expect((err2 as MailboxRateLimitedError).detail!.length).toBe(200);
+    const junk = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => new Response('<html>busy</html>', { status: 429 }));
+    const err3 = await new NylasMailbox('key', 'g', junk as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);
+    expect((err3 as MailboxRateLimitedError).detail).toContain('not readable');
+  });
+
   it('throws with the status only on an error response', async () => {
     const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => jsonResponse({ error: 'bad key sk-123' }, 401));
     const err = await new NylasMailbox('key', 'g', fetchMock as unknown as typeof fetch).sentSince(0).catch((e: unknown) => e);
