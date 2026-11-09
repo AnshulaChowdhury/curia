@@ -2,7 +2,7 @@
   "id": "contacts",
   "label": "Contacts export (Matrix message counts)",
   "repo": "git@github.com:AnshulaChowdhury/curia.git",
-  "ref": "contacts-export-v0.1.0",
+  "ref": "contacts-export-v0.1.1",
   "subdir": "jobs/contacts-export",
   "macos_user": "contacts",
   "entry": "scripts/run.sh",
