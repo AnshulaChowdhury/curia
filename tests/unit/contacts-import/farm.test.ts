@@ -81,6 +81,18 @@ describe('MailboxFarmService', () => {
     expect((await store.getRun('moonray'))!.status).toBe('done');
   });
 
+  it('waits out a rate limit on the folder list, and pauses (never stays "running") when it keeps failing', async () => {
+    const { store, svc } = mk();
+    let calls = 0;
+    const flaky = { folderNames: async () => { if (calls++ < 2) throw new MailboxRateLimitedError(1); return new Map<string, string>(); }, scanPage: async (): Promise<ScanPage> => ({ messages: [msg('a@x.com', [ME], 10)] }) };
+    await svc.loop(target(flaky), await store.startRun('moonray', new Date(0), false));
+    expect((await store.getRun('moonray'))!.status).toBe('done');
+
+    const dead = { folderNames: async (): Promise<Map<string, string>> => { throw new MailboxRateLimitedError(1); }, scanPage: async (): Promise<ScanPage> => ({ messages: [] }) };
+    await svc.loop(target(dead), await store.startRun('moonray', new Date(0), false));
+    expect(await store.getRun('moonray')).toMatchObject({ status: 'paused', errorKind: 'rate_limited' });
+  });
+
   it('a failure stops the scan and a resume continues from the saved cursor without double counting', async () => {
     const { store, svc } = mk();
     const s1 = scanner([{ messages: [msg('a@x.com', [ME], 10)], nextCursor: 'c1' }, new Error('boom')]);

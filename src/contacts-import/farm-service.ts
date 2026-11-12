@@ -46,14 +46,35 @@ export class MailboxFarmService {
     return run;
   }
 
+  private async stop(accountId: string, err: unknown): Promise<void> {
+    const kind = err instanceof MailboxRateLimitedError ? 'rate_limited' : err instanceof Error ? err.name : 'unknown';
+    await this.store.finish(accountId, kind === 'rate_limited' ? 'paused' : 'failed', kind);
+    this.logger.warn({ accountId, kind }, 'contacts-farm: scan stopped; it can be resumed');
+  }
+
   /** Runs the scan to the end; exposed so tests can await it. */
   async loop(target: FarmTarget, run: FarmRun): Promise<void> {
     const { accountId } = target;
     try {
-      const ignored = ignoredFolderIds(await target.mailbox.folderNames());
       const after = Math.floor(Date.parse(run.windowStart) / 1000);
       let cursor = run.cursor ?? undefined;
       let waits = 0;
+      // The folder list is rate limited like any other call; waiting here (instead of throwing) keeps a fresh run from being left "running" at zero.
+      let ignored: ReturnType<typeof ignoredFolderIds> | undefined;
+      while (!ignored) {
+        try {
+          ignored = ignoredFolderIds(await target.mailbox.folderNames());
+        } catch (err) {
+          if (err instanceof MailboxRateLimitedError && waits < MAX_RATE_LIMIT_WAITS) {
+            waits += 1;
+            this.logger.info({ accountId, wait: waits, retryAfterSeconds: err.retryAfterSeconds ?? null, detail: err.detail ?? null }, 'contacts-farm: rate limited, waiting');
+            await this.sleep(Math.min(err.retryAfterSeconds ?? 30, MAX_WAIT_SECONDS) * 1000);
+            continue;
+          }
+          await this.stop(accountId, err);
+          return;
+        }
+      }
       for (;;) {
         let page;
         try {
@@ -65,9 +86,7 @@ export class MailboxFarmService {
             await this.sleep(Math.min(err.retryAfterSeconds ?? 30, MAX_WAIT_SECONDS) * 1000);
             continue;
           }
-          const kind = err instanceof MailboxRateLimitedError ? 'rate_limited' : err instanceof Error ? err.name : 'unknown';
-          await this.store.finish(accountId, kind === 'rate_limited' ? 'paused' : 'failed', kind);
-          this.logger.warn({ accountId, kind }, 'contacts-farm: scan stopped; it can be resumed');
+          await this.stop(accountId, err);
           return;
         }
         const deltas = [...reduceMessages(page.messages, target.address, ignored).values()];
