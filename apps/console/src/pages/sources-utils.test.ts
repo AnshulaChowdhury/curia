@@ -77,6 +77,8 @@ describe('mailbox scan text and actions', () => {
     expect(farmAction(farm({ status: 'failed' }))).toEqual({ label: 'Resume scan', resume: true });
     expect(farmAction(farm({ status: 'done' }))).toEqual({ label: 'Scan again', resume: false });
     expect(farmAction(farm({ status: 'running', running: true }))).toBeNull();
+    // saved as running but nothing is running it (a restart or crash left it): offer to resume
+    expect(farmAction(farm({ status: 'running', running: false }))).toEqual({ label: 'Resume scan', resume: true });
   });
   it('shows counts while running and when done', () => {
     expect(farmStatusText(farm({ status: 'running', running: true, messagesScanned: 12000, peopleFound: 340 }))).toBe('Scanning… 12,000 messages read, 340 people found.');

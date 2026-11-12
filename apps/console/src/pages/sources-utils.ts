@@ -143,6 +143,7 @@ export function farmStatusText(m: FarmMailbox): string {
   switch (m.status) {
     case 'not_started': return 'Not scanned yet. Reads the last ten years of mail and keeps only counts.';
     case 'done': return `Done. ${counts}.`;
+    case 'running': return `Interrupted (Curia restarted or the scan crashed). ${counts}. Resume to continue.`;
     case 'paused': return `Paused (the mail provider asked us to slow down). ${counts}. Resume to continue.`;
     case 'failed': return `Stopped by an error (${m.errorKind ?? 'unknown'}). ${counts}. Resume to continue.`;
     default: return counts;
@@ -154,6 +155,7 @@ export function farmAction(m: FarmMailbox): { label: string; resume: boolean } |
   if (!m.eligible || m.running) return null;
   switch (m.status) {
     case 'not_started': return { label: 'Scan last 10 years', resume: false };
+    case 'running': // saved as running but nothing is running it (a restart or crash): safe to pick up from the saved cursor
     case 'paused':
     case 'failed': return { label: 'Resume scan', resume: true };
     case 'done': return { label: 'Scan again', resume: false };
