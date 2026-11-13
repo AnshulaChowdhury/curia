@@ -106,11 +106,22 @@ describe('MailboxFarmService', () => {
     expect(facts.map((f) => [f.email, f.received]).sort()).toEqual([['a@x.com', 1], ['b@x.com', 1]]);
   });
 
-  it('a fresh start clears the old counts', async () => {
+  it('scanning again never deletes: it adds mail since the last scan to the existing counts', async () => {
     const { store, svc } = mk();
     await svc.loop(target(scanner([{ messages: [msg('a@x.com', [ME], 10)] }]).mailbox), await store.startRun('moonray', new Date(0), false));
-    await store.startRun('moonray', new Date(0), false);
-    expect(await store.countFacts('moonray')).toBe(0);
+    const first = (await store.getRun('moonray'))!;
+    const again = await store.startRun('moonray', new Date(0), false);
+    expect(await store.countFacts('moonray')).toBe(1);
+    expect(again).toMatchObject({ status: 'running', cursor: null, windowStart: first.startedAt, messagesScanned: 1 });
+    await svc.loop(target(scanner([{ messages: [msg('a@x.com', [ME], 30)] }]).mailbox), again);
+    expect((await store.facts('moonray', 10))[0]).toMatchObject({ received: 2 });
+  });
+
+  it('starting while a scan is unfinished resumes it, whatever was asked', async () => {
+    const { store, svc } = mk();
+    await svc.loop(target(scanner([{ messages: [msg('a@x.com', [ME], 10)], nextCursor: 'c1' }, new Error('boom')]).mailbox), await store.startRun('moonray', new Date(0), false));
+    expect(await store.startRun('moonray', new Date(0), false)).toMatchObject({ status: 'running', cursor: 'c1' });
+    expect(await store.countFacts('moonray')).toBe(1);
   });
 
   it('refuses a second scan of the same mailbox while one runs', async () => {

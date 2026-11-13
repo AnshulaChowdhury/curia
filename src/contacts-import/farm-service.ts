@@ -40,7 +40,7 @@ export class MailboxFarmService {
   async start(target: FarmTarget, opts: { resume: boolean }): Promise<FarmRun> {
     if (this.active.has(target.accountId)) throw new Error('already_running');
     const windowStart = new Date(this.now() - FARM_YEARS * 365.25 * 24 * 3600 * 1000);
-    const run = await this.store.startRun(target.accountId, windowStart, opts.resume);
+    const run = await this.store.startRun(target.accountId, windowStart, opts.resume); // never deletes: see FarmStore.startRun
     this.active.add(target.accountId);
     void this.loop(target, run).catch((err) => this.logger.error({ accountId: target.accountId, errorName: err instanceof Error ? err.name : 'unknown' }, 'contacts-farm: scan crashed'));
     return run;
