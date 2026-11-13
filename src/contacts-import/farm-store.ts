@@ -37,7 +37,11 @@ export interface FarmStore {
   /** Every mailbox's facts, for cross-mailbox grouping (organisations). */
   allFacts(limit: number): Promise<FarmFactRow[]>;
   getRun(accountId: string): Promise<FarmRun | null>;
-  /** Starts a fresh scan (clears that mailbox's old facts) or, with resume, keeps the cursor and counts. */
+  /**
+   * Starts a scan without ever deleting results. An unfinished scan continues from its saved cursor; a finished one
+   * starts again over only the mail that arrived since it began, and adds to the counts it already has; a mailbox
+   * never scanned gets the full window.
+   */
   startRun(accountId: string, windowStart: Date, resume: boolean): Promise<FarmRun>;
   /** Adds a page's counts and moves the cursor, atomically. */
   commitPage(accountId: string, cursor: string | null, messages: number, deltas: FarmDelta[]): Promise<void>;
@@ -56,16 +60,17 @@ export class InMemoryFarmStore implements FarmStore {
     return this.runs.get(accountId) ?? null;
   }
 
-  async startRun(accountId: string, windowStart: Date, resume: boolean): Promise<FarmRun> {
+  async startRun(accountId: string, windowStart: Date, _resume: boolean): Promise<FarmRun> {
     const old = this.runs.get(accountId);
     const now = new Date().toISOString();
-    if (resume && old && old.status !== 'done') {
+    if (old && old.status !== 'done') {
       const run = { ...old, status: 'running' as const, errorKind: null, updatedAt: now, finishedAt: null };
       this.runs.set(accountId, run);
       return run;
     }
-    for (const k of [...this.rows.keys()]) if (k.startsWith(`${accountId}\u0000`)) this.rows.delete(k);
-    const run: FarmRun = { accountId, status: 'running', windowStart: windowStart.toISOString(), cursor: null, messagesScanned: 0, pagesScanned: 0, errorKind: null, startedAt: now, updatedAt: now, finishedAt: null };
+    const run: FarmRun = old
+      ? { ...old, status: 'running', windowStart: old.startedAt, cursor: null, errorKind: null, startedAt: now, updatedAt: now, finishedAt: null }
+      : { accountId, status: 'running', windowStart: windowStart.toISOString(), cursor: null, messagesScanned: 0, pagesScanned: 0, errorKind: null, startedAt: now, updatedAt: now, finishedAt: null };
     this.runs.set(accountId, run);
     return run;
   }
@@ -124,31 +129,27 @@ export class PgFarmStore implements FarmStore {
     return r.rows[0] ? toRun(r.rows[0]) : null;
   }
 
-  async startRun(accountId: string, windowStart: Date, resume: boolean): Promise<FarmRun> {
+  async startRun(accountId: string, windowStart: Date, _resume: boolean): Promise<FarmRun> {
     const old = await this.getRun(accountId);
-    if (resume && old && old.status !== 'done') {
+    if (old && old.status !== 'done') {
       const r = await this.pool.query<RunRow>(
         `UPDATE contact_farm_runs SET status = 'running', error_kind = NULL, finished_at = NULL, updated_at = now()
          WHERE account_id = $1 RETURNING *`, [accountId]);
       return toRun(r.rows[0]!);
     }
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query('DELETE FROM contact_farm_facts WHERE account_id = $1', [accountId]);
-      const r = await client.query<RunRow>(
-        `INSERT INTO contact_farm_runs (account_id, status, window_start) VALUES ($1, 'running', $2)
-         ON CONFLICT (account_id) DO UPDATE SET status = 'running', window_start = EXCLUDED.window_start, cursor = NULL,
-           messages_scanned = 0, pages_scanned = 0, error_kind = NULL, started_at = now(), updated_at = now(), finished_at = NULL
-         RETURNING *`, [accountId, windowStart]);
-      await client.query('COMMIT');
+    if (old) {
+      // A finished scan: look only at mail since it began, keep every count already stored.
+      const r = await this.pool.query<RunRow>(
+        `UPDATE contact_farm_runs SET status = 'running', window_start = started_at, cursor = NULL, error_kind = NULL,
+           started_at = now(), updated_at = now(), finished_at = NULL
+         WHERE account_id = $1 RETURNING *`, [accountId]);
       return toRun(r.rows[0]!);
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
     }
+    const r = await this.pool.query<RunRow>(
+      `INSERT INTO contact_farm_runs (account_id, status, window_start) VALUES ($1, 'running', $2)
+       ON CONFLICT (account_id) DO UPDATE SET status = 'running', error_kind = NULL, updated_at = now(), finished_at = NULL
+       RETURNING *`, [accountId, windowStart]);
+    return toRun(r.rows[0]!);
   }
 
   async commitPage(accountId: string, cursor: string | null, messages: number, deltas: FarmDelta[]): Promise<void> {
