@@ -26,14 +26,17 @@ describeIf('contact farm store', () => {
     expect(await store.countFacts('moonray')).toBe(1);
   });
 
-  it('resume keeps the cursor and counts; a fresh start clears them', async () => {
+  it('an unfinished scan resumes with its cursor and counts; a finished one starts over only the newer mail and keeps every count', async () => {
     await store.startRun('moonray', new Date(0), false);
     await store.commitPage('moonray', 'c9', 3, [d('a@x.com')]);
     await store.finish('moonray', 'failed', 'Boom');
     expect(await store.startRun('moonray', new Date(0), true)).toMatchObject({ status: 'running', cursor: 'c9', errorKind: null, messagesScanned: 3 });
     expect(await store.countFacts('moonray')).toBe(1);
-    expect(await store.startRun('moonray', new Date(0), false)).toMatchObject({ cursor: null, messagesScanned: 0 });
-    expect(await store.countFacts('moonray')).toBe(0);
+    await store.finish('moonray', 'done');
+    const first = (await store.getRun('moonray'))!;
+    const again = await store.startRun('moonray', new Date(0), false);
+    expect(again).toMatchObject({ status: 'running', cursor: null, messagesScanned: 3, windowStart: first.startedAt });
+    expect(await store.countFacts('moonray')).toBe(1);
   });
 
   it('a page whose write fails changes nothing (counts and cursor move together)', async () => {

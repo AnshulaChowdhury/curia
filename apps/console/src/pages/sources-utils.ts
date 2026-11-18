@@ -158,7 +158,7 @@ export function farmAction(m: FarmMailbox): { label: string; resume: boolean } |
     case 'running': // saved as running but nothing is running it (a restart or crash): safe to pick up from the saved cursor
     case 'paused':
     case 'failed': return { label: 'Resume scan', resume: true };
-    case 'done': return { label: 'Scan again', resume: false };
+    case 'done': return { label: 'Scan for new mail', resume: false };
     default: return null;
   }
 }
