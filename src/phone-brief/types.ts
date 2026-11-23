@@ -19,9 +19,26 @@ export interface BriefItem {
   messageId?: string;
 }
 
+/** A newsletter sender the owner already unsubscribed from; shown as a list, never as a decision. */
+export interface BriefUnsubscribed {
+  /** Display name, or the address when there is none. */
+  from: string;
+  /** Mailbox id, as on /phone/inbox. */
+  account: string;
+  /** ISO-8601: when the owner first unsubscribed. The phone counts the days. */
+  since: string;
+  /** True while the sender mailed after the unsubscribe and has not been sent to Trash yet. */
+  stillSending: boolean;
+}
+
+export const MAX_UNSUBSCRIBED = 10;
+
 export interface BriefSection {
   id: BriefSectionId;
+  /** May be empty when the section carries only `unsubscribed`. */
   items: BriefItem[];
+  /** Newsletters section only: senders already unsubscribed from that mailed yesterday, newest first, at most 10. */
+  unsubscribed?: BriefUnsubscribed[];
 }
 
 /** What is stored for a day, and what the route returns apart from the Signal number. */
@@ -46,6 +63,8 @@ export interface BriefSource {
   id: BriefSectionId;
   /** Items for this section; throwing or returning [] simply leaves the section out. */
   items(ctx: BriefContext): Promise<BriefItem[]>;
+  /** Optional richer form of items(): also returns senders already unsubscribed from. The service prefers it when present. */
+  collect?(ctx: BriefContext): Promise<{ items: BriefItem[]; unsubscribed?: BriefUnsubscribed[] }>;
 }
 
 export interface BriefStore {

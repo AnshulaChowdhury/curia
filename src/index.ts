@@ -3253,6 +3253,7 @@ async function main(): Promise<void> {
     secrets: secretsService,
     summarizer: new InfraLlmSummarizer(infraLlmService.scoped({ toolName: 'phone-brief' })),
     logger,
+    unsubscribes: triageUnsubscribes,
   }));
   phoneBrief.registerSource(new UnsortedBriefSource(triageItems));
   const phoneBriefScheduler = new PhoneBriefScheduler(phoneBrief, logger, config.timezone);
