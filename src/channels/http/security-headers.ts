@@ -58,6 +58,28 @@ export const ANTFARM_CONTENT_SECURITY_POLICY = [
   "frame-ancestors 'none'",
 ].join('; ');
 
+/**
+ * CSP for the one page that opens Plaid Link (`/budget/connect-bank`, served as text/html).
+ *
+ * Plaid Link is a script Plaid serves from cdn.plaid.com that opens its own iframe and talks to Plaid's API, so this page
+ * (and only this page) also allows those origins. Everything else is the console policy: `default-src 'none'`, no inline
+ * script, no other third-party origin. The console is a single-page app and a CSP is fixed when a document loads, so the
+ * Budget page reaches this one with a full page load, not an in-app navigation.
+ */
+export const PLAID_LINK_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self' https://cdn.plaid.com",
+  "style-src 'self' https://fonts.googleapis.com",
+  "style-src-attr 'unsafe-inline'",
+  "font-src https://fonts.gstatic.com",
+  "img-src 'self'",
+  "connect-src 'self' https://*.plaid.com",
+  "frame-src https://cdn.plaid.com",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join('; ');
+
 function isHtmlResponse(reply: { getHeader(name: string): unknown }): boolean {
   const raw = reply.getHeader('content-type');
   const value = Array.isArray(raw) ? raw[0] : raw;
@@ -79,6 +101,12 @@ function isAntfarmRequest(url: string): boolean {
   // split always yields at least one element, so [0] is guaranteed present.
   const path = url.split('?', 1)[0]!;
   return path.startsWith('/antfarm/');
+}
+
+/** True only for the exact Plaid Link page; a prefix match would hand the relaxed policy to every page under it. */
+function isPlaidLinkRequest(url: string): boolean {
+  const path = url.split('?', 1)[0]!;
+  return path === '/budget/connect-bank' || path === '/budget/connect-bank/';
 }
 
 /**
@@ -108,7 +136,9 @@ export function registerSecurityHeaders(app: FastifyInstance): void {
     if (isHtmlResponse(reply)) {
       const csp = isAntfarmRequest(request.url)
         ? ANTFARM_CONTENT_SECURITY_POLICY
-        : CONSOLE_CONTENT_SECURITY_POLICY;
+        : isPlaidLinkRequest(request.url)
+          ? PLAID_LINK_CONTENT_SECURITY_POLICY
+          : CONSOLE_CONTENT_SECURITY_POLICY;
       reply.header('Content-Security-Policy', csp);
       reply.header('X-Frame-Options', 'DENY');
     }
