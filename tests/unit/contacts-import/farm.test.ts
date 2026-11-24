@@ -146,12 +146,13 @@ describe('mailbox eligibility and candidates', () => {
     expect(await resolveFarmTarget('moonray', [{ id: 'moonray', address: null, reader: null }], cats)).toEqual({ ok: false, reason: 'not_connected' });
   });
 
-  it('turns person facts into labelled candidates and leaves role addresses out', async () => {
+  it('imports only people you have written to, labelled, and leaves role addresses and one-way senders out', async () => {
     const store = new InMemoryFarmStore();
     await store.startRun('moonray', new Date(0), false);
     await store.commitPage('moonray', null, 3, [
       { email: 'dana@acme.com', domain: 'acme.com', name: 'Dana Smith', received: 2, sent: 1, copied: 0, first: 10, last: 20 },
-      { email: 'info@acme.com', domain: 'acme.com', received: 1, sent: 0, copied: 0, first: 10, last: 20 },
+      { email: 'info@acme.com', domain: 'acme.com', received: 1, sent: 1, copied: 0, first: 10, last: 20 },
+      { email: 'jane.k@rts.kijiji.ca', domain: 'rts.kijiji.ca', name: 'Jane K', received: 9, sent: 0, copied: 0, first: 10, last: 20 },
     ]);
     await store.finish('moonray', 'done');
     const r = await farmCollector('moonray', 'Moonray', 'WORK', store).collect();
