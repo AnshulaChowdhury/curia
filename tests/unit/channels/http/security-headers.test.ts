@@ -9,6 +9,7 @@ import {
   registerSecurityHeaders,
   CONSOLE_CONTENT_SECURITY_POLICY,
   ANTFARM_CONTENT_SECURITY_POLICY,
+  PLAID_LINK_CONTENT_SECURITY_POLICY,
 } from '../../../../src/channels/http/security-headers.js';
 
 let app: FastifyInstance | undefined;
@@ -30,6 +31,10 @@ async function build(): Promise<FastifyInstance> {
   // Register headers BEFORE routes/other hooks so the header is set even when a later
   // onRequest hook short-circuits the response (e.g. an auth 401).
   registerSecurityHeaders(instance);
+  // The budget pages: only /budget/connect-bank may load Plaid Link.
+  for (const url of ['/budget', '/budget/connect-bank', '/budget/connect-bank/', '/budget/connect-bank-evil', '/budget/connect-bank/x', '/budget-extra']) {
+    instance.get(url, async (_req, reply) => reply.type('text/html; charset=utf-8').send('<!doctype html><html><body>b</body></html>'));
+  }
   instance.get('/ok', async () => ({ ok: true }));
   instance.get('/html', async (_req, reply) => {
     return reply.type('text/html; charset=utf-8').send('<!doctype html><html><body>ok</body></html>');
@@ -195,5 +200,31 @@ describe('registerSecurityHeaders', () => {
     expect(ANTFARM_CONTENT_SECURITY_POLICY).toContain("script-src 'self'");
     expect(ANTFARM_CONTENT_SECURITY_POLICY).toContain("frame-ancestors 'none'");
     expect(ANTFARM_CONTENT_SECURITY_POLICY).toContain("img-src 'self' data: blob:");
+  });
+
+  it('serves the Plaid Link CSP on exactly /budget/connect-bank (with or without a slash or query)', async () => {
+    app = await build();
+    for (const url of ['/budget/connect-bank', '/budget/connect-bank/', '/budget/connect-bank?x=1']) {
+      const res = await app.inject({ method: 'GET', url });
+      expect(res.headers['content-security-policy'], url).toBe(PLAID_LINK_CONTENT_SECURITY_POLICY);
+    }
+  });
+
+  it('keeps the strict console CSP on every other budget path, including look-alikes', async () => {
+    app = await build();
+    for (const url of ['/budget', '/budget/connect-bank-evil', '/budget/connect-bank/x', '/budget-extra']) {
+      const res = await app.inject({ method: 'GET', url });
+      expect(res.headers['content-security-policy'], url).toBe(CONSOLE_CONTENT_SECURITY_POLICY);
+      expect(res.headers['content-security-policy'], url).not.toContain('plaid');
+    }
+  });
+
+  it('opens only Plaid origins on the Plaid page: no inline script, no wildcard source, no other host', () => {
+    expect(PLAID_LINK_CONTENT_SECURITY_POLICY).toContain("script-src 'self' https://cdn.plaid.com;");
+    expect(PLAID_LINK_CONTENT_SECURITY_POLICY).toContain("default-src 'none'");
+    expect(PLAID_LINK_CONTENT_SECURITY_POLICY).toContain("frame-ancestors 'none'");
+    expect(PLAID_LINK_CONTENT_SECURITY_POLICY).not.toMatch(/unsafe-inline'|unsafe-eval|script-src[^;]*\*/);
+    const hosts = PLAID_LINK_CONTENT_SECURITY_POLICY.match(/https:\/\/[^\s;]+/g)!.filter(h => !/plaid\.com$/.test(h) && !/fonts\.g/.test(h));
+    expect(hosts).toEqual([]);
   });
 });
