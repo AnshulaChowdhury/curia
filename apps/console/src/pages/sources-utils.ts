@@ -93,13 +93,16 @@ export function applyOutcomeText(r: ApplyResult): string {
 
 // ---- Cleanup of imported contacts you never wrote to (POST /api/contacts/import/cleanup/*) ----
 
-export interface CleanupPreview { total: number; sample: { name: string; identifier: string }[] }
+export interface CleanupPreview { total: number; sample: { name: string; identifier: string }[]; unfinished?: string[] }
 export interface CleanupResult { removed: number; kept: number }
 
 export function cleanupPrompt(p: CleanupPreview): string {
   return p.total === 0
     ? 'Nothing to clean up.'
-    : `Remove ${p.total.toLocaleString('en-US')} imported contact${p.total === 1 ? '' : 's'} you have never written to? Anyone you edited, labelled or wrote to is kept. This cannot be undone.`;
+    : `Remove ${p.total.toLocaleString('en-US')} imported contact${p.total === 1 ? '' : 's'} you have never written to? Anyone you edited, labelled or wrote to is kept. This cannot be undone.${
+      p.unfinished && p.unfinished.length > 0
+        ? ` Careful: the ${p.unfinished.map(farmName).join(' and ')} scan stopped before the end, so someone you did write to may be on this list.`
+        : ''}`;
 }
 
 export function cleanupOutcomeText(r: CleanupResult): string {
