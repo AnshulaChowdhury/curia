@@ -10,7 +10,8 @@ import { NYLAS_REGIONS, NylasMailboxError, type NylasRegion } from '../phone-inb
 import { NylasMessageReader } from '../phone-inbox/nylas-message.js';
 import { PHONE_INBOX_ACCOUNT_IDS } from '../phone-inbox/phone-inbox-service.js';
 import type { NewsletterSummarizer } from './summarizer.js';
-import { MAX_ITEMS_PER_SECTION, type BriefContext, type BriefItem, type BriefSource } from './types.js';
+import type { UnsubscribeRecord } from '../inbox-triage/unsubscribe-store.js';
+import { MAX_ITEMS_PER_SECTION, MAX_UNSUBSCRIBED, type BriefContext, type BriefItem, type BriefSource, type BriefUnsubscribed } from './types.js';
 
 const PER_MAILBOX_LIMIT = 20;
 
@@ -35,6 +36,8 @@ interface Found {
   id: string;
   threadId: string;
   from: string;
+  /** Lower-case sender address; '' when the message has none. */
+  address: string;
   subject: string;
   date: number;
 }
@@ -44,6 +47,8 @@ export interface NewsletterSourceDeps {
   summarizer: NewsletterSummarizer;
   logger: Logger;
   fetchImpl?: typeof fetch;
+  /** Senders the owner unsubscribed from. Their mail is listed apart instead of asking for a decision. Optional. */
+  unsubscribes?: { getMany(accountId: string, senderAddresses: string[]): Promise<Map<string, UnsubscribeRecord>> };
 }
 
 export class NewsletterBriefSource implements BriefSource {
@@ -52,6 +57,10 @@ export class NewsletterBriefSource implements BriefSource {
   constructor(private readonly deps: NewsletterSourceDeps) {}
 
   async items(ctx: BriefContext): Promise<BriefItem[]> {
+    return (await this.collect(ctx)).items;
+  }
+
+  async collect(ctx: BriefContext): Promise<{ items: BriefItem[]; unsubscribed: BriefUnsubscribed[] }> {
     const found: Found[] = [];
     for (const mailbox of await this.mailboxes()) {
       try {
@@ -63,14 +72,57 @@ export class NewsletterBriefSource implements BriefSource {
     }
     found.sort((a, b) => b.date - a.date);
 
+    const { unsubscribed, remaining } = await this.splitUnsubscribed(found);
     const items: BriefItem[] = [];
-    for (const message of found.slice(0, MAX_ITEMS_PER_SECTION)) {
+    for (const message of remaining.slice(0, MAX_ITEMS_PER_SECTION)) {
       items.push({
         from: message.from, subject: message.subject, text: await this.summary(message),
         account: message.mailbox.accountId, messageId: message.id,
       });
     }
-    return items;
+    return { items, unsubscribed };
+  }
+
+  /** Mail from senders the owner already unsubscribed from becomes one list entry per sender, not an item to decide on. */
+  private async splitUnsubscribed(found: Found[]): Promise<{ unsubscribed: BriefUnsubscribed[]; remaining: Found[] }> {
+    const store = this.deps.unsubscribes;
+    if (!store) return { unsubscribed: [], remaining: found };
+    const records = new Map<string, Map<string, UnsubscribeRecord>>();
+    for (const accountId of new Set(found.map((f) => f.mailbox.accountId))) {
+      const addresses = [...new Set(found.filter((f) => f.mailbox.accountId === accountId && f.address).map((f) => f.address))];
+      try {
+        records.set(accountId, await store.getMany(accountId, addresses));
+      } catch (err) {
+        // Without the records the mail is simply shown as before.
+        this.deps.logger.warn({ err, accountId }, 'phone-brief: could not read the unsubscribed senders');
+      }
+    }
+
+    const remaining: Found[] = [];
+    const bySender = new Map<string, BriefUnsubscribed & { latest: number }>();
+    for (const message of found) { // newest first
+      const record = message.address ? records.get(message.mailbox.accountId)?.get(message.address) : undefined;
+      if (!record) {
+        remaining.push(message);
+        continue;
+      }
+      const key = `${message.mailbox.accountId}:${message.address}`;
+      const mailedAfter = message.date * 1000 > record.firstUnsubscribedAt.getTime();
+      const seen = bySender.get(key);
+      if (seen) {
+        seen.stillSending = seen.stillSending || (mailedAfter && record.trashedAt === null);
+        continue;
+      }
+      bySender.set(key, {
+        from: message.from, account: message.mailbox.accountId, since: record.firstUnsubscribedAt.toISOString(),
+        stillSending: mailedAfter && record.trashedAt === null, latest: message.date,
+      });
+    }
+    const unsubscribed = [...bySender.values()]
+      .sort((a, b) => b.latest - a.latest)
+      .slice(0, MAX_UNSUBSCRIBED)
+      .map(({ from, account, since, stillSending }) => ({ from, account, since, stillSending }));
+    return { unsubscribed, remaining };
   }
 
   /** The mailboxes that have a Nylas grant. */
@@ -105,6 +157,7 @@ export class NewsletterBriefSource implements BriefSource {
           id: m.id,
           threadId: m.thread_id ?? '',
           from: m.from?.[0]?.name || m.from?.[0]?.email || '',
+          address: (m.from?.[0]?.email ?? '').trim().toLowerCase(),
           subject: m.subject ?? '',
           date: m.date ?? 0,
         });

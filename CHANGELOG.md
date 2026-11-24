@@ -14,8 +14,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
-- **Personal budgeting backend** — owner-only `/api/budget` routes for categories, monthly budgets, transactions, one server-computed summary and a rules YAML (migration 130).
-- **Budget specialist** — the Digital EA can ask a read-only `budget` agent how the owner is doing against their budgets; off until enabled (ADR-062).
+- **Brief: unsubscribed newsletters** — senders already unsubscribed from are listed apart with the first-unsubscribe date (migration 128).
 - **Rate-limit diagnosis** — Nylas 429s now log the provider's error text, so we can see whose limit was hit.
 - **Matrix export job log** — the Mac mini job's status lines show in the Sources drawer (migration 127).
 - **Matrix export button** — request the Mac mini message-count run from the Sources drawer and watch its progress.

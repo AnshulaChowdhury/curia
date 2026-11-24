@@ -6,7 +6,7 @@ import type { TriageCandidate } from '../../../src/inbox-triage/types.js';
 const DAY = 86_400_000;
 const T0 = Date.parse('2026-11-01T12:00:00Z');
 const at = (days: number) => new Date(T0 + days * DAY);
-const record = (over: Partial<UnsubscribeRecord> = {}): UnsubscribeRecord => ({ unsubscribedAt: at(0), attempts: 0, lastAttemptAt: null, trashedAt: null, ...over });
+const record = (over: Partial<UnsubscribeRecord> = {}): UnsubscribeRecord => ({ unsubscribedAt: at(0), firstUnsubscribedAt: at(0), attempts: 0, lastAttemptAt: null, trashedAt: null, ...over });
 
 describe('decide', () => {
   it('waits out the grace period after the unsubscribe', () => {

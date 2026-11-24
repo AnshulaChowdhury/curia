@@ -141,4 +141,22 @@ describe('PhoneBriefService', () => {
       { from: 'D', subject: 'odd id' },
     ]);
   });
+
+  it('keeps a newsletters section that has only unsubscribed senders, and cleans the list', async () => {
+    const { svc } = service();
+    svc.registerSource({
+      id: 'newsletters', items: async () => [],
+      collect: async () => ({
+        items: [],
+        unsubscribed: [
+          { from: 'Acme', account: 'moonray', since: '2026-10-01T00:00:00Z', stillSending: true },
+          { from: 'Nowhere', account: 'not-a-mailbox', since: '2026-10-01T00:00:00Z', stillSending: true },
+          { from: 'Bad date', account: 'moonray', since: 'yesterday-ish', stillSending: false },
+          { from: '', account: 'moonray', since: '2026-10-01T00:00:00Z', stillSending: false },
+        ],
+      }),
+    });
+    const brief = await svc.generate(NOW);
+    expect(brief.sections).toEqual([{ id: 'newsletters', items: [], unsubscribed: [{ from: 'Acme', account: 'moonray', since: '2026-10-01T00:00:00.000Z', stillSending: true }] }]);
+  });
 });
