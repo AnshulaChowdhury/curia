@@ -56,6 +56,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
+- **Signal strangers** — `unknown_sender: ignore`; unrecognised numbers get no reply and calls go unanswered.
 - **Contacts import** — imported people no longer get knowledge-graph nodes; a node is linked later, when a person is kept.
 - **MCP Skills page** — now points to the Tools page, where bundles such as books live.
 - **QuickBooks connection** — built once in `index.ts` and shared, since QuickBooks rotates refresh tokens on every use.

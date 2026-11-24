@@ -3,10 +3,10 @@
 // (#1672).
 //
 // Policy: unknown-caller admission follows `channels.signal.unknown_sender` in
-// channel-trust.yaml (currently `allow` — known contacts and unresolved
-// strangers are answered; a stranger is unknown-tier / liveTurn=false). Rejects
-// blocked contacts, uuid-only callers (no E.164), and — if the YAML is flipped
-// to `ignore` — unresolved numbers and resolved `tier: 'unknown'` contacts
+// channel-trust.yaml (currently `ignore` — only known contacts are answered; with
+// `allow` a stranger is answered as unknown-tier / liveTurn=false). Rejects
+// blocked contacts, uuid-only callers (no E.164), and — while the YAML is
+// `ignore` — unresolved numbers and resolved `tier: 'unknown'` contacts
 // (except automated), matching the dispatcher gate. Exactly one call is ever
 // active at a time; a second incoming call while one is active (or mid-accept)
 // is rejected as busy.

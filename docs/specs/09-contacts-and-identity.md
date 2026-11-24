@@ -361,7 +361,7 @@ Policy and channel trust are configured per channel in `config/channel-trust.yam
 channels:
   cli:    { trust: high,   unknown_sender: allow }
   web:    { trust: high,   unknown_sender: allow }   # short-circuited to the CEO contact
-  signal: { trust: high,   unknown_sender: allow }
+  signal: { trust: high,   unknown_sender: ignore }
   http:   { trust: medium, unknown_sender: ignore }
   email:  { trust: low,    unknown_sender: allow }
 ```
