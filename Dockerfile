@@ -107,7 +107,7 @@ RUN groupadd --system --gid 1001 curia \
 RUN mkdir -p /data/signal-cli /run/signal-cli \
  && chown curia:curia /data/signal-cli /run/signal-cli
 
-COPY docker/signal-cli-entrypoint.sh /usr/local/bin/signal-cli-entrypoint.sh
+COPY --chmod=0755 docker/signal-cli-entrypoint.sh /usr/local/bin/signal-cli-entrypoint.sh
 
 WORKDIR /app
 
