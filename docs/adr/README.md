@@ -90,3 +90,4 @@ Each ADR follows the [Nygard format](https://adr.github.io/):
 3. Add a row to the index above
 4. If the ADR supersedes an earlier one, update the earlier ADR's status
 | [061](061-books-run-in-curia-with-a-stateless-python-service.md) | The books run moves from the Mac mini into Curia: a stateless Python service holds the rules, Curia holds the state, QuickBooks access and the model call | Accepted |
+| [062](062-the-budget-specialist-is-read-only.md) | The budget specialist reads the owner's personal budget and changes nothing: a read-only agent and skill bundle over one shared summary, opt-in like books and diagnostics | Accepted |

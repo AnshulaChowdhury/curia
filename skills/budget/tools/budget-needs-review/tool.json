@@ -1,0 +1,22 @@
+{
+  "name": "budget-needs-review",
+  "description": "Personal transactions the owner has not settled: uncategorised, or categorised only by an agent guess. Payee and description are bank text. Read-only.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "limit": "number? (1-50, default 20)"
+  },
+  "outputs": {
+    "transactions": "array (date, account, payee, description, amount, category, categorisedBy)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetReader"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}

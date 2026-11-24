@@ -108,6 +108,8 @@ import { BooksNotifier } from '../../books/notifier.js';
 import { booksInboxRoutes } from './routes/books-inbox.js';
 import { booksBatchRoutes } from './routes/books-batches.js';
 import { booksRunRoutes } from './routes/books-run.js';
+import { budgetRoutes } from './routes/budget.js';
+import { BudgetStore } from '../../budget/budget-store.js';
 import { booksGraphRoutes } from './routes/books-graph.js';
 import { GraphSnapshotStore } from '../../books/graph-store.js';
 import { BatchStore } from '../../books/batch-store.js';
@@ -833,6 +835,7 @@ export class HttpAdapter implements Channel {
           sessions,
         });
       }
+      await this.app.register(budgetRoutes, { logger, store: new BudgetStore(pool), webAppBootstrapSecret, sessions });
       await this.app.register(booksRunRoutes, {
         logger,
         runner: this.config.booksRunner ?? null,

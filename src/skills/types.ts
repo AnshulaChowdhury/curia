@@ -287,6 +287,9 @@ export interface ToolContext {
    *  Read-only view of the bookkeeping state (QuickBooks balances, the review queue, uploads, the Mac mini's
    *  check-ins) for the books specialist (ADR-060). It has no method that changes anything. */
   booksReader?: import('../books/books-reader.js').BooksReader;
+  /** Budget read facade — available to skills declaring 'budgetReader' in capabilities.
+   *  Read-only view of the owner's personal budget for the budget specialist (ADR-062). It has no method that changes anything. */
+  budgetReader?: import('../budget/budget-reader.js').BudgetReader;
   /** Task repo — available to skills declaring 'taskRepo' in capabilities.
    *  Provides CRUD access to the tasks table and manages linked wake-up scheduled_jobs rows.
    *  Used by task-create, task-list, task-update, task-complete. */
