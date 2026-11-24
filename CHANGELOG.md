@@ -14,6 +14,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
+
+- **Migration numbering guard** — CI fails on a duplicate migration prefix, except the two applied 121 files.
 - **Signal in the image** — optional signal-cli daemon inside the container, off unless `SIGNAL_CLI_DAEMON=true`.
 - **Brief: unsubscribed newsletters** — senders already unsubscribed from are listed apart with the first-unsubscribe date (migration 128).
 - **Rate-limit diagnosis** — Nylas 429s now log the provider's error text, so we can see whose limit was hit.
