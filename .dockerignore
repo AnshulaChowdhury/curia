@@ -17,3 +17,5 @@ docker/*
 # Needed by the main Dockerfile's install steps (#1699) — without this exception
 # the COPY fails with "not found in build context" and every build breaks.
 !docker/pnpm-retry.sh
+# Image entrypoint (optional in-container signal-cli); COPY fails without this exception.
+!docker/signal-cli-entrypoint.sh
