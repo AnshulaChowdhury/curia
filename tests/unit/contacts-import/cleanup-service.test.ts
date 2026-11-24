@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { CleanupError, ImportCleanupService, type CleanupCandidate } from '../../../src/contacts-import/cleanup-service.js';
 import { createSilentLogger } from '../../../src/logger.js';
 
