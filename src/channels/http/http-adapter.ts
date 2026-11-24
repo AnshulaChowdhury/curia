@@ -949,11 +949,14 @@ export class HttpAdapter implements Channel {
             new PgCleanupStore(pool),
             this.config.contactService,
             async () => {
+              const state = { running: false, unfinished: [] as string[] };
               for (const box of mailboxes) {
                 const run = await farmStore.getRun(box.id);
-                if (run && (run.status !== 'done' || farmScans.isRunning(box.id))) return false;
+                if (!run) continue;
+                if (farmScans.isRunning(box.id)) state.running = true;
+                else if (run.status !== 'done') state.unfinished.push(box.id);
               }
-              return true;
+              return state;
             },
             logger,
           );

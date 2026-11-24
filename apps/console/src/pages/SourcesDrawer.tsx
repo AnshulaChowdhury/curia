@@ -359,7 +359,7 @@ export default function SourcesDrawer({ onClose }: Props) {
                 {busy === 'cprev' ? 'Checking…' : 'Preview cleanup'}
               </button>
               <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '6px 0 0' }}>
-                Finds imported contacts from mail you have never written to (newsletters, notifications). It changes nothing. Needs every mailbox scan to be finished.
+                Finds imported contacts from mail you have never written to (newsletters, notifications). It changes nothing. Works from the scans as they stand; it waits only while a scan is actively running.
               </p>
               {cleanupOutcome && <p style={{ fontSize: 13, margin: '8px 0 0' }}>{cleanupOutcome}</p>}
               {cleanup && (

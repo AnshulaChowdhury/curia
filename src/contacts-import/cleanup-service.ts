@@ -6,7 +6,8 @@
 //   - no scanned mailbox shows mail SENT to its address
 //   - tier is still `unknown`, it is a plain person/automated contact (not the principal, an agent or system)
 //   - one identity only (its email), no notes, role, title or organisation, and no work / personal decision
-// It never runs while a mailbox scan is unfinished: a person you did write to could still be missing from the counts.
+// It does not run while a scan is actively running (the counts are moving). A scan that stopped part-way is allowed, and
+// the preview says so: a person you wrote to whose mail the scan has not reached yet looks like a one-way sender.
 // Preview counts; Apply re-checks, and refuses if the count is no longer the one that was reviewed.
 
 import type { Pool } from 'pg';
@@ -49,38 +50,45 @@ export class PgCleanupStore implements CleanupStore {
 }
 
 export class CleanupError extends Error {
-  constructor(public readonly code: 'scans_unfinished' | 'count_changed', message: string) {
+  constructor(public readonly code: 'scans_running' | 'count_changed', message: string) {
     super(message);
     this.name = 'CleanupError';
   }
 }
 
-export interface CleanupPreview { total: number; sample: { name: string; identifier: string }[] }
+export interface CleanupPreview {
+  total: number;
+  sample: { name: string; identifier: string }[];
+  /** Mailboxes whose scan stopped before the end: their one-way senders may include people you did write to. */
+  unfinished: string[];
+}
+
+export interface ScanState { running: boolean; unfinished: string[] }
 export interface CleanupResult { removed: number; kept: number }
 
 export class ImportCleanupService {
   constructor(
     private readonly store: CleanupStore,
     private readonly contacts: { deleteContact(id: string): Promise<void> },
-    /** True only when every scanned mailbox has finished. */
-    private readonly scansFinished: () => Promise<boolean>,
+    private readonly scanState: () => Promise<ScanState>,
     private readonly logger: Logger,
   ) {}
 
-  private async candidates(): Promise<CleanupCandidate[]> {
-    if (!(await this.scansFinished())) {
-      throw new CleanupError('scans_unfinished', 'A mailbox scan is still running or unfinished. Let every scan finish first, so nobody you have written to is removed by mistake.');
+  private async candidates(): Promise<{ found: CleanupCandidate[]; unfinished: string[] }> {
+    const state = await this.scanState();
+    if (state.running) {
+      throw new CleanupError('scans_running', 'A mailbox scan is running right now, so the counts are still changing. Wait for it to stop, then try again.');
     }
-    return this.store.findOneWayImports(MAX_CLEANUP);
+    return { found: await this.store.findOneWayImports(MAX_CLEANUP), unfinished: state.unfinished };
   }
 
   async preview(): Promise<CleanupPreview> {
-    const found = await this.candidates();
-    return { total: found.length, sample: found.slice(0, 8).map((c) => ({ name: c.displayName, identifier: maskAddress(c.email) ?? '' })) };
+    const { found, unfinished } = await this.candidates();
+    return { total: found.length, sample: found.slice(0, 8).map((c) => ({ name: c.displayName, identifier: maskAddress(c.email) ?? '' })), unfinished };
   }
 
   async apply(expected: number): Promise<CleanupResult> {
-    const found = await this.candidates();
+    const { found } = await this.candidates();
     if (found.length !== expected) {
       throw new CleanupError('count_changed', `The list changed since the preview (${found.length} now, ${expected} then). Preview again.`);
     }
