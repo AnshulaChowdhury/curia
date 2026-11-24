@@ -158,8 +158,8 @@ export type ResolveSignalVoiceCallerResult =
  * Signal number and principal standing carries over from the text channel.
  *
  * Unknown-caller admission follows `channels.signal.unknown_sender` in
- * channel-trust.yaml (currently `allow` — a stranger is answered, stamped
- * unknown-tier / liveTurn=false). The ignore gate matches the dispatcher:
+ * channel-trust.yaml (currently `ignore` — only known contacts are answered; with
+ * `allow` a stranger would be answered, stamped unknown-tier / liveTurn=false). The ignore gate matches the dispatcher:
  * unresolved numbers *and* resolved `tier: 'unknown'` contacts (except
  * automated) are rejected when the YAML is `ignore`. A blocked-tier contact
  * is always denied. A null callerNumber (uuid-only, no stable identifier) is

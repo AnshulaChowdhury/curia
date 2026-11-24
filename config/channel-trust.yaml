@@ -21,7 +21,7 @@ channels:
   # stranger texts AND unanswered incoming calls (same dispatcher gate).
   signal:
     trust: high
-    unknown_sender: allow
+    unknown_sender: ignore
     threaded: false
   http:
     trust: medium

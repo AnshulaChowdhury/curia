@@ -314,7 +314,7 @@ describe('resolveSignalVoiceCaller (#1672)', () => {
     expect(contactResolver.resolve).toHaveBeenCalledWith('signal', '+15196161377');
   });
 
-  it('admits an unresolved stranger as unknown tier without liveTurn (signal unknown_sender: allow)', async () => {
+  it('admits an unresolved stranger as unknown tier without liveTurn (signal unknown_sender overridden to allow)', async () => {
     const contactResolver = {
       resolve: vi.fn().mockResolvedValue({
         resolved: false,
@@ -323,11 +323,15 @@ describe('resolveSignalVoiceCaller (#1672)', () => {
       }),
     } as unknown as ContactResolver;
 
-    expect(yamlPolicies.signal!.unknownSender).toBe('allow');
+    // The shipped YAML now ignores Signal strangers, so this pins the allow path explicitly.
+    const allowPolicies: Record<string, ChannelPolicyConfig> = {
+      ...yamlPolicies,
+      signal: { ...yamlPolicies.signal!, unknownSender: 'allow' },
+    };
     const result = await resolveSignalVoiceCaller({
       contactResolver,
       callerNumber: '+15550001111',
-      channelPolicies: yamlPolicies,
+      channelPolicies: allowPolicies,
       logger,
     });
 
