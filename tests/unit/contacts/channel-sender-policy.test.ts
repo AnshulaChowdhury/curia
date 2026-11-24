@@ -29,7 +29,7 @@ describe('unknownSenderPolicy', () => {
   it('reads voice and signal from channel-trust.yaml via loadAuthConfig', () => {
     const { channelPolicies } = loadAuthConfig(CONFIG_DIR);
     expect(unknownSenderPolicy(channelPolicies, 'voice')).toBe('ignore');
-    expect(unknownSenderPolicy(channelPolicies, 'signal')).toBe('allow');
+    expect(unknownSenderPolicy(channelPolicies, 'signal')).toBe('ignore');
   });
 
   it('is ignore only when that channel is explicitly ignore', () => {

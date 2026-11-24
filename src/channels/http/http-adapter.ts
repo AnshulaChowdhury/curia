@@ -82,6 +82,7 @@ import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
 import { contactsSourcesRoutes } from './routes/contacts-sources.js';
 import { BRIDGES, bridgeVaultKeys } from '../../contacts-import/bridges.js';
 import { contactsImportRunRoutes } from './routes/contacts-import-run.js';
+import { ImportCleanupService, PgCleanupStore } from '../../contacts-import/cleanup-service.js';
 import { ContactImportService } from '../../contacts-import/import-service.js';
 import { PgImportStore } from '../../contacts-import/import-store.js';
 import { PgRunStore } from '../../contacts-import/run-store.js';
@@ -108,6 +109,9 @@ import { BooksNotifier } from '../../books/notifier.js';
 import { booksInboxRoutes } from './routes/books-inbox.js';
 import { booksBatchRoutes } from './routes/books-batches.js';
 import { booksRunRoutes } from './routes/books-run.js';
+import { budgetRoutes } from './routes/budget.js';
+import { budgetBanksRoutes } from './routes/budget-banks.js';
+import { BudgetStore } from '../../budget/budget-store.js';
 import { booksGraphRoutes } from './routes/books-graph.js';
 import { GraphSnapshotStore } from '../../books/graph-store.js';
 import { BatchStore } from '../../books/batch-store.js';
@@ -190,6 +194,8 @@ export interface HttpAdapterConfig {
   booksMonitor?: import('../../books/monitor.js').BooksMonitor;
   /** Runs the books pipeline in Curia (POST /api/books/run); absent when the books service is not configured. */
   booksRunner?: import('../../books/books-runner.js').BooksRunner;
+  /** Plaid bank links for the personal budget; absent when the vault is not available. */
+  budgetBanks?: { sync: import('../../budget/bank-sync.js').BankSync; plaid: import('../../budget/plaid-client.js').PlaidClient };
   /** Backs the public /api/secret-capture/* routes (one-time tokenized secret capture, #971).
    *  Token-authed, so mounted independently of the bootstrap secret. */
   secretCaptureService?: import('../../secrets/secret-capture-service.js').SecretCaptureService;
@@ -833,6 +839,10 @@ export class HttpAdapter implements Channel {
           sessions,
         });
       }
+      await this.app.register(budgetRoutes, { logger, store: new BudgetStore(pool), webAppBootstrapSecret, sessions });
+      if (this.config.budgetBanks) {
+        await this.app.register(budgetBanksRoutes, { logger, ...this.config.budgetBanks, webAppBootstrapSecret, sessions });
+      }
       await this.app.register(booksRunRoutes, {
         logger,
         runner: this.config.booksRunner ?? null,
@@ -936,6 +946,23 @@ export class HttpAdapter implements Channel {
             new ContactImportService(this.config.contactService, new PgImportStore(pool), logger),
             new PgRunStore(pool),
             collectors,
+            logger,
+          );
+        },
+        getCleanup: async () => {
+          const mailboxes = await loadPhoneInboxAccounts(sourcesSecrets);
+          return new ImportCleanupService(
+            new PgCleanupStore(pool),
+            this.config.contactService,
+            async () => {
+              const state = { running: false, unfinished: [] as string[] };
+              for (const box of mailboxes) {
+                const run = await farmStore.getRun(box.id);
+                if (run && farmScans.isRunning(box.id)) state.running = true;
+                else if (!run || run.status !== 'done') state.unfinished.push(box.id);
+              }
+              return state;
+            },
             logger,
           );
         },

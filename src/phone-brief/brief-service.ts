@@ -11,11 +11,13 @@ import {
   BRIEF_SECTION_IDS,
   MAX_ITEMS_PER_SECTION,
   MAX_ITEM_TEXT,
+  MAX_UNSUBSCRIBED,
   type Brief,
   type BriefContext,
   type BriefItem,
   type BriefSection,
   type BriefSource,
+  type BriefUnsubscribed,
   type BriefStore,
 } from './types.js';
 
@@ -47,6 +49,18 @@ function cleanItem(item: BriefItem): BriefItem | null {
   }
   // An item needs something to show.
   return out.text || out.subject ? out : null;
+}
+
+function cleanUnsubscribed(list: BriefUnsubscribed[] | undefined): BriefUnsubscribed[] {
+  const out: BriefUnsubscribed[] = [];
+  for (const u of list ?? []) {
+    const from = cleanText(u.from ?? '', 120);
+    if (!from || !(PHONE_INBOX_ACCOUNT_IDS as readonly string[]).includes(u.account)) continue;
+    const since = new Date(u.since);
+    if (Number.isNaN(since.getTime())) continue;
+    out.push({ from, account: u.account, since: since.toISOString(), stillSending: u.stillSending === true });
+  }
+  return out.slice(0, MAX_UNSUBSCRIBED);
 }
 
 export class PhoneBriefService {
@@ -88,11 +102,15 @@ export class PhoneBriefService {
       const source = this.sources.find((s) => s.id === id);
       if (!source) continue;
       try {
-        const items = (await source.items(ctx))
+        const gathered = source.collect ? await source.collect(ctx) : { items: await source.items(ctx) };
+        const items = gathered.items
           .map(cleanItem)
           .filter((i): i is BriefItem => i !== null)
           .slice(0, MAX_ITEMS_PER_SECTION);
-        if (items.length > 0) sections.push({ id, items });
+        const unsubscribed = cleanUnsubscribed(gathered.unsubscribed);
+        if (items.length > 0 || unsubscribed.length > 0) {
+          sections.push({ id, items, ...(unsubscribed.length > 0 ? { unsubscribed } : {}) });
+        }
       } catch (err) {
         // One section failing must not cost the others.
         this.logger.warn({ err, section: id }, 'phone-brief: a section failed and was left out');

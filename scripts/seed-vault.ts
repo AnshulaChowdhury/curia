@@ -43,6 +43,10 @@ export const SEED_SECRET_NAMES = [
   // phone launcher inbox (GET /phone/inbox and GET /phone/message): one read-only token for both, plus a grant and address per mailbox
   'nylas_region',
   'phone_inbox_token',
+  // Plaid bank feeds for the personal budget (plaid_env is "sandbox" or "production")
+  'plaid_client_id',
+  'plaid_secret',
+  'plaid_env',
   'phone_inbox_grant_personal',
   'phone_inbox_grant_moonray',
   'phone_inbox_grant_work_outlook',

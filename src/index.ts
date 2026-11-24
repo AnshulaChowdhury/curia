@@ -269,7 +269,11 @@ import { DriveInbox } from './books/drive-inbox.js';
 import { BooksToken } from './quickbooks/books-token.js';
 import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.js';
 import { BooksReader } from './books/books-reader.js';
+import { BudgetReader } from './budget/budget-reader.js';
+import { BudgetStore } from './budget/budget-store.js';
 import { BooksRunner } from './books/books-runner.js';
+import { BankSync, BankSyncRunner } from './budget/bank-sync.js';
+import { PlaidClient, plaidCredentialsFrom } from './budget/plaid-client.js';
 import { booksServiceFromEnv } from './books/books-service-client.js';
 import { PipelineStateStore } from './books/pipeline-state-store.js';
 import { BatchStore } from './books/batch-store.js';
@@ -1689,6 +1693,9 @@ async function main(): Promise<void> {
     logger,
   });
 
+  // The budget specialist's read-only view of the owner's personal budget (ADR-062).
+  const budgetReader = new BudgetReader(new BudgetStore(pool));
+
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
   // #2322: parked agendas and the post-call pipeline share this store.
@@ -2661,7 +2668,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, budgetReader, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
@@ -3253,6 +3260,7 @@ async function main(): Promise<void> {
     secrets: secretsService,
     summarizer: new InfraLlmSummarizer(infraLlmService.scoped({ toolName: 'phone-brief' })),
     logger,
+    unsubscribes: triageUnsubscribes,
   }));
   phoneBrief.registerSource(new UnsortedBriefSource(triageItems));
   const phoneBriefScheduler = new PhoneBriefScheduler(phoneBrief, logger, config.timezone);
@@ -3288,6 +3296,12 @@ async function main(): Promise<void> {
       })
     : undefined;
   booksRunner?.start();
+
+  // Bank feeds for the personal budget (Plaid). Idle until plaid_client_id and plaid_secret are in the vault.
+  const plaidClient = new PlaidClient({ credentials: () => plaidCredentialsFrom(secretsService) });
+  const bankSync = new BankSync({ pool, plaid: plaidClient, secrets: secretsService, budget: new BudgetStore(pool), logger });
+  const bankSyncRunner = new BankSyncRunner(bankSync, plaidClient, logger);
+  bankSyncRunner.start();
 
   // Reaction → approval mapper (#1479): channel-agnostic inbound.reaction handling.
   // Registered after ExecutionLayer so approve can re-invoke the blocked skill.
@@ -3529,6 +3543,7 @@ async function main(): Promise<void> {
     phoneBrief,
     booksMonitor,
     booksRunner,
+    budgetBanks: { sync: bankSync, plaid: plaidClient },
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
@@ -3577,6 +3592,7 @@ async function main(): Promise<void> {
     phoneBriefScheduler.stop();
     booksMonitor.stop();
     booksRunner?.stop();
+    bankSyncRunner.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace
     // before Signal, Slack, and the pool close (#2254).

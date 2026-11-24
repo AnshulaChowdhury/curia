@@ -14,7 +14,12 @@ bus event types) are noted explicitly even in the `0.x` range.
 ## [Unreleased]
 
 ### Added
-- **Personal budget (console)** — Overview and Budgets on sample data, plus Import: bank file upload and Plaid bank connections. Plan in docs/wip.
+
+- **Budget bank-file import** — upload RBC, Tangerine, CIBC or .qbo/.ofx files into budget transactions, duplicates skipped.
+- **Budget bank feeds (Plaid)** — connect banks, sync every six hours, tokens stay in the vault (ADR-063, migration 131).
+- **Migration numbering guard** — CI fails on a duplicate migration prefix, except the two applied 121 files.
+- **Signal in the image** — optional signal-cli daemon inside the container, off unless `SIGNAL_CLI_DAEMON=true`.
+- **Brief: unsubscribed newsletters** — senders already unsubscribed from are listed apart with the first-unsubscribe date (migration 128).
 - **Rate-limit diagnosis** — Nylas 429s now log the provider's error text, so we can see whose limit was hit.
 - **Matrix export job log** — the Mac mini job's status lines show in the Sources drawer (migration 127).
 - **Matrix export button** — request the Mac mini message-count run from the Sources drawer and watch its progress.
@@ -55,6 +60,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Contacts import token** — API connections page makes a one-time token for the Mac mini.
 
 ### Changed
+- **Signal strangers** — `unknown_sender: ignore`; unrecognised numbers get no reply and calls go unanswered.
+- **Signal volume ownership** — the container starts as root, hands the signal-cli volume to curia, then runs as curia.
 - **Contacts import** — imported people no longer get knowledge-graph nodes; a node is linked later, when a person is kept.
 - **MCP Skills page** — now points to the Tools page, where bundles such as books live.
 - **QuickBooks connection** — built once in `index.ts` and shared, since QuickBooks rotates refresh tokens on every use.
@@ -305,6 +312,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 - **Saved drafts** — `send-draft` checks drafts for PII; unallowed details hold, or refuse unless principal-directed. (#2312)
 
 ### Fixed
+- **Image build** — signal-cli step failed on missing CA certificates and an ignored entrypoint file.
 - **Mailbox scan** — reads 20 messages a page with a pause between pages, as Nylas's 429 advises.
 - **Local-jobs installer** — secret prompts now read from the keyboard instead of looping on empty input.
 - **Inbox triage start point** — resumes from each mailbox's last successful triage, not a fixed date (migration 126).

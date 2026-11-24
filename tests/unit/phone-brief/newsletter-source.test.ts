@@ -112,4 +112,50 @@ describe('NewsletterBriefSource', () => {
     const methods = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.map(([, init]) => (init as RequestInit).method);
     expect(new Set(methods)).toEqual(new Set(['GET']));
   });
+
+  describe('senders already unsubscribed from', () => {
+    const record = (first: string, trashedAt: Date | null = null) => ({
+      unsubscribedAt: new Date(first), firstUnsubscribedAt: new Date(first), attempts: 0, lastAttemptAt: null, trashedAt,
+    });
+    const run = async (known: Record<string, ReturnType<typeof record>>, mails: Mail[]) => {
+      const { fetchImpl } = nylas({ 'g-moonray': { folders: [{ id: 'N1', name: 'Newsletter' }], mail: mails } });
+      const getMany = vi.fn(async (_account: string, addresses: string[]) => new Map(addresses.filter((a) => known[a]).map((a) => [a, known[a]!] as const)));
+      const s = summarizer();
+      const out = await new NewsletterBriefSource({ secrets: vault(), summarizer: s, logger, fetchImpl, unsubscribes: { getMany } }).collect(CTX);
+      return { out, getMany, s };
+    };
+
+    it('lists them apart, with no summary and no item to decide on', async () => {
+      const { out, s } = await run({ 'a@x.com': record('1970-01-01T00:00:00Z') }, [mail('a', 500), mail('b', 400)]);
+      expect(out.items.map((i) => i.messageId)).toEqual(['b']);
+      expect(out.unsubscribed).toEqual([{ from: 'Sender a', account: 'moonray', since: '1970-01-01T00:00:00.000Z', stillSending: true }]);
+      expect(s.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it('says stillSending false once the sender was trashed, or when the mail came before the unsubscribe', async () => {
+      const trashed = await run({ 'a@x.com': record('1970-01-01T00:00:00Z', new Date('1970-01-02T00:00:00Z')) }, [mail('a', 500)]);
+      expect(trashed.out.unsubscribed[0]!.stillSending).toBe(false);
+      const early = await run({ 'a@x.com': record('2026-11-01T00:00:00Z') }, [mail('a', 500)]);
+      expect(early.out.unsubscribed[0]!.stillSending).toBe(false);
+    });
+
+    it('lists a sender once however many times it mailed, newest sender first, at most 10', async () => {
+      const known: Record<string, ReturnType<typeof record>> = {};
+      const mails: Mail[] = [];
+      for (let i = 0; i < 12; i += 1) { known[`s${i}@x.com`] = record('1970-01-01T00:00:00Z'); mails.push(mail(`s${i}`, 100 + i)); }
+      mails.push(mail('s0b', 999, { from: [{ name: 'Sender s0', email: 'S0@X.com' }] }));
+      const { out } = await run(known, mails);
+      expect(out.unsubscribed).toHaveLength(10);
+      expect(out.unsubscribed[0]!.from).toBe('Sender s0');
+      expect(out.unsubscribed.filter((u) => u.from === 'Sender s0')).toHaveLength(1);
+    });
+
+    it('shows the mail as before when the records cannot be read', async () => {
+      const { fetchImpl } = nylas({ 'g-moonray': { folders: [{ id: 'N1', name: 'Newsletter' }], mail: [mail('a', 500)] } });
+      const getMany = vi.fn(async () => { throw new Error('db down'); });
+      const out = await new NewsletterBriefSource({ secrets: vault(), summarizer: summarizer(), logger, fetchImpl, unsubscribes: { getMany } }).collect(CTX);
+      expect(out.items).toHaveLength(1);
+      expect(out.unsubscribed).toEqual([]);
+    });
+  });
 });

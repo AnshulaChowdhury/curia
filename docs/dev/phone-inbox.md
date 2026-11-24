@@ -43,7 +43,11 @@ day's brief.
   one-to-two sentence summary written by the fast model from the email's text (the only place email text leaves Curia for the
   brief; no tools, links and markdown stripped). If the summary fails the item has sender and subject only. Each newsletter item also
   carries `account` (same ids as `/phone/inbox`) and `messageId` (the one `POST /phone/unsubscribe` takes) so the phone can offer
-  Unsubscribe; both or neither, and a brief built before this change has neither.
+  Unsubscribe; both or neither, and a brief built before this change has neither. Mail from a sender the owner already unsubscribed
+  from (a row in `inbox_unsubscribes`) is not an item: the section gets an optional `unsubscribed` list instead, one entry per
+  sender that mailed yesterday, newest first, at most 10: `{ from, account, since, stillSending }`. `since` is the ISO time of the
+  first unsubscribe (migration 128 keeps it when the owner unsubscribes again; the phone counts the days). `stillSending` is true
+  when the sender mailed after that and has not been sent to Trash. The section can have an empty `items` and only `unsubscribed`.
 - **Unsorted:** mail triage could not sort (the classifier said `none`, the call failed, or the label could not be written), one
   item per email with sender, subject and why. Not limited to yesterday: it lists everything still waiting, until the owner sorts it.
 - **Other sections** are supplied by their owners: `PhoneBriefService.registerSource({ id, items(ctx) })` with `ctx.yesterday`

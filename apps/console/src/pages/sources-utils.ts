@@ -91,6 +91,25 @@ export function applyOutcomeText(r: ApplyResult): string {
   return t.failed > 0 ? `${base}. ${t.failed} could not be saved; run the preview again to retry.` : `${base}.`;
 }
 
+// ---- Cleanup of imported contacts you never wrote to (POST /api/contacts/import/cleanup/*) ----
+
+export interface CleanupPreview { total: number; sample: { name: string; identifier: string }[]; unfinished?: string[]; held?: number }
+export interface CleanupResult { removed: number; kept: number }
+
+export function cleanupPrompt(p: CleanupPreview): string {
+  return p.total === 0
+    ? 'Nothing to clean up.'
+    : `Remove ${p.total.toLocaleString('en-US')} imported contact${p.total === 1 ? '' : 's'} you have never written to? Anyone you edited, labelled or wrote to is kept. This cannot be undone.${
+      p.held && p.held > 0
+        ? ` ${p.held.toLocaleString('en-US')} more look like real people and are kept until the ${(p.unfinished ?? []).map(farmName).join(' and ') || 'mailbox'} scan finishes, because you may have written to them.`
+        : ''}`;
+}
+
+export function cleanupOutcomeText(r: CleanupResult): string {
+  const base = `Removed ${r.removed.toLocaleString('en-US')}`;
+  return r.kept > 0 ? `${base}. ${r.kept} were kept because something still refers to them.` : `${base}.`;
+}
+
 // ---- Organisations found in scanned mail (GET /api/contacts/import/organizations) ----
 
 export interface OrganizationRow {

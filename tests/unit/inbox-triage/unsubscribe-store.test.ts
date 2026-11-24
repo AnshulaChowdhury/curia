@@ -18,9 +18,27 @@ describe('PgUnsubscribeStore', () => {
 
   it('reads a record back, or null', async () => {
     const at = new Date('2026-11-01T00:00:00Z');
-    const row = { unsubscribed_at: at, attempts: 2, last_attempt_at: at, trashed_at: null };
-    expect(await pool([row]).store.get('moonray', 'a@x.com')).toEqual({ unsubscribedAt: at, attempts: 2, lastAttemptAt: at, trashedAt: null });
+    const first = new Date('2026-10-01T00:00:00Z');
+    const row = { unsubscribed_at: at, first_unsubscribed_at: first, attempts: 2, last_attempt_at: at, trashed_at: null };
+    expect(await pool([row]).store.get('moonray', 'a@x.com')).toEqual({ unsubscribedAt: at, firstUnsubscribedAt: first, attempts: 2, lastAttemptAt: at, trashedAt: null });
     expect(await pool([]).store.get('moonray', 'a@x.com')).toBeNull();
+  });
+
+  it('keeps the first unsubscribe date when the owner unsubscribes again', async () => {
+    const { store, query } = pool();
+    await store.record('moonray', 'news@x.com');
+    expect(args(query)[0]).not.toMatch(/first_unsubscribed_at/);
+  });
+
+  it('reads several senders at once, keyed by address, and skips the query for none', async () => {
+    const at = new Date('2026-11-01T00:00:00Z');
+    const row = { sender_address: 'a@x.com', unsubscribed_at: at, first_unsubscribed_at: at, attempts: 0, last_attempt_at: null, trashed_at: null };
+    const { store, query } = pool([row]);
+    const found = await store.getMany('moonray', ['a@x.com', 'b@x.com']);
+    expect([...found.keys()]).toEqual(['a@x.com']);
+    expect(args(query)[1]).toEqual(['moonray', ['a@x.com', 'b@x.com']]);
+    expect((await store.getMany('moonray', [])).size).toBe(0);
+    expect(query).toHaveBeenCalledTimes(1);
   });
 
   it('counts a try only if the count is still what the caller saw, and never past three or once trashed', async () => {

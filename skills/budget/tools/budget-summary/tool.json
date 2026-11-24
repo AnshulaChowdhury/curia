@@ -1,0 +1,26 @@
+{
+  "name": "budget-summary",
+  "description": "The owner's personal budget for one month: for each category what was budgeted, spent and remaining (in Canadian dollars), whether it is under, near or over, the totals, and how many transactions need the owner. Defaults to the current month. Read-only.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "month": "string? (YYYY-MM; defaults to the current month)"
+  },
+  "outputs": {
+    "month": "string",
+    "currency": "CAD",
+    "categories": "array (name, budgeted, spent, remaining, state)",
+    "totals": "object (budgeted, spent, spentOnUncategorised)",
+    "needsYou": "object (uncategorised, guesses, overBudget)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetReader"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}

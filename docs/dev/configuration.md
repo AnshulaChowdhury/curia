@@ -483,7 +483,7 @@ channels:
 | `unknown_sender` | `allow`, `ignore` | `allow` routes messages from unrecognized senders to the coordinator in low-trust mode (auto-created as a `tier=unknown` contact); `ignore` silently drops them. |
 | `threaded` | `true`, `false` | `true` when the platform has native threads (email, Slack). `false` enables context bridging for channels without a thread reference (Signal, SMS, CLI, HTTP). Voice is a live call, so bridging does not apply. |
 
-Current defaults: CLI, Signal, and Voice are `high`; HTTP, Slack, and SMS are `medium`; email is `low`. HTTP and Voice use `unknown_sender: ignore`; the rest `allow`. (`web` — the authenticated console — is `high`.)
+Current defaults: CLI, Signal, and Voice are `high`; HTTP, Slack, and SMS are `medium`; email is `low`. HTTP, Voice and Signal use `unknown_sender: ignore`; the rest `allow`. (`web` — the authenticated console — is `high`.)
 
 ---
 

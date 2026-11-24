@@ -330,6 +330,8 @@ SIGNAL_PHONE_NUMBER=+12223334444 pnpm run seed-vault
 
 That's the E.164 number you registered via `signal-cli register` + `verify`. `SIGNAL_SOCKET_PATH` is managed by the deployment layer; do not set it in `.env`.
 
+**Hosts where every service is its own container (for example Railway).** The socket has to be on Curia's own filesystem, so the image can run signal-cli itself. It is off by default. Set `SIGNAL_CLI_DAEMON=true`, mount a persistent volume at `/data/signal-cli` (it holds the account keys; if it is lost the number must be registered again), and use `/run/signal-cli/socket` as the socket path in **Settings -> Channels -> Signal**. Register the number by running `signal-cli --config /data/signal-cli -a <number> register`, then `verify <code>`, inside the container. The binary is installed for linux/amd64 builds only; the entrypoint (`docker/signal-cli-entrypoint.sh`) logs a warning on other platforms and Curia starts without it.
+
 Restart Curia, then **install and enable the Signal channel** in the console (**Settings -> Channels -> Signal**). The phone number in the vault and a populated `signal-data` volume are prerequisites, but the channel still requires an explicit install then enable before it starts.
 
 ---
