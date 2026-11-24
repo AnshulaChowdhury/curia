@@ -6,13 +6,14 @@ import { Topbar } from '../components/Topbar.js';
 import { useTheme } from '../hooks/useTheme.js';
 import type { BudgetLoad } from './budget-data.js';
 
-const TABS: Array<{ to: '/budget' | '/budget/budgets'; label: string }> = [
+const TABS: Array<{ to: '/budget' | '/budget/budgets' | '/budget/import'; label: string }> = [
   { to: '/budget', label: 'Overview' },
   { to: '/budget/budgets', label: 'Budgets' },
+  { to: '/budget/import', label: 'Import' },
 ];
 
 /** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions, Import and Rules join the tabs later. */
-export function BudgetShell({ active, children }: { active: string; children: ReactNode }) {
+export function BudgetShell({ active, children, live = false }: { active: string; children: ReactNode; live?: boolean }) {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -40,9 +41,11 @@ export function BudgetShell({ active, children }: { active: string; children: Re
             ))}
           </nav>
           <div className="bud-body">
-            <p className="bud-fixture-note" role="note">
-              Sample data only. Nothing here is real, and nothing is saved when you reload.
-            </p>
+            {!live && (
+              <p className="bud-fixture-note" role="note">
+                Sample data only. Nothing here is real, and nothing is saved when you reload.
+              </p>
+            )}
             {children}
           </div>
         </main>

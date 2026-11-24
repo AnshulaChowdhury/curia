@@ -4173,3 +4173,15 @@ table.records-table tbody tr.active td { background: transparent; }
 .bud-check { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 32px; align-self: flex-end; }
 .bud-err { color: var(--app-destructive); font-size: 12px; }
 .bud-actions, .bud-row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* Budget: import and bank connections */
+.bud-form { display: grid; gap: 12px; max-width: 520px; }
+.bud-field { display: grid; gap: 4px; font-size: 13px; }
+.bud-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+.bud-ok { color: var(--text); margin: 0; }
+.bud-error { color: var(--danger, #b3261e); margin: 0; font-size: 13px; }
+.bud-banks { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.bud-bank { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--border, rgba(128,128,128,.25)); }
+.bud-bank-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+.bud-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
+.bud-chip-needs_login, .bud-chip-error { font-weight: 600; }
