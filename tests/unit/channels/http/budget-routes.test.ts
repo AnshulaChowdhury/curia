@@ -14,7 +14,7 @@ async function app(over: Record<string, unknown> = {}) {
   const store = {
     listCategories: vi.fn(async () => []), createCategory: vi.fn(async () => ({ id: ID })), updateCategory: vi.fn(async () => ({ id: ID })),
     deleteCategory: vi.fn(async () => undefined), summary: vi.fn(async (month: string) => ({ month })), listTransactions: vi.fn(async () => []),
-    categorise: vi.fn(async () => 1), getRules: vi.fn(async () => ({ yaml: '', updatedAt: null })), putRules: vi.fn(async () => ({ updatedAt: 'x' })), ...over,
+    categorise: vi.fn(async () => 1), getRules: vi.fn(async () => ({ yaml: '', updatedAt: null })), putRules: vi.fn(async () => ({ updatedAt: 'x' })), addTransactions: vi.fn(async (items: unknown[]) => ({ added: items.length, duplicates: 0 })), ...over,
   };
   const a = Fastify();
   await a.register(budgetRoutes, { logger, store: store as never, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
@@ -28,7 +28,7 @@ describe('/api/budget', () => {
       ['GET', '/api/budget/categories'], ['POST', '/api/budget/categories'], ['PATCH', `/api/budget/categories/${ID}`],
       ['DELETE', `/api/budget/categories/${ID}`], ['GET', '/api/budget/summary'], ['GET', '/api/budget/transactions'],
       ['PATCH', `/api/budget/transactions/${ID}`], ['POST', '/api/budget/transactions/bulk-categorise'],
-      ['GET', '/api/budget/rules'], ['PUT', '/api/budget/rules'],
+      ['GET', '/api/budget/rules'], ['PUT', '/api/budget/rules'], ['POST', '/api/budget/imports'],
     ] as const) {
       expect((await a.inject({ method, url, payload: {} })).statusCode, `${method} ${url}`).toBe(401);
     }
@@ -64,5 +64,23 @@ describe('/api/budget', () => {
     expect(store.categorise).not.toHaveBeenCalled();
     expect((await a.inject({ method: 'PATCH', url: `/api/budget/transactions/${ID}`, headers: auth, payload: { categoryId: null } })).statusCode).toBe(200);
     expect(store.categorise).toHaveBeenCalledWith([ID], null);
+  });
+
+  it('imports a bank file sent as the raw body', async () => {
+    const { a, store } = await app();
+    const csv = 'Transaction date,Transaction,Name,Memo,Amount\n3/9/2031,D,Invented Cafe,,-4.50\n';
+    const res = await a.inject({ method: 'POST', url: '/api/budget/imports?name=t.csv&account=Tangerine', headers: { ...auth, 'content-type': 'application/octet-stream' }, payload: Buffer.from(csv) });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, format: 'tangerine-csv', added: 1, duplicates: 0, skipped: 0 });
+    expect(store.addTransactions).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a file that is not a bank file, or has no account, without touching the store', async () => {
+    const { a, store } = await app();
+    const h = { ...auth, 'content-type': 'application/octet-stream' };
+    expect((await a.inject({ method: 'POST', url: '/api/budget/imports?name=x.exe&account=A', headers: h, payload: Buffer.from('MZ') })).statusCode).toBe(400);
+    const csv = Buffer.from('Transaction date,Transaction,Name,Memo,Amount\n3/9/2031,D,N,,-1\n');
+    expect((await a.inject({ method: 'POST', url: '/api/budget/imports?name=t.csv', headers: h, payload: csv })).statusCode).toBe(400);
+    expect(store.addTransactions).not.toHaveBeenCalled();
   });
 });
