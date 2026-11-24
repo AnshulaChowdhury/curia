@@ -958,9 +958,8 @@ export class HttpAdapter implements Channel {
               const state = { running: false, unfinished: [] as string[] };
               for (const box of mailboxes) {
                 const run = await farmStore.getRun(box.id);
-                if (!run) continue;
-                if (farmScans.isRunning(box.id)) state.running = true;
-                else if (run.status !== 'done') state.unfinished.push(box.id);
+                if (run && farmScans.isRunning(box.id)) state.running = true;
+                else if (!run || run.status !== 'done') state.unfinished.push(box.id);
               }
               return state;
             },

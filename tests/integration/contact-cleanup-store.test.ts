@@ -51,6 +51,6 @@ describeIf('import cleanup candidates', () => {
     await batch();
     const found = await store.findOneWayImports(100);
     expect(found.map((c) => c.contactId)).toEqual([one]);
-    expect(found[0]).toMatchObject({ email: 'news@kijiji.ca' });
+    expect(found[0]).toMatchObject({ email: 'news@kijiji.ca', accounts: ['moonray'] });
   });
 });
