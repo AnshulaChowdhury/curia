@@ -61,6 +61,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 - **Signal strangers** — `unknown_sender: ignore`; unrecognised numbers get no reply and calls go unanswered.
+- **Signal volume ownership** — the container starts as root, hands the signal-cli volume to curia, then runs as curia.
 - **Contacts import** — imported people no longer get knowledge-graph nodes; a node is linked later, when a person is kept.
 - **MCP Skills page** — now points to the Tools page, where bundles such as books live.
 - **QuickBooks connection** — built once in `index.ts` and shared, since QuickBooks rotates refresh tokens on every use.

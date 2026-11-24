@@ -370,7 +370,8 @@ ENV HOME=/tmp \
     LOGNAME=curia \
     NODE_ENV=production \
     COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-USER curia
+# No USER here on purpose: the entrypoint starts as root only to hand the signal-cli volume to curia, then drops to
+# curia (uid 1001) with setpriv before starting Curia or signal-cli. See docker/signal-cli-entrypoint.sh.
 
 # Invoke tsx directly rather than going through `pnpm exec tsx ...`. The pnpm
 # route triggers corepack at runtime, which in turn looks for a pnpm tarball
