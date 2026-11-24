@@ -9,21 +9,23 @@ const link = { id: 'l1', institution: '<b>Bank</b>', status: 'needs_login' as co
 
 describe('BanksPanel', () => {
   it('says Plaid is not set up and hides Connect', () => {
-    const html = renderToStaticMarkup(<BanksPanel state={{ configured: false, links: [] }} busy={false} message={null} onConnect={noop} onSyncAll={noop} onSync={noop} onDisconnect={noop} />);
+    const html = renderToStaticMarkup(<BanksPanel state={{ configured: false, links: [] }} busy={false} message={null} onSyncAll={noop} onSync={noop} onDisconnect={noop} />);
     expect(html).toContain('Plaid not set up');
     expect(html).not.toContain('Connect a bank');
   });
   it('offers Connect when configured', () => {
-    const html = renderToStaticMarkup(<BanksPanel state={{ configured: true, links: [] }} busy={false} message={null} onConnect={noop} onSyncAll={noop} onSync={noop} onDisconnect={noop} />);
+    const html = renderToStaticMarkup(<BanksPanel state={{ configured: true, links: [] }} busy={false} message={null} onSyncAll={noop} onSync={noop} onDisconnect={noop} />);
+    expect(html).toContain('href="/budget/connect-bank"');
     expect(html).toContain('Connect a bank');
   });
 });
 
 describe('BankLinkRow', () => {
-  const html = renderToStaticMarkup(<BankLinkRow link={link} busy={false} onSync={noop} onReconnect={noop} onDisconnect={noop} />);
+  const html = renderToStaticMarkup(<BankLinkRow link={link} busy={false} onSync={noop} onDisconnect={noop} />);
   it('shows Reconnect with a words-based status and escapes the bank name', () => {
     expect(html).toContain('Needs login');
     expect(html).toContain('Reconnect');
+    expect(html).toContain('href="/budget/connect-bank"');
     expect(html).toContain('&lt;b&gt;Bank');
     expect(html).not.toContain('<b>Bank');
   });

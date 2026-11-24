@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { BudgetShell } from './BudgetShell.js';
 import {
-  bankClient, runPlaidLink, validateAccount, accountLabel, statusText, BudgetApiError,
+  bankClient, validateAccount, accountLabel, statusText, BudgetApiError,
   type BanksState, type BankLink, type ImportResult,
 } from './budget-banks.js';
+
+export const CONNECT_PATH = '/budget/connect-bank';
 
 function when(iso: string | null): string {
   if (!iso) return 'Never synced';
@@ -57,8 +59,8 @@ export function ImportFilePanel({ onDone }: { onDone?: () => void }) {
   );
 }
 
-export function BankLinkRow({ link, busy, onSync, onReconnect, onDisconnect }: {
-  link: BankLink; busy: boolean; onSync: () => void; onReconnect: () => void; onDisconnect: () => void;
+export function BankLinkRow({ link, busy, onSync, onDisconnect }: {
+  link: BankLink; busy: boolean; onSync: () => void; onDisconnect: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
   return (
@@ -70,7 +72,7 @@ export function BankLinkRow({ link, busy, onSync, onReconnect, onDisconnect }: {
         {link.lastError && link.status !== 'active' && <div className="bud-error">{link.lastError}</div>}
       </div>
       <div className="bud-bank-actions">
-        {link.status === 'needs_login' && <button type="button" className="bud-btn" disabled={busy} onClick={onReconnect}>Reconnect</button>}
+        {link.status === 'needs_login' && <a className="bud-btn" href={CONNECT_PATH}>Reconnect</a>}
         <button type="button" className="bud-btn" disabled={busy} onClick={onSync}>Sync now</button>
         {confirming ? (
           <span role="group" aria-label={`Disconnect ${link.institution}?`}>
@@ -85,9 +87,9 @@ export function BankLinkRow({ link, busy, onSync, onReconnect, onDisconnect }: {
   );
 }
 
-export function BanksPanel({ state, busy, message, onConnect, onSyncAll, onSync, onDisconnect }: {
+export function BanksPanel({ state, busy, message, onSyncAll, onSync, onDisconnect }: {
   state: BanksState | null; busy: boolean; message: string | null;
-  onConnect: () => void; onSyncAll: () => void; onSync: (id: string) => void; onDisconnect: (id: string) => void;
+  onSyncAll: () => void; onSync: (id: string) => void; onDisconnect: (id: string) => void;
 }) {
   return (
     <section className="dash-card" aria-labelledby="bud-banks-h">
@@ -98,13 +100,14 @@ export function BanksPanel({ state, busy, message, onConnect, onSyncAll, onSync,
       {state?.configured && (
         <>
           <div className="bud-row">
-            <button type="button" className="bud-btn" disabled={busy} onClick={onConnect}>Connect a bank</button>
+            {/* A plain link on purpose: the connect page has its own CSP, which only applies to a full page load. */}
+            <a className="bud-btn" href={CONNECT_PATH}>Connect a bank</a>
             {state.links.length > 0 && <button type="button" className="bud-btn" disabled={busy} onClick={onSyncAll}>Sync all</button>}
           </div>
           {state.links.length === 0
             ? <p className="dash-card-quiet">No banks connected yet.</p>
             : <ul className="bud-banks">{state.links.map(l => (
-                <BankLinkRow key={l.id} link={l} busy={busy} onSync={() => onSync(l.id)} onReconnect={onConnect} onDisconnect={() => onDisconnect(l.id)} />
+                <BankLinkRow key={l.id} link={l} busy={busy} onSync={() => onSync(l.id)} onDisconnect={() => onDisconnect(l.id)} />
               ))}</ul>}
         </>
       )}
@@ -144,7 +147,6 @@ export default function BudgetImportPage() {
           <ImportFilePanel />
           <BanksPanel
             state={state} busy={busy} message={message}
-            onConnect={() => void run(async () => ((await runPlaidLink()) ? 'Bank connected.' : null))}
             onSyncAll={() => void run(async () => { await bankClient.syncAll(); return 'Sync finished.'; })}
             onSync={id => void run(async () => `Added ${await bankClient.syncOne(id)} new transactions.`)}
             onDisconnect={id => void run(async () => { await bankClient.disconnect(id); return 'Bank disconnected.'; })}
