@@ -33,7 +33,10 @@ export async function resolveFarmTarget(
   return { ok: true, target: { accountId, address: box.address, mailbox: box.reader }, category: reported.category };
 }
 
-/** People only: automated senders were never stored, and role addresses (info@, sales@) are left for domain mining. */
+/**
+ * People you have written to: an address you have never sent mail to is a newsletter, a notification or a stranger, and
+ * stays in the scan results (not imported). Role addresses (info@, sales@) are left for domain mining.
+ */
 export function farmCollector(accountId: string, label: string, category: MailboxCategory, store: FarmStore): Collector {
   return {
     sourceId: `mailbox:${accountId}`,
@@ -43,7 +46,7 @@ export function farmCollector(accountId: string, label: string, category: Mailbo
       if (!run) return { ok: false, message: 'This mailbox has not been scanned yet. Start the scan first.', read: 0, candidates: [] };
       const facts = await store.facts(accountId, MAX_FARM_CANDIDATES);
       const candidates: Candidate[] = facts
-        .filter((f) => classifyEmailSender(f.email) === 'person')
+        .filter((f) => f.sent > 0 && classifyEmailSender(f.email) === 'person')
         .map((f) => ({
           sourceKey: `mailbox:${accountId}:${f.email}`,
           sourceId: `mailbox:${accountId}`,
