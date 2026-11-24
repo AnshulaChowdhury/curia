@@ -74,7 +74,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.6.3 /uv /uvx /usr/local/bin/
 # so it gets no benefit from the pnpm retry wrapper.
 RUN apt-get -o Acquire::Retries=3 update \
  && apt-get -o Acquire::Retries=3 upgrade -y \
- && apt-get -o Acquire::Retries=3 install -y --no-install-recommends curl pulseaudio-utils python3 \
+ && apt-get -o Acquire::Retries=3 install -y --no-install-recommends ca-certificates curl pulseaudio-utils python3 \
  && rm -rf /var/lib/apt/lists/*
 
 # signal-cli for the Signal channel, opt-in at runtime (docker/signal-cli-entrypoint.sh).
