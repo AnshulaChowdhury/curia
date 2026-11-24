@@ -37,6 +37,10 @@ const SecretCapturePage = lazy(() => import('./pages/SecretCapturePage'));
 const ContactsPage = lazy(() => import('./pages/ContactsPage'));
 const JobsPage = lazy(() => import('./pages/JobsPage'));
 const BooksReviewPage = lazy(() => import('./pages/BooksReviewPage'));
+const BudgetOverviewPage = lazy(() => import('./pages/BudgetOverviewPage'));
+const BudgetsPage = lazy(() => import('./pages/BudgetsPage'));
+const BudgetImportPage = lazy(() => import('./pages/BudgetImportPage'));
+const BudgetConnectBankPage = lazy(() => import('./pages/BudgetConnectBankPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const KgPage = lazy(() => import('./pages/KgPage'));
 const DocumentsPage = lazy(() => import('./pages/DocumentsPage'));
@@ -216,6 +220,30 @@ const booksRoute = createRoute({
   component: BooksReviewPage,
 });
 
+const budgetRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/budget',
+  component: BudgetOverviewPage,
+});
+
+const budgetBudgetsRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/budget/budgets',
+  component: BudgetsPage,
+});
+
+const budgetImportRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/budget/import',
+  component: BudgetImportPage,
+});
+
+const budgetConnectBankRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/budget/connect-bank',
+  component: BudgetConnectBankPage,
+});
+
 const jobDetailRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/jobs/$jobId',
@@ -292,6 +320,10 @@ const routeTree = rootRoute.addChildren([
     contactsRoute,
     jobsRoute,
     booksRoute,
+    budgetRoute,
+    budgetBudgetsRoute,
+    budgetImportRoute,
+    budgetConnectBankRoute,
     jobDetailRoute,
     tasksRoute,
     skillsRoute,

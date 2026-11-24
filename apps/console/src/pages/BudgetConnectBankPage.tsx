@@ -1,0 +1,39 @@
+import { useState } from 'react';
+import { BudgetShell } from './BudgetShell.js';
+import { runPlaidLink, BudgetApiError } from './budget-banks.js';
+
+const RETURN_PATH = '/budget/import';
+
+/**
+ * Connect a bank with Plaid Link. The server gives only this exact path a CSP that allows cdn.plaid.com, and a CSP is fixed
+ * when the document loads. So this page is reached by a full page load (a plain link, not router navigation) and returns the
+ * same way. The Plaid script is added at runtime; there is no inline script.
+ */
+export default function BudgetConnectBankPage() {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function start() {
+    setBusy(true); setError(null);
+    try {
+      if (await runPlaidLink()) { window.location.assign(RETURN_PATH); return; }
+    } catch (e) {
+      setError(e instanceof BudgetApiError && e.locked ? 'Budget data is private to the owner.' : e instanceof Error ? e.message : 'Could not start Plaid.');
+    }
+    setBusy(false);
+  }
+
+  return (
+    <BudgetShell active="/budget/import" live>
+      <section className="dash-card bud-form">
+        <h3 className="dash-card-title">Connect a bank</h3>
+        <p className="dash-card-quiet">Plaid opens a secure window. Your bank login goes to your bank through Plaid and never reaches this app.</p>
+        {error && <p className="bud-error" role="alert">{error}</p>}
+        <div className="bud-row">
+          <button type="button" className="bud-btn" disabled={busy} onClick={() => void start()}>{busy ? 'Opening…' : 'Open Plaid'}</button>
+          <a className="bud-btn" href={RETURN_PATH}>Back</a>
+        </div>
+      </section>
+    </BudgetShell>
+  );
+}
