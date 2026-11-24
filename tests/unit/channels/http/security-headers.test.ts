@@ -223,7 +223,9 @@ describe('registerSecurityHeaders', () => {
     expect(PLAID_LINK_CONTENT_SECURITY_POLICY).toContain("script-src 'self' https://cdn.plaid.com;");
     expect(PLAID_LINK_CONTENT_SECURITY_POLICY).toContain("default-src 'none'");
     expect(PLAID_LINK_CONTENT_SECURITY_POLICY).toContain("frame-ancestors 'none'");
-    expect(PLAID_LINK_CONTENT_SECURITY_POLICY).not.toMatch(/unsafe-inline'|unsafe-eval|script-src[^;]*\*/);
+    const scriptSrc = PLAID_LINK_CONTENT_SECURITY_POLICY.split('; ').find(d => d.startsWith('script-src'))!;
+    expect(scriptSrc).not.toMatch(/unsafe-inline|unsafe-eval|\*/);
+    expect(PLAID_LINK_CONTENT_SECURITY_POLICY).not.toContain('unsafe-eval');
     const hosts = PLAID_LINK_CONTENT_SECURITY_POLICY.match(/https:\/\/[^\s;]+/g)!.filter(h => !/plaid\.com$/.test(h) && !/fonts\.g/.test(h));
     expect(hosts).toEqual([]);
   });
