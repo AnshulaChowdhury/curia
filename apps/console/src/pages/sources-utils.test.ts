@@ -134,7 +134,7 @@ describe('cleanup text', () => {
     expect(cleanupPrompt({ total: 1700, sample: [] })).toContain('Remove 1,700 imported contacts');
     expect(cleanupPrompt({ total: 1, sample: [] })).toContain('Remove 1 imported contact ');
     expect(cleanupPrompt({ total: 0, sample: [] })).toBe('Nothing to clean up.');
-    expect(cleanupPrompt({ total: 5, sample: [], unfinished: ['moonray'] })).toContain('scan stopped before the end');
+    expect(cleanupPrompt({ total: 5, sample: [], unfinished: ['moonray'], held: 900 })).toContain('900 more look like real people');
   });
   it('reports what was removed and kept', () => {
     expect(cleanupOutcomeText({ removed: 5, kept: 0 })).toBe('Removed 5.');
