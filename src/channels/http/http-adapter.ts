@@ -82,6 +82,7 @@ import { contactsConnectionsRoutes } from './routes/contacts-connections.js';
 import { contactsSourcesRoutes } from './routes/contacts-sources.js';
 import { BRIDGES, bridgeVaultKeys } from '../../contacts-import/bridges.js';
 import { contactsImportRunRoutes } from './routes/contacts-import-run.js';
+import { ImportCleanupService, PgCleanupStore } from '../../contacts-import/cleanup-service.js';
 import { ContactImportService } from '../../contacts-import/import-service.js';
 import { PgImportStore } from '../../contacts-import/import-store.js';
 import { PgRunStore } from '../../contacts-import/run-store.js';
@@ -939,6 +940,21 @@ export class HttpAdapter implements Channel {
             new ContactImportService(this.config.contactService, new PgImportStore(pool), logger),
             new PgRunStore(pool),
             collectors,
+            logger,
+          );
+        },
+        getCleanup: async () => {
+          const mailboxes = await loadPhoneInboxAccounts(sourcesSecrets);
+          return new ImportCleanupService(
+            new PgCleanupStore(pool),
+            this.config.contactService,
+            async () => {
+              for (const box of mailboxes) {
+                const run = await farmStore.getRun(box.id);
+                if (run && (run.status !== 'done' || farmScans.isRunning(box.id))) return false;
+              }
+              return true;
+            },
             logger,
           );
         },

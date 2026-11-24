@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { apiFetch } from '../api.js';
 import {
-  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, categoryLabel, exportAction, exportInProgress, exportLogText, exportStatusText, farmAction, farmName, farmStatusText, orgLine, reviewReasonText, sourcesSummary,
-  type ApplyResult, type ExportStatus, type FarmMailbox, type ImportSourceRow, type OrganizationRow, type PreviewResult,
+  STATUS_LABEL, anyFarmRunning, applyOutcomeText, applyPrompt, cleanupOutcomeText, cleanupPrompt, categoryLabel, exportAction, exportInProgress, exportLogText, exportStatusText, farmAction, farmName, farmStatusText, orgLine, reviewReasonText, sourcesSummary,
+  type ApplyResult, type CleanupPreview, type CleanupResult, type ExportStatus, type FarmMailbox, type ImportSourceRow, type OrganizationRow, type PreviewResult,
 } from './sources-utils.js';
 
 // The Contacts page "Sources" drawer: every place the contact import reads people from, and whether it will.
@@ -17,7 +17,9 @@ export default function SourcesDrawer({ onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [outcome, setOutcome] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'preview' | 'apply' | null>(null);
+  const [busy, setBusy] = useState<'preview' | 'apply' | 'cprev' | 'capply' | null>(null);
+  const [cleanup, setCleanup] = useState<CleanupPreview | null>(null);
+  const [cleanupOutcome, setCleanupOutcome] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [farm, setFarm] = useState<FarmMailbox[] | null>(null);
   const [farmError, setFarmError] = useState<string | null>(null);
@@ -133,6 +135,40 @@ export default function SourcesDrawer({ onClose }: Props) {
     } catch (err) {
       setActionError('Could not reach Curia');
       console.error('[SourcesDrawer] apply failed:', err);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runCleanupPreview() {
+    setBusy('cprev'); setActionError(null); setCleanupOutcome(null); setCleanup(null);
+    try {
+      const res = await apiFetch('/api/contacts/import/cleanup/preview', { method: 'POST' });
+      if (!res.ok) { setActionError(await errorOf(res)); return; }
+      setCleanup(await res.json() as CleanupPreview);
+    } catch (err) {
+      setActionError('Could not reach Curia');
+      console.error('[SourcesDrawer] cleanup preview failed:', err);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runCleanupApply() {
+    if (!cleanup) return;
+    setBusy('capply'); setActionError(null);
+    try {
+      const res = await apiFetch('/api/contacts/import/cleanup/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expected: cleanup.total }),
+      });
+      if (!res.ok) { setActionError(await errorOf(res)); return; }
+      setCleanupOutcome(cleanupOutcomeText(await res.json() as CleanupResult));
+      setCleanup(null);
+    } catch (err) {
+      setActionError('Could not reach Curia');
+      console.error('[SourcesDrawer] cleanup apply failed:', err);
     } finally {
       setBusy(null);
     }
@@ -317,6 +353,27 @@ export default function SourcesDrawer({ onClose }: Props) {
                 </button>
               </div>
             )}
+
+            <div style={{ marginTop: 20, borderTop: '1px solid var(--app-border)', paddingTop: 12 }}>
+              <button className="btn btn-secondary btn-sm" onClick={() => void runCleanupPreview()} disabled={busy !== null}>
+                {busy === 'cprev' ? 'Checking…' : 'Preview cleanup'}
+              </button>
+              <p style={{ fontSize: 12, color: 'var(--app-fg-muted)', margin: '6px 0 0' }}>
+                Finds imported contacts from mail you have never written to (newsletters, notifications). It changes nothing. Needs every mailbox scan to be finished.
+              </p>
+              {cleanupOutcome && <p style={{ fontSize: 13, margin: '8px 0 0' }}>{cleanupOutcome}</p>}
+              {cleanup && (
+                <div style={{ marginTop: 12, border: '1px solid var(--app-border)', borderRadius: 6, padding: '10px 12px', fontSize: 12 }}>
+                  {cleanup.sample.map((r, i) => (
+                    <div key={i} style={{ fontFamily: 'JetBrains Mono, monospace' }}>{r.name} · {r.identifier}</div>
+                  ))}
+                  <p style={{ margin: '8px 0 6px' }}>{cleanupPrompt(cleanup)}</p>
+                  <button className="btn btn-primary btn-sm" onClick={() => void runCleanupApply()} disabled={busy !== null || cleanup.total === 0}>
+                    {busy === 'capply' ? 'Removing…' : 'Remove these contacts'}
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>
