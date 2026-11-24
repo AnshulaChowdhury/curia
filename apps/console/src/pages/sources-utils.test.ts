@@ -58,7 +58,7 @@ describe('orgLine', () => {
   });
 });
 
-import { farmAction, farmStatusText, anyFarmRunning, type FarmMailbox } from './sources-utils.js';
+import { cleanupOutcomeText, cleanupPrompt, farmAction, farmStatusText, anyFarmRunning, type FarmMailbox } from './sources-utils.js';
 
 const farm = (over: Partial<FarmMailbox>): FarmMailbox => ({
   accountId: 'moonray', eligible: true, status: 'not_started', running: false, messagesScanned: 0, peopleFound: 0,
@@ -126,5 +126,17 @@ describe('Matrix export text and actions', () => {
     expect(exportLogText({ at: 'not a date', level: 'info', message: 'run started' })).toBe('run started');
     expect(exportLogText({ at: 'not a date', level: 'error', message: 'HTTP 500 from matrix' })).toBe('ERROR: HTTP 500 from matrix');
     expect(exportLogText({ at: '2026-11-08T22:00:05Z', level: 'warn', message: 'slow' })).toMatch(/\d\d:\d\d:\d\d WARN: slow$/);
+  });
+});
+
+describe('cleanup text', () => {
+  it('asks with the count and explains what is kept', () => {
+    expect(cleanupPrompt({ total: 1700, sample: [] })).toContain('Remove 1,700 imported contacts');
+    expect(cleanupPrompt({ total: 1, sample: [] })).toContain('Remove 1 imported contact ');
+    expect(cleanupPrompt({ total: 0, sample: [] })).toBe('Nothing to clean up.');
+  });
+  it('reports what was removed and kept', () => {
+    expect(cleanupOutcomeText({ removed: 5, kept: 0 })).toBe('Removed 5.');
+    expect(cleanupOutcomeText({ removed: 5, kept: 2 })).toContain('2 were kept');
   });
 });

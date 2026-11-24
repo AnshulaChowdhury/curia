@@ -4,6 +4,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { contactsImportRunRoutes } from '../../../../../src/channels/http/routes/contacts-import-run.js';
 import { PullError, type ContactsPullService } from '../../../../../src/contacts-import/pull-service.js';
+import { CleanupError, type ImportCleanupService } from '../../../../../src/contacts-import/cleanup-service.js';
 import { ImportError } from '../../../../../src/contacts-import/import-service.js';
 import { createSilentLogger } from '../../../../../src/logger.js';
 import { hashToken } from '../../../../../src/channels/http/session-auth.js';
@@ -15,7 +16,7 @@ describe('contacts import run routes', () => {
   let app: FastifyInstance;
   afterEach(async () => app?.close());
 
-  async function build(service: Partial<ContactsPullService>) {
+  async function build(service: Partial<ContactsPullService>, cleanup: Partial<ImportCleanupService> = {}) {
     app = Fastify();
     const sessions = new Map<string, number>([[hashToken('sess'), Date.now() + 60_000]]);
     app.addHook('onRequest', async (req) => {
@@ -23,7 +24,7 @@ describe('contacts import run routes', () => {
       (req as unknown as { cookies: Record<string, string> }).cookies = m ? { curia_session: m[1]! } : {};
     });
     await app.register(contactsImportRunRoutes, {
-      logger: createSilentLogger(), getService: async () => service as ContactsPullService, webAppBootstrapSecret: 'boot', sessions,
+      logger: createSilentLogger(), getService: async () => service as ContactsPullService, getCleanup: async () => cleanup as ImportCleanupService, webAppBootstrapSecret: 'boot', sessions,
     });
   }
 
@@ -82,5 +83,23 @@ describe('contacts import run routes', () => {
     const res = await app.inject({ method: 'POST', url: '/api/contacts/import/apply', headers: COOKIE, payload: { runId: RUN } });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ totals: { created: 2 } });
+  });
+
+  it('cleanup routes need a session, validate the expected count and map errors', async () => {
+    const apply = vi.fn(async () => ({ removed: 3, kept: 0 }));
+    await build({}, { preview: async () => ({ total: 3, sample: [] }), apply } as never);
+    expect((await app.inject({ method: 'POST', url: '/api/contacts/import/cleanup/preview' })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'POST', url: '/api/contacts/import/cleanup/apply', payload: { expected: 3 } })).statusCode).toBe(401);
+    const prev = await app.inject({ method: 'POST', url: '/api/contacts/import/cleanup/preview', headers: COOKIE });
+    expect(prev.json()).toMatchObject({ total: 3 });
+    expect((await app.inject({ method: 'POST', url: '/api/contacts/import/cleanup/apply', headers: COOKIE, payload: { expected: 'x' } })).statusCode).toBe(400);
+    const ok = await app.inject({ method: 'POST', url: '/api/contacts/import/cleanup/apply', headers: COOKIE, payload: { expected: 3 } });
+    expect(ok.json()).toEqual({ removed: 3, kept: 0 });
+    expect(apply).toHaveBeenCalledWith(3);
+    await app.close();
+    await build({}, { apply: async () => { throw new CleanupError('count_changed', 'changed'); } } as never);
+    const changed = await app.inject({ method: 'POST', url: '/api/contacts/import/cleanup/apply', headers: COOKIE, payload: { expected: 3 } });
+    expect(changed.statusCode).toBe(409);
+    expect(changed.json()).toMatchObject({ code: 'count_changed' });
   });
 });
