@@ -77,12 +77,37 @@ RUN apt-get -o Acquire::Retries=3 update \
  && apt-get -o Acquire::Retries=3 install -y --no-install-recommends curl pulseaudio-utils python3 \
  && rm -rf /var/lib/apt/lists/*
 
+# signal-cli for the Signal channel, opt-in at runtime (docker/signal-cli-entrypoint.sh).
+# Curia reaches signal-cli over a Unix socket, so on hosts where each service is its own
+# container the daemon has to live in this one. Nothing starts unless SIGNAL_CLI_DAEMON=true.
+# The native build is linux/amd64 only, so other platforms (arm64) get no signal-cli and the
+# entrypoint says so. The tarball is pinned by version and sha256; to bump, take the new
+# digest from the GitHub release page. It unpacks to one ~400 MB static binary.
+ARG TARGETARCH
+ARG SIGNAL_CLI_VERSION=0.14.10
+ARG SIGNAL_CLI_SHA256=db9297789c5bbc6131df505d2f37abe43efa0b54200585f5e56b478e1cd93916
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      curl -fsSL --retry 3 -o /tmp/signal-cli.tar.gz \
+        "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
+      && echo "${SIGNAL_CLI_SHA256}  /tmp/signal-cli.tar.gz" | sha256sum -c - \
+      && tar -xzf /tmp/signal-cli.tar.gz -C /usr/local/bin signal-cli \
+      && chmod 0755 /usr/local/bin/signal-cli \
+      && rm -f /tmp/signal-cli.tar.gz; \
+    fi
+
 # Create a non-root system user/group for the runtime process.
 # UIDs/GIDs are pinned (not dynamic) so docker-compose tmpfs uid= options
 # and any external tooling can reference a stable, known value.
 # --no-create-home: HOME=/tmp is set below; no home dir on disk is needed.
 RUN groupadd --system --gid 1001 curia \
  && useradd --system --uid 1001 --gid 1001 --no-create-home curia
+
+# signal-cli's data dir (account keys; mount a volume here to keep them) and its socket dir.
+# Pre-created for curia so the daemon can write without root. Unused unless SIGNAL_CLI_DAEMON=true.
+RUN mkdir -p /data/signal-cli /run/signal-cli \
+ && chown curia:curia /data/signal-cli /run/signal-cli
+
+COPY docker/signal-cli-entrypoint.sh /usr/local/bin/signal-cli-entrypoint.sh
 
 WORKDIR /app
 
@@ -360,4 +385,5 @@ USER curia
 # at runtime via ESM .js→.ts extension resolution. node alone cannot do that.
 # The .bin shim is created by `pnpm add tsx` above and is the documented way
 # to call tsx without a package manager wrapper.
+ENTRYPOINT ["/usr/local/bin/signal-cli-entrypoint.sh"]
 CMD ["./node_modules/.bin/tsx", "dist/index.js"]
