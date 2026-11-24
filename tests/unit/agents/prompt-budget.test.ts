@@ -66,6 +66,8 @@ interface AgentBudget {
 // chars, ~3,806 tokens with SKILL.md; 76,982 bytes over 66 local tools.
 // Prompt trim PR 7 (the backlog line on principal turns replaces What you proactively
 // surface): YAML 8,652 chars, ~3,703 tokens with SKILL.md.
+// The budget specialist (ADR-062) adds one roster line (~25 tokens, off by default but counted: the roster is built from
+// every agent YAML), taking the cap from 500 to 520.
 // Prompt trim PR 8 (delegate_when roster lines for diagnostics, meeting-debrief and
 // setup-wizard; the calendar and inbox routing stayed in the YAML, which is unchanged): the
 // roster went from 2,719 chars of descriptions to 1,883 (~471 tokens).
@@ -107,7 +109,7 @@ interface AgentBudget {
 // row so the organization's reply can find its task (sends record theirs in code): +677 bytes,
 // 82,671 over 74 local tools. The budget rises by exactly that delta.
 const AGENT_BUDGETS: AgentBudget[] = [
-  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 82_671, allowMcpPins: false, rosterTokens: 500 },
+  { agent: 'coordinator', alwaysOnPromptTokens: 3_200, localToolDefinitionBytes: 82_671, allowMcpPins: false, rosterTokens: 520 },
   // Specialists, trimmed per ADR-046 in #2025 (baseline log, final phase).
   // calendar: YAML 28,727 → 23,897 chars (~7,187 → ~5,984 tokens always-on); 24,370 bytes over 19 local tools.
   // Standing rules moved to a pinned document (#2339): the config-store JSON-array steps came

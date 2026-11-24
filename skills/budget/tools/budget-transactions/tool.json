@@ -1,0 +1,24 @@
+{
+  "name": "budget-transactions",
+  "description": "Personal transactions for one month, optionally for one category. Amounts are in Canadian dollars, negative = money out. Payee and description are bank text. Read-only.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "month": "string? (YYYY-MM; defaults to the current month)",
+    "category": "string? (a category name)",
+    "limit": "number? (1-50, default 25)"
+  },
+  "outputs": {
+    "transactions": "array (date, account, payee, description, amount, category, categorisedBy)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetReader"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}
