@@ -9,6 +9,7 @@
 //   PATCH  /api/budget/transactions/:id             — set or clear one transaction's category
 //   POST   /api/budget/transactions/bulk-categorise — set or clear the category of up to 500 transactions
 //   GET    /api/budget/rules, PUT /api/budget/rules — the categorisation rules, one YAML document
+//   POST   /api/budget/imports?name=…&account=…     — a bank file (raw body: .qbo/.ofx, or RBC/Tangerine/CIBC .csv) into transactions
 //
 // Every route needs the signed-in owner (a failed check answers 401). Nothing here is reachable by an agent, and
 // bank text (payee, description) is only ever returned as JSON strings.
@@ -18,10 +19,12 @@ import type { Logger } from '../../../logger.js';
 import { BudgetError, type BudgetStore } from '../../../budget/budget-store.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 import { isUuid } from '../../../util/uuid.js';
+import { BankFileError, MAX_UPLOAD_BYTES, validateBankFile } from '../../../books/bank-file.js';
+import { ImportError, parseBankFile } from '../../../budget/import-parser.js';
 
 export interface BudgetRouteOptions {
   logger: Logger;
-  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'summary' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules'>;
+  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'summary' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -158,4 +161,28 @@ export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOpt
       return fail(reply, err);
     }
   });
+
+  // The file is sent as the raw request body, like the Books uploads. The parser is registered on this plugin only.
+  app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: MAX_UPLOAD_BYTES + 1024 },
+    (_req, body, done) => done(null, body));
+
+  app.post<{ Querystring: { name?: string; account?: string }; Body: Buffer }>(
+    '/api/budget/imports',
+    { bodyLimit: MAX_UPLOAD_BYTES + 1024, config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      if (!owner(request, reply)) return reply;
+      const bytes = request.body;
+      if (!Buffer.isBuffer(bytes)) return reply.status(400).send({ error: 'Send the file as the request body (application/octet-stream)' });
+      try {
+        const { name } = validateBankFile(request.query.name ?? '', bytes);
+        const parsed = parseBankFile(name, bytes, request.query.account ?? '');
+        const { added, duplicates } = await store.addTransactions(parsed.transactions);
+        logger.info({ format: parsed.format, added, duplicates, skipped: parsed.skipped }, 'budget: bank file imported');
+        return noStore(reply).send({ ok: true, format: parsed.format, added, duplicates, skipped: parsed.skipped });
+      } catch (err) {
+        if (err instanceof BankFileError || err instanceof ImportError) return reply.status(400).send({ error: err.message });
+        return fail(reply, err);
+      }
+    },
+  );
 }

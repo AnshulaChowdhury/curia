@@ -41,6 +41,8 @@ export interface NewTransaction {
   source?: CategorisedBy | null;
   ruleId?: string | null;
   confidence?: number | null;
+  /** The bank's own id for the transaction (Plaid), so two identical purchases on one day stay two rows. */
+  externalId?: string;
 }
 
 export interface CategorySummary {
@@ -84,8 +86,11 @@ const MAX_CENTS = 2_000_000_000;
 const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && Math.abs(v) <= MAX_CENTS;
 const text = (v: unknown, max: number): string => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 
-export function fingerprint(t: Pick<NewTransaction, 'account' | 'date' | 'payee' | 'description' | 'amountCents'>): string {
-  return createHash('sha256').update([t.account, t.date, t.amountCents, t.payee, t.description].join('\u0000')).digest('hex');
+export function fingerprint(t: Pick<NewTransaction, 'account' | 'date' | 'payee' | 'description' | 'amountCents' | 'externalId'>): string {
+  const parts = [t.account, t.date, t.amountCents, t.payee, t.description];
+  // Appended only when present, so every fingerprint already stored (file imports) stays the same.
+  if (t.externalId) parts.push(t.externalId);
+  return createHash('sha256').update(parts.join('\u0000')).digest('hex');
 }
 
 /** [first day, first day of the next month) for a YYYY-MM month. */
@@ -207,7 +212,7 @@ export class BudgetStore {
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (fingerprint) DO NOTHING`,
         [text(t.account, 60), t.date, text(t.payee, 200), text(t.description, 500), t.amountCents,
           t.categoryId ?? null, t.categoryId ? (t.source ?? 'you') : null, t.categoryId ? (t.ruleId ?? null) : null, t.categoryId ? (t.confidence ?? null) : null,
-          fingerprint({ account: text(t.account, 60), date: t.date, payee: text(t.payee, 200), description: text(t.description, 500), amountCents: t.amountCents })],
+          fingerprint({ account: text(t.account, 60), date: t.date, payee: text(t.payee, 200), description: text(t.description, 500), amountCents: t.amountCents, externalId: t.externalId })],
       );
       added += res.rowCount ?? 0;
     }
