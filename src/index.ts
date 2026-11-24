@@ -272,6 +272,8 @@ import { BooksReader } from './books/books-reader.js';
 import { BudgetReader } from './budget/budget-reader.js';
 import { BudgetStore } from './budget/budget-store.js';
 import { BooksRunner } from './books/books-runner.js';
+import { BankSync, BankSyncRunner } from './budget/bank-sync.js';
+import { PlaidClient, plaidCredentialsFrom } from './budget/plaid-client.js';
 import { booksServiceFromEnv } from './books/books-service-client.js';
 import { PipelineStateStore } from './books/pipeline-state-store.js';
 import { BatchStore } from './books/batch-store.js';
@@ -3295,6 +3297,12 @@ async function main(): Promise<void> {
     : undefined;
   booksRunner?.start();
 
+  // Bank feeds for the personal budget (Plaid). Idle until plaid_client_id and plaid_secret are in the vault.
+  const plaidClient = new PlaidClient({ credentials: () => plaidCredentialsFrom(secretsService) });
+  const bankSync = new BankSync({ pool, plaid: plaidClient, secrets: secretsService, budget: new BudgetStore(pool), logger });
+  const bankSyncRunner = new BankSyncRunner(bankSync, plaidClient, logger);
+  bankSyncRunner.start();
+
   // Reaction → approval mapper (#1479): channel-agnostic inbound.reaction handling.
   // Registered after ExecutionLayer so approve can re-invoke the blocked skill.
   const reactionIntentsConfig = yamlConfig.autonomy?.reaction_intents;
@@ -3535,6 +3543,7 @@ async function main(): Promise<void> {
     phoneBrief,
     booksMonitor,
     booksRunner,
+    budgetBanks: { sync: bankSync, plaid: plaidClient },
     secretCaptureService,
     setupRequiredAtBoot,
     bootStartedAt,
@@ -3583,6 +3592,7 @@ async function main(): Promise<void> {
     phoneBriefScheduler.stop();
     booksMonitor.stop();
     booksRunner?.stop();
+    bankSyncRunner.stop();
     // Parallel so several mailboxes share one drain budget. A sequential stop
     // waits 5s per hung account and can outlast Docker's default 10s grace
     // before Signal, Slack, and the pool close (#2254).
