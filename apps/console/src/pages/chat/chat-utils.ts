@@ -28,8 +28,8 @@ function rejectionText(reason: string): string {
  *
  * Ack-and-stream (#985): the POST only acks, so the `message` event is now the
  * source of truth for the agent's final reply (terminal). `message.rejected` is
- * a terminal error. `tool.invoke` is intermediate progress. Everything else
- * (tool.result, malformed payloads, unknown types) returns null.
+ * a terminal error. `tool.invoke` and `tool.result` are intermediate progress.
+ * Everything else (malformed payloads, unknown types) returns null.
  */
 export function parseSseEvent(data: string): SseEvent | null {
   let payload: unknown;
@@ -45,9 +45,13 @@ export function parseSseEvent(data: string): SseEvent | null {
   const p = payload as Record<string, unknown>;
 
   switch (p['type']) {
-    case 'tool.invoke': {
+    case 'tool.invoke':
+    case 'tool.result': {
       const tool = typeof p['tool'] === 'string' ? p['tool'] : 'tool';
-      return { kind: 'status', text: `invoking ${tool}` };
+      const agent = typeof p['agent'] === 'string' ? p['agent'] : '';
+      if (p['type'] === 'tool.result') return { kind: 'step-end', agent, tool, ok: p['success'] !== false };
+      const delegateTo = typeof p['delegate_to'] === 'string' ? p['delegate_to'] : undefined;
+      return { kind: 'step-start', agent, tool, ...(delegateTo ? { delegateTo } : {}) };
     }
     case 'message': {
       const text = typeof p['content'] === 'string' ? p['content'] : '';

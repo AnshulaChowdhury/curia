@@ -2,14 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { parseSseEvent, makeMessage, formatTimestamp, linkifyText, pickRecoveredReply } from './chat-utils.js';
 
 describe('parseSseEvent', () => {
-  it('returns a status event for tool.invoke', () => {
-    const data = JSON.stringify({ type: 'tool.invoke', tool: 'memory.recall', conversation_id: 'c1' });
-    expect(parseSseEvent(data)).toEqual({ kind: 'status', text: 'invoking memory.recall' });
+  it('starts a step on tool.invoke, naming who a delegation goes to', () => {
+    const data = JSON.stringify({ type: 'tool.invoke', agent: 'coordinator', tool: 'delegate', delegate_to: 'budget', conversation_id: 'c1' });
+    expect(parseSseEvent(data)).toEqual({ kind: 'step-start', agent: 'coordinator', tool: 'delegate', delegateTo: 'budget' });
   });
 
   it('falls back to "tool" when the tool field is absent', () => {
-    const data = JSON.stringify({ type: 'tool.invoke', conversation_id: 'c1' });
-    expect(parseSseEvent(data)).toEqual({ kind: 'status', text: 'invoking tool' });
+    expect(parseSseEvent(JSON.stringify({ type: 'tool.invoke' }))).toEqual({ kind: 'step-start', agent: '', tool: 'tool' });
   });
 
   it('returns a reply event with content and html for message events', () => {
@@ -40,8 +39,10 @@ describe('parseSseEvent', () => {
     expect(result.text).toContain('blocked_sender');
   });
 
-  it('returns null for tool.result events (not displayed)', () => {
-    expect(parseSseEvent(JSON.stringify({ type: 'tool.result', skill: 'memory.recall' }))).toBeNull();
+  it('ends a step on tool.result, saying whether it worked', () => {
+    const result = (success: boolean) => parseSseEvent(JSON.stringify({ type: 'tool.result', agent: 'budget', tool: 'budget-propose', success }));
+    expect(result(true)).toEqual({ kind: 'step-end', agent: 'budget', tool: 'budget-propose', ok: true });
+    expect(result(false)).toEqual({ kind: 'step-end', agent: 'budget', tool: 'budget-propose', ok: false });
   });
 
   it('returns null for malformed JSON', () => {

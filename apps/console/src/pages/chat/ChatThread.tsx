@@ -2,15 +2,19 @@
 import { useEffect, useRef } from 'react';
 import { formatTimestamp, linkifyText } from './chat-utils.js';
 import type { Message } from './types.js';
+import type { Work } from './activity.js';
+import { WorkingIndicator } from './WorkingIndicator.js';
 
 interface ChatThreadProps {
   messages: Message[];
   hasMore: boolean;
   loadingHistory: boolean;
   loadMore: () => Promise<void>;
+  /** The turn being worked on, shown after the last message. */
+  work?: Work | null;
 }
 
-export function ChatThread({ messages, hasMore, loadingHistory, loadMore }: ChatThreadProps) {
+export function ChatThread({ messages, hasMore, loadingHistory, loadMore, work }: ChatThreadProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const topSentinelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -45,6 +49,14 @@ export function ChatThread({ messages, hasMore, loadingHistory, loadMore }: Chat
     // If prev > 0 and lastId is unchanged, history was prepended — don't scroll.
     lastMessageId.current = currentLastId;
   }, [messages]);
+
+  // Keep the loader and its newest step in view, unless the reader has scrolled up to look at something.
+  const stepCount = work?.steps.length ?? -1;
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (stepCount < 0 || !container) return;
+    if (container.scrollHeight - container.scrollTop - container.clientHeight < 240) container.scrollTop = container.scrollHeight;
+  }, [stepCount]);
 
   // IntersectionObserver on the top sentinel triggers loadMore when the user
   // scrolls near the top of the thread and older history is available.
@@ -124,6 +136,8 @@ export function ChatThread({ messages, hasMore, loadingHistory, loadMore }: Chat
           </div>
         );
       })}
+
+      {work && <WorkingIndicator key={work.startedAt} work={work} />}
 
       <div ref={bottomRef} />
     </div>

@@ -425,6 +425,8 @@ interface ToolInvokePayload {
   toolName: string;
   input: Record<string, unknown>;
   taskEventId: string;  // traces back to the agent.task that triggered this
+  /** The conversation that delegated to this specialist, so the chat there can show its progress. */
+  originConversationId?: string;
 }
 
 interface ToolResultPayload {

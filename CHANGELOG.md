@@ -26,6 +26,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Chat working status** — Moonray loader with live steps, including a specialist's, and elapsed time.
+- **`tool.invoke` `originConversationId`** — **public API:** bus event names the chat that delegated.
 - **`LLMProvider.chat` `toolChoice`** — require a named tool; Bedrock and Anthropic.
 - **Budgets by month** — income, expense and savings categories, edited month by month (migration 136).
 - **`budget-plan`** — the budget agent reads budgeted amounts month by month.

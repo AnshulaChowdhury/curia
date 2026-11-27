@@ -10,13 +10,14 @@ export interface Message {
 
 /**
  * A parsed SSE event from GET /api/chat/stream, normalized for the chat UI.
- * - status:   intermediate progress (skill invocation) — append as a status line.
+ * - step-start / step-end: a tool began or finished, in this chat or in a specialist it asked.
  * - reply:    the agent's final reply for this turn (terminal).
  * - rejected: the turn was rejected before reaching the agent (terminal error).
  * parseSseEvent returns null for everything else (tool.result, malformed, etc.).
  */
 export type SseEvent =
-  | { kind: 'status'; text: string }
+  | { kind: 'step-start'; agent: string; tool: string; delegateTo?: string }
+  | { kind: 'step-end'; agent: string; tool: string; ok: boolean }
   | { kind: 'reply'; text: string; html: string | null }
   | { kind: 'rejected'; text: string };
 

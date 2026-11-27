@@ -18,7 +18,7 @@ import { ProposalCard } from './chat/ProposalCard.js';
 export default function ChatPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { messages, sending, hasMore, loadingHistory, send, loadMore, conversationId, ensureConversationId } = useChatSession();
+  const { messages, sending, work, hasMore, loadingHistory, send, loadMore, conversationId, ensureConversationId } = useChatSession();
   const attachment = useChatSheet(conversationId, ensureConversationId);
   const [sheetOpen, setSheetOpen] = useState(true);
   const framing = loadedAsChatPage(performance.getEntriesByType('navigation')[0]?.name);
@@ -26,7 +26,8 @@ export default function ChatPage() {
   const shown = attachment.sheet ?? attachment.leaving;
   const voiceCall = useVoiceCall();
   useHandedOffQuestion(send);
-  const changes = useBudgetProposal(conversationId, sending);
+  // Looked up when the work ends, not when the message box unlocks: a slow turn does those at different times.
+  const changes = useBudgetProposal(conversationId, work !== null);
   // "yes" while a proposal is on screen approves it here, without going through the assistant.
   const say = (text: string) => { if (changes.proposal && isApproval(text)) void changes.apply(); else send(text); };
 
@@ -53,6 +54,7 @@ export default function ChatPage() {
                 hasMore={hasMore}
                 loadingHistory={loadingHistory}
                 loadMore={loadMore}
+                work={work}
               />
               <div className="chat-input-area">
                 <VoiceCallBar {...voiceCall} />
