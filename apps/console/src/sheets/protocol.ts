@@ -1,4 +1,5 @@
-// The messages between the sheet page and the sandboxed converter frame.
+// The messages between the sheet page and the sandboxed converter frame. The frame sends 'ready' with one end of a
+// MessageChannel; everything else travels over that channel.
 
 export const CONVERTER_PATH = '/budget/convert-frame';
 

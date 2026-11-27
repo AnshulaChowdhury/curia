@@ -25,20 +25,29 @@ export async function convertFile(file: File, doc: Document = document, timeoutM
   frame.src = CONVERTER_PATH;
   const view = doc.defaultView!;
   return new Promise((resolve, reject) => {
+    let port: MessagePort | null = null;
     const end = (settle: () => void) => {
       view.clearTimeout(timer);
       view.removeEventListener('message', onMessage);
+      port?.close();
       frame.remove();
       settle();
     };
+    // The frame announces itself with one end of a private channel. The file and the result travel only over that, so
+    // neither can reach any other window.
     const onMessage = (event: MessageEvent) => {
-      if (event.source !== frame.contentWindow) return;
-      const message = event.data as FromConverter;
-      if (message?.kind === 'ready') {
-        const request: ToConverter = { kind: 'convert', name: file.name, bytes };
-        frame.contentWindow!.postMessage(request, '*', [bytes]);
-      } else if (message?.kind === 'done') end(() => resolve(message.workbook));
-      else if (message?.kind === 'failed') end(() => reject(new Error(`That file could not be read. ${message.message}`)));
+      // Our own frame only, once, and only if it has no origin, which is what the sandbox guarantees.
+      if (port || event.source !== frame.contentWindow || event.origin !== 'null') return;
+      const [handed] = event.ports;
+      if ((event.data as FromConverter)?.kind !== 'ready' || !handed) return;
+      port = handed;
+      port.onmessage = reply => {
+        const message = reply.data as FromConverter;
+        if (message?.kind === 'done') end(() => resolve(message.workbook));
+        else if (message?.kind === 'failed') end(() => reject(new Error(`That file could not be read. ${message.message}`)));
+      };
+      const request: ToConverter = { kind: 'convert', name: file.name, bytes };
+      port.postMessage(request, [bytes]);
     };
     const timer = view.setTimeout(() => end(() => reject(new Error('Reading that file took too long.'))), timeoutMs);
     view.addEventListener('message', onMessage);
