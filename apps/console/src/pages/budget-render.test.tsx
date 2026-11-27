@@ -3,11 +3,12 @@
 import { describe, it, expect } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MoneyCard } from '../components/MoneyCard.js';
-import { ReviewList } from './BudgetOverviewPage.js';
-import { RetireActions } from './BudgetsPage.js';
+import { OverviewView } from './BudgetOverviewPage.js';
+import { ReconcileSection, ReviewList } from './ReconcilePanel.js';
+import { monthFromSearch, RetireActions } from './BudgetsPage.js';
 import { ActionItems, SpendingPanel, StatusColumn, Tiles, CategoryBar } from './BudgetDashboard.js';
 import type { DashboardData } from './budget-data.js';
-import { NetWorthSummary, SideCard } from './NetWorthPage.js';
+import { NetWorthSummary, SideCard } from './NetWorthPanel.js';
 
 describe('MoneyCard', () => {
   const summary = {
@@ -70,7 +71,7 @@ describe('archived categories', () => {
 
 describe('dashboard', () => {
   const data: DashboardData = {
-    categories: [], review: [], banksNeedingYou: [{ id: 'l', institution: '<i>Bank</i>', status: 'error' }],
+    banksNeedingYou: [{ id: 'l', institution: '<i>Bank</i>', status: 'error' }],
     summary: {
       month: '2031-03',
       categories: [{ categoryId: 'a', name: '<b>Food</b>', archived: false, budgetedCents: 10000, spentCents: 12000, remainingCents: -2000, state: 'over' }],
@@ -85,6 +86,15 @@ describe('dashboard', () => {
     },
   };
 
+  it('holds the whole picture on one page: tiles, then assets and liabilities, with no review list', () => {
+    const html = renderToStaticMarkup(<OverviewView load={{ state: 'ok', data }} month="2031-03" onMonth={() => {}} onChanged={async () => {}} accounts={null} />);
+    expect(html).toContain('id="bud-networth"');
+    expect(html).toContain('aria-label="Assets"');
+    expect(html).toContain('aria-label="Liabilities"');
+    expect(html).toContain('href="#bud-networth"');
+    expect(html).toContain('Add an asset or liability');
+    expect(html).not.toContain('Needs a category');
+  });
   it('shows net worth up front', () => {
     const html = renderToStaticMarkup(<Tiles data={data} />);
     expect(html).toContain('Net worth');
@@ -102,6 +112,28 @@ describe('dashboard', () => {
     expect(html).toContain('Show as a table');
     expect(html).toContain('+50.0%');
     expect(html).toContain('—');
+  });
+});
+
+describe('reconciliation', () => {
+  const section = (data: Parameters<typeof ReconcileSection>[0]['data']) => renderToStaticMarkup(
+    <ReconcileSection month="2031-03" data={data} busy={false} error={null} onMonth={() => {}} onCategorise={() => {}} />);
+  const txn = { id: 't', account: 'Card', date: '2031-03-02', payee: 'Shop', description: '', amountCents: -100, categoryId: null, source: null };
+
+  it('says when there is nothing left, and keeps the month picker', () => {
+    const html = section({ categories: [], review: [] });
+    expect(html).toContain('Nothing to categorise in');
+    expect(html).toContain('aria-label="Previous month"');
+  });
+  it('asks for a budget first when there is no category to choose', () => {
+    expect(section({ categories: [], review: [txn] })).toContain('Add a budget below');
+  });
+  it('shows no rows while the chosen month loads', () => {
+    expect(section(null)).toContain('Loading');
+  });
+  it('opens on the month it was linked with', () => {
+    expect(monthFromSearch('?month=2031-03')).toBe('2031-03');
+    expect(monthFromSearch('?month=<x>')).toMatch(/^\d{4}-\d{2}$/);
   });
 });
 

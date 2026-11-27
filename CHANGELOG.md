@@ -25,6 +25,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Changed
 
 - **Budget categories** — used ones archive and keep history; only empty ones delete (migration 133).
+- **Budget tabs** — net worth moves into Overview; categorising moves to Budgets.
 
 ### Added
 

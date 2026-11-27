@@ -1,12 +1,19 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { BudgetShell, BudgetGate } from './BudgetShell.js';
-import { budgetClient, type BudgetLoad } from './budget-data.js';
+import { ReconcileSection } from './ReconcilePanel.js';
+import { budgetClient, type BudgetLoad, type ReconcileData } from './budget-data.js';
 import {
-  formatCents, centsToDollarInput, validateDraft,
+  currentMonth, isMonth, formatCents, centsToDollarInput, validateDraft,
   type BudgetCategory, type CategoryDraft,
 } from './budget-utils.js';
 
 const EMPTY: CategoryDraft = { name: '', amount: '', rollover: false };
+
+/** The month the overview linked here with, or this month. */
+export function monthFromSearch(search: string): string {
+  const month = new URLSearchParams(search).get('month') ?? '';
+  return isMonth(month) ? month : currentMonth();
+}
 
 /** Edit, then Delete (empty) or Archive (used), each confirmed in place. */
 export function RetireActions({ c, confirming, onAsk, onKeep, onConfirm, onEdit }: {
@@ -34,19 +41,31 @@ export function RetireActions({ c, confirming, onAsk, onKeep, onConfirm, onEdit 
 }
 
 export default function BudgetsPage() {
-  const [load, setLoad] = useState<BudgetLoad<BudgetCategory[]> | null>(null);
+  const [load, setLoad] = useState<BudgetLoad<ReconcileData> | null>(null);
+  const [month, setMonth] = useState(() => monthFromSearch(window.location.search));
+  const [busy, setBusy] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const wanted = useRef(month);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<CategoryDraft>(EMPTY);
   const [errors, setErrors] = useState<{ name?: string; amount?: string }>({});
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
+  // Only the answer for the month on screen is applied. The budgets stay put while another month loads.
   const refresh = useCallback(async () => {
-    setLoad(await budgetClient.loadCategories());
+    const m = wanted.current;
+    const result = await budgetClient.loadBudgets(m);
+    if (wanted.current === m) setLoad(result);
   }, []);
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    wanted.current = month;
+    setReviewError(null);
+    void refresh();
+  }, [month, refresh]);
 
-  const all: BudgetCategory[] = load?.state === 'ok' ? load.data : [];
+  const data = load?.state === 'ok' ? load.data : null;
+  const all: BudgetCategory[] = data?.categories ?? [];
   const categories = all.filter(c => !c.archived);
   const archived = all.filter(c => c.archived);
 
@@ -95,11 +114,27 @@ export default function BudgetsPage() {
     await refresh();
   }
 
+  async function categorise(id: string, categoryId: string) {
+    setBusy(true);
+    setReviewError(null);
+    try {
+      await budgetClient.categorise(id, categoryId);
+      await refresh();
+    } catch (err) {
+      console.error('budget categorise failed', err);
+      setReviewError('Could not save that category.');
+    }
+    setBusy(false);
+  }
+
   return (
     <BudgetShell active="/budget/budgets">
       <BudgetGate load={load} />
-      {load?.state === 'ok' && (
+      {data && (
         <>
+          <ReconcileSection month={month} data={data.month === month ? data : null} busy={busy} error={reviewError}
+            onMonth={setMonth} onCategorise={(id, c) => void categorise(id, c)} />
+
           <form className="dash-card" onSubmit={e => void submit(e)} noValidate aria-labelledby="bud-form-h">
             <h2 id="bud-form-h" className="dash-card-title">{editingId ? 'Edit budget' : 'Add a budget'}</h2>
             <div className="bud-form">
