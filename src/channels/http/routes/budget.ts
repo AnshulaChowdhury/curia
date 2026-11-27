@@ -5,6 +5,7 @@
 //   PATCH  /api/budget/categories/:id               — rename, change the budget or rollover
 //   DELETE /api/budget/categories/:id               — archive it; its transactions go back to uncategorised
 //   GET    /api/budget/summary?month=YYYY-MM        — spent against budget per category, and what needs the owner
+//   GET    /api/budget/trend?asOf=YYYY-MM-DD        — money out and in by month, and period-on-period spending
 //   GET    /api/budget/transactions                 — filter by month, category, account, needsReview
 //   PATCH  /api/budget/transactions/:id             — set or clear one transaction's category
 //   POST   /api/budget/transactions/bulk-categorise — set or clear the category of up to 500 transactions
@@ -24,7 +25,7 @@ import { ImportError, parseBankFile } from '../../../budget/import-parser.js';
 
 export interface BudgetRouteOptions {
   logger: Logger;
-  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'summary' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
+  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -93,6 +94,15 @@ export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOpt
     try {
       const month = request.query.month ?? new Date().toISOString().slice(0, 7);
       return noStore(reply).send(await store.summary(month));
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.get<{ Querystring: { asOf?: string } }>('/api/budget/trend', RATE, async (request, reply) => {
+    if (!owner(request, reply)) return reply;
+    try {
+      return noStore(reply).send(await store.trend(request.query.asOf ?? new Date().toISOString().slice(0, 10)));
     } catch (err) {
       return fail(reply, err);
     }

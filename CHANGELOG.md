@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Household finance dashboard** — net worth, spending history and budget status on one screen.
 - **Household net worth** — assets and liabilities from connected banks and hand entries (migration 132).
 - **Budget screens use real data** — categories and budgets save; assign categories on Overview.
 - **Budget bank-file import** — upload RBC, Tangerine, CIBC or .qbo/.ofx files into budget transactions, duplicates skipped.
