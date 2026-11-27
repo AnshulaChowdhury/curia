@@ -5,12 +5,13 @@
 import LuckyExcel from '@zwight/luckyexcel';
 import type { FromConverter, ToConverter } from './protocol.js';
 import { numbersFromText } from './csv-numbers.js';
+import { trimBlanks } from './trim-blanks.js';
 
 function convert(name: string, bytes: ArrayBuffer): Promise<unknown> {
   const file = new File([bytes], name);
   const csv = name.toLowerCase().endsWith('.csv');
   return new Promise((resolve, reject) => {
-    const done = (workbook: unknown) => resolve(csv ? numbersFromText(workbook) : workbook);
+    const done = (workbook: unknown) => resolve(trimBlanks(csv ? numbersFromText(workbook) : workbook));
     const failed = (error: unknown) => reject(error instanceof Error ? error : new Error(String(error)));
     if (csv) LuckyExcel.transformCsvToUniver(file, done, failed);
     else LuckyExcel.transformExcelToUniver(file, done, failed);
