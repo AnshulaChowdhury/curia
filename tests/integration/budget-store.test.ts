@@ -19,7 +19,7 @@ describeIf('budget store', () => {
   // the same time; each test starts from empty tables it owns.
   const wipe = async () => {
     await pool.query(`DELETE FROM budget_transactions WHERE (txn_date >= '2029-01-01' AND txn_date < '2030-01-01') OR (txn_date >= '2031-01-01' AND txn_date < '2032-01-01')`);
-    await pool.query(`DELETE FROM budget_categories WHERE name LIKE 'T-%'`);
+    await pool.query(`DELETE FROM budget_categories WHERE name LIKE 'T-%'`);   // after their transactions: the key restricts
     await pool.query(`DELETE FROM budget_rules`);
   };
   beforeAll(async () => {
@@ -30,15 +30,57 @@ describeIf('budget store', () => {
   beforeEach(wipe);
   afterAll(async () => { await wipe(); await pool.end(); });
 
-  it('keeps names unique and archives a deleted category, returning its transactions to uncategorised', async () => {
+  it('keeps open names unique, deletes only an empty category, and frees an archived name', async () => {
     const food = await store.createCategory({ name: 'T-Food', monthlyCents: 10000 });
     await expect(store.createCategory({ name: 't-food' })).rejects.toMatchObject({ kind: 'conflict' });
+    const spare = await store.createCategory({ name: 'T-Spare' });
+    await store.deleteCategory(spare.id);
+    expect((await store.listCategories({ includeArchived: true })).some(c => c.id === spare.id)).toBe(false);
+    await expect(store.deleteCategory(spare.id)).rejects.toMatchObject({ kind: 'not_found' });
+
     await store.addTransactions([txn({ categoryId: food.id, source: 'rule', ruleId: 'grocer' })]);
-    await store.deleteCategory(food.id);
-    const [t] = await store.listTransactions({ month: '2031-03' });
-    expect(t).toMatchObject({ categoryId: null, source: null, ruleId: null });
+    await expect(store.deleteCategory(food.id)).rejects.toMatchObject({ kind: 'conflict', message: expect.stringContaining('Archive') });
+    expect(await store.archiveCategory(food.id)).toMatchObject({ archived: true, transactionCount: 1 });
+    await expect(store.archiveCategory(food.id)).rejects.toMatchObject({ kind: 'not_found' });
+    await expect(store.deleteCategory(food.id)).rejects.toMatchObject({ kind: 'conflict' });
     expect((await store.listCategories()).some(c => c.id === food.id)).toBe(false);
-    await expect(store.deleteCategory(food.id)).rejects.toBeInstanceOf(BudgetError);
+    const again = await store.createCategory({ name: 'T-Food' });          // the name is free again
+    expect(again.sortOrder).toBeGreaterThan(food.sortOrder);
+  });
+
+  it('leaves an archived category its transactions and lets nothing new into it, whoever writes', async () => {
+    const old = await store.createCategory({ name: 'T-Old' });
+    const open = await store.createCategory({ name: 'T-Open' });
+    await store.addTransactions([txn({ categoryId: old.id, source: 'agent_guess', confidence: 0.5 }), txn({ description: 'loose' })]);
+    await store.archiveCategory(old.id);
+    const [kept, loose] = await Promise.all([
+      store.listTransactions({ month: '2031-03', categoryId: old.id }),
+      store.listTransactions({ month: '2031-03' }).then(rows => rows.filter(r => r.categoryId === null)),
+    ]);
+    expect(kept).toHaveLength(1);
+    await expect(store.categorise([loose[0]!.id], old.id)).rejects.toBeInstanceOf(BudgetError);
+    await expect(store.addTransactions([txn({ description: 'new', categoryId: old.id, source: 'rule' })])).rejects.toMatchObject({ kind: 'conflict' });
+    // Straight to the database, as a writer that skips the store's own check would.
+    await expect(pool.query(`UPDATE budget_transactions SET category_id = $2, source = 'rule' WHERE id = $1`, [loose[0]!.id, old.id]))
+      .rejects.toMatchObject({ constraint: 'budget_category_archived' });
+    await store.categorise([kept[0]!.id], open.id);                        // moving one out is fine
+    expect(await store.listTransactions({ month: '2031-03', categoryId: old.id })).toHaveLength(0);
+  });
+
+  it('shows an archived category only in months it has transactions, with its budget only for months already over', async () => {
+    const c = await store.createCategory({ name: 'T-Gone', monthlyCents: 5000 });
+    await store.addTransactions([
+      txn({ categoryId: c.id, source: 'you', date: '2031-03-10', amountCents: -6000 }),
+      txn({ categoryId: c.id, source: 'you', date: '2031-05-10', amountCents: -100, description: 'later' }),
+    ]);
+    await store.archiveCategory(c.id);
+    await pool.query(`UPDATE budget_categories SET archived_at = '2031-05-15' WHERE id = $1`, [c.id]);
+    const find = async (month: string) => (await store.summary(month)).categories.find(x => x.categoryId === c.id);
+    expect(await find('2031-03')).toMatchObject({ archived: true, budgetedCents: 5000, spentCents: 6000, state: 'over' });
+    expect(await find('2031-05')).toMatchObject({ archived: true, budgetedCents: null, spentCents: 100, state: 'no_budget' });
+    expect(await find('2031-04')).toBeUndefined();
+    expect((await store.summary('2031-03')).totals.spentCents).toBe(6000);
+    expect((await store.summary('2031-03')).needsYou.overBudget).toBe(0);    // nothing the owner can act on
   });
 
   it('never adds the same transaction twice', async () => {

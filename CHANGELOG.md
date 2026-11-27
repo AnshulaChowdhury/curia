@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Changed
+
+- **Budget categories** — used ones archive and keep history; only empty ones delete (migration 133).
+
 ### Added
 
 - **Household finance dashboard** — net worth, spending history and budget status on one screen.

@@ -63,7 +63,8 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
     }
   }
 
-  const categories = async () => (await call<{ categories: BudgetCategory[] }>('/api/budget/categories')).categories;
+  // Archived ones too: the Budgets page lists them, and the review list has to name one a transaction still points at.
+  const categories = async () => (await call<{ categories: BudgetCategory[] }>('/api/budget/categories?archived=1')).categories;
 
   const monthData = async (month: string): Promise<MonthData> => {
     const m = encodeURIComponent(month);
@@ -105,6 +106,9 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
     async saveCategory({ id, ...fields }: CategoryInput): Promise<void> {
       if (id) await call(`/api/budget/categories/${encodeURIComponent(id)}`, 'PATCH', fields);
       else await call('/api/budget/categories', 'POST', fields);
+    },
+    async archiveCategory(id: string): Promise<void> {
+      await call(`/api/budget/categories/${encodeURIComponent(id)}/archive`, 'POST');
     },
     async deleteCategory(id: string): Promise<void> {
       await call(`/api/budget/categories/${encodeURIComponent(id)}`, 'DELETE');

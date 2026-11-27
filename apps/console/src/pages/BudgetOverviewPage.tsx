@@ -4,7 +4,7 @@ import { AddTransactions } from './BudgetAccountsPanel.js';
 import { ActionItems, CategoryBar, SpendingPanel, StatusColumn, Tiles } from './BudgetDashboard.js';
 import { budgetClient, type BudgetLoad, type DashboardData } from './budget-data.js';
 import {
-  currentMonth, today, formatCents, shiftMonth, isMonth,
+  currentMonth, today, displayName, formatCents, shiftMonth, isMonth,
   type BudgetCategory, type BudgetTxn,
 } from './budget-utils.js';
 
@@ -24,7 +24,10 @@ export function ReviewList({ txns, categories, busy, onCategorise }: {
         <tr><th scope="col">Date</th><th scope="col">Payee</th><th scope="col" className="bud-right">Amount</th><th scope="col">Category</th></tr>
       </thead>
       <tbody>
-        {txns.slice(0, REVIEW_SHOWN).map(t => (
+        {txns.slice(0, REVIEW_SHOWN).map(t => {
+          // A guess may still point at a category that has since been archived: show it, but it cannot be chosen again.
+          const closed = categories.find(c => c.id === t.categoryId && c.archived);
+          return (
           <tr key={t.id}>
             <td>{t.date}</td>
             <td>{t.payee || t.description}<div className="bud-hint">{t.account}</div></td>
@@ -38,14 +41,16 @@ export function ReviewList({ txns, categories, busy, onCategorise }: {
                 onChange={e => { if (e.target.value) onCategorise(t.id, e.target.value); }}
               >
                 <option value="">Choose…</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                {closed && <option value={closed.id} disabled>{displayName(closed)}</option>}
+                {categories.filter(c => !c.archived).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
-              {t.source === 'agent_guess' && t.categoryId && (
+              {t.source === 'agent_guess' && t.categoryId && !closed && (
                 <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={() => onCategorise(t.id, t.categoryId!)}>Confirm guess</button>
               )}
             </div></td>
           </tr>
-        ))}
+          );
+        })}
       </tbody>
     </table>
   );
@@ -101,7 +106,7 @@ export function OverviewView({ load, month, busy, message, onMonth, onCategorise
             <span className="dash-count">{data.review.length}</span>
           </div>
           {message && <p className="bud-error" role="alert">{message}</p>}
-          {data.categories.length === 0
+          {data.categories.every(c => c.archived)
             ? <p className="bud-hint">Add a category on the Budgets tab, then assign these here.</p>
             : <div className="bud-table-wrap bud-review-scroll"><ReviewList txns={data.review} categories={data.categories} busy={busy} onCategorise={onCategorise} /></div>}
         </section>

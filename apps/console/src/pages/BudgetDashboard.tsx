@@ -5,7 +5,7 @@ import { BudgetBar } from '../components/MoneyCard.js';
 import { SpendingChart } from './SpendingChart.js';
 import { actionItems, cashCents, categorySegments, change, columnOf, inRange, type Column, type Range } from './budget-dashboard-utils.js';
 import type { DashboardData } from './budget-data.js';
-import { formatCents, formatMonth, type PeriodCompare } from './budget-utils.js';
+import { displayName, formatCents, formatMonth, type PeriodCompare } from './budget-utils.js';
 
 type Tone = 'blue' | 'aqua' | 'violet' | 'alert' | 'plain';
 
@@ -157,7 +157,7 @@ export function StatusColumn({ data, column }: { data: DashboardData; column: Co
           <ul>
             {categories.slice(0, SHOWN).map(c => (
               <li key={c.categoryId} className="bud-col-row">
-                <span className="bud-name">{c.name}</span>
+                <span className="bud-name">{displayName(c)}</span>
                 <span className="bud-num">
                   {c.remainingCents === null ? formatCents(c.spentCents) : c.remainingCents >= 0 ? `${formatCents(c.remainingCents)} left` : `${formatCents(-c.remainingCents)} over`}
                 </span>

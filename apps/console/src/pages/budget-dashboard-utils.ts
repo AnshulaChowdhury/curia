@@ -1,5 +1,5 @@
 // Pure logic for the budget dashboard: what the tiles, chart, category bar and lists show. No React, no fetching.
-import { counted, formatCents, type BudgetSummary, type CategorySummary, type NetWorth, type PeriodCompare, type TrendMonth } from './budget-utils.js';
+import { counted, displayName, formatCents, type BudgetSummary, type CategorySummary, type NetWorth, type PeriodCompare, type TrendMonth } from './budget-utils.js';
 
 /** Money held in cash accounts: the part of the assets that can be spent today. */
 export function cashCents(netWorth: NetWorth): number {
@@ -78,7 +78,7 @@ export function categorySegments(summary: BudgetSummary): Segment[] {
   let other = 0;
   summary.categories.forEach((c, i) => {
     if (c.spentCents <= 0) return;
-    if (i < SLOTS) segments.push({ key: c.categoryId, label: c.name, cents: c.spentCents, slot: i + 1 });
+    if (i < SLOTS) segments.push({ key: c.categoryId, label: displayName(c), cents: c.spentCents, slot: i + 1 });
     else other += c.spentCents;
   });
   if (other > 0) segments.push({ key: 'other', label: 'Other categories', cents: other, slot: 'other' });
@@ -103,12 +103,12 @@ export function actionItems(input: {
   const { uncategorised, guesses } = summary.needsYou;
   if (uncategorised > 0) items.push({ key: 'loose', tone: 'bad', strong: plural(uncategorised, 'transaction'), rest: `${uncategorised === 1 ? 'has' : 'have'} no category`, href: '#bud-review', action: 'Categorise' });
   if (guesses > 0) items.push({ key: 'guess', tone: 'warn', strong: `${guesses} guess${guesses === 1 ? '' : 'es'}`, rest: 'to confirm', href: '#bud-review', action: 'Review' });
-  const over = summary.categories.filter(c => c.state === 'over');
+  const over = summary.categories.filter(c => c.state === 'over' && !c.archived);
   if (over.length > 0) {
     const by = over.reduce((n, c) => n - (c.remainingCents ?? 0), 0);
     items.push({ key: 'over', tone: 'bad', strong: `${over.length} categor${over.length === 1 ? 'y' : 'ies'}`, rest: `over budget by ${formatCents(by)}`, href: '/budget/budgets', action: 'Adjust budgets' });
   }
-  if (!summary.categories.some(c => c.budgetedCents !== null)) {
+  if (!summary.categories.some(c => !c.archived && c.budgetedCents !== null)) {
     items.push({ key: 'nobudget', tone: 'warn', strong: 'No budgets yet', rest: 'so nothing can be tracked against a plan', href: '/budget/budgets', action: 'Set budgets' });
   }
   if (netWorth.accounts.length === 0) {
