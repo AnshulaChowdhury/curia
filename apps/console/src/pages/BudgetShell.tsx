@@ -13,7 +13,7 @@ const TABS: Array<{ to: '/budget' | '/budget/budgets' | '/budget/net-worth'; lab
 ];
 
 /** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions and Rules join the tabs later; importing lives on the overview. */
-export function BudgetShell({ active, children }: { active: string; children: ReactNode }) {
+export function BudgetShell({ active, children, wide = false }: { active: string; children: ReactNode; wide?: boolean }) {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -41,7 +41,7 @@ export function BudgetShell({ active, children }: { active: string; children: Re
             ))}
           </nav>
           <div className="bud-scroll">
-            <div className="bud-body">
+            <div className={`bud-body${wide ? ' bud-body-wide' : ''}`}>
               {children}
             </div>
           </div>

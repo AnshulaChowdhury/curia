@@ -15,9 +15,10 @@ describeIf('budget store', () => {
   let pool: pg.Pool;
   let store: BudgetStore;
 
-  // The year 2031 keeps these rows apart from anything real; each test starts from empty tables it owns.
+  // The years 2029 and 2031 keep these rows apart from anything real and from the bank-sync test (2032), which runs at
+  // the same time; each test starts from empty tables it owns.
   const wipe = async () => {
-    await pool.query(`DELETE FROM budget_transactions WHERE txn_date >= '2031-01-01'`);
+    await pool.query(`DELETE FROM budget_transactions WHERE (txn_date >= '2029-01-01' AND txn_date < '2030-01-01') OR (txn_date >= '2031-01-01' AND txn_date < '2032-01-01')`);
     await pool.query(`DELETE FROM budget_categories WHERE name LIKE 'T-%'`);
     await pool.query(`DELETE FROM budget_rules`);
   };
@@ -77,6 +78,28 @@ describeIf('budget store', () => {
     await store.categorise([t!.id], null);
     expect((await store.listTransactions({ month: '2031-03', needsReview: true }))).toHaveLength(1);
     await expect(store.categorise([t!.id], '00000000-0000-4000-8000-000000000000')).rejects.toMatchObject({ kind: 'not_found' });
+  });
+
+  it('totals money out and in by month and compares only with periods the history covers', async () => {
+    const row = (date: string, amountCents: number) => txn({ date, amountCents, description: `trend ${date}` });
+    await store.addTransactions([
+      row('2029-01-10', -1000), row('2029-02-05', -2000), row('2029-02-20', -3000), row('2029-02-28', 500),
+      row('2029-03-01', -400), row('2029-03-15', -600), row('2029-03-20', -9999),
+    ]);
+    const t = await store.trend('2029-03-15');
+    expect(t.firstDate).toBe('2029-01-10');
+    expect(t.months).toEqual([
+      { month: '2029-01', outCents: 1000, inCents: 0 },
+      { month: '2029-02', outCents: 5000, inCents: 500 },
+      { month: '2029-03', outCents: 1000, inCents: 0 },          // the 20th is after the date asked
+    ]);
+    expect(t.monthToDate).toEqual({ currentCents: 1000, previousCents: 2000 });   // 1-15 March against 1-15 February
+    expect(t.lastMonth).toEqual({ currentCents: 5000, previousCents: null });     // history starts mid-January
+    expect(t.yearToDate).toEqual({ currentCents: 7000, previousCents: null });
+    expect((await store.trend('2029-03-31')).monthToDate).toEqual({ currentCents: 10999, previousCents: 5000 }); // held to 28 February
+    expect((await store.trend('2028-06-01')).months).toEqual([]);
+    await expect(store.trend('2029-02-30')).rejects.toBeInstanceOf(BudgetError);
+    await expect(store.trend('soon')).rejects.toBeInstanceOf(BudgetError);
   });
 
   it('stores the rules only if they are valid YAML', async () => {

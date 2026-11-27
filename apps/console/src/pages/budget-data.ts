@@ -3,7 +3,7 @@
 // The server computes the month's summary, so the console, the morning brief and the budget specialist show the same
 // numbers; nothing here recalculates spending. A 401 or 403 means "locked": the pages never show partial data.
 import { apiFetch } from '../api.js';
-import type { AccountType, BudgetCategory, BudgetSummary, BudgetTxn, NetWorth } from './budget-utils.js';
+import type { AccountType, BudgetCategory, BudgetSummary, BudgetTrend, BudgetTxn, NetWorth } from './budget-utils.js';
 
 type Fetcher = (path: string, init?: RequestInit) => Promise<Response>;
 
@@ -17,6 +17,13 @@ export interface MonthData {
   summary: BudgetSummary;
   /** This month's transactions with no category, or a guess the owner has not confirmed. */
   review: BudgetTxn[];
+}
+
+export interface DashboardData extends MonthData {
+  netWorth: NetWorth;
+  trend: BudgetTrend;
+  /** Connected banks that need the owner: a fresh login, or a sync that failed. */
+  banksNeedingYou: Array<{ id: string; institution: string; status: 'needs_login' | 'error' }>;
 }
 
 export interface AccountInput { id: string | null; name: string; type: AccountType; balanceCents: number }
@@ -58,8 +65,31 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
 
   const categories = async () => (await call<{ categories: BudgetCategory[] }>('/api/budget/categories')).categories;
 
+  const monthData = async (month: string): Promise<MonthData> => {
+    const m = encodeURIComponent(month);
+    const [cats, summary, review] = await Promise.all([
+      categories(),
+      call<BudgetSummary>(`/api/budget/summary?month=${m}`),
+      call<{ transactions: BudgetTxn[] }>(`/api/budget/transactions?month=${m}&needsReview=true&limit=500`),
+    ]);
+    return { categories: cats, summary, review: review.transactions };
+  };
+
   return {
     loadCategories: () => load(categories),
+    /** Everything the dashboard shows: the chosen month, plus net worth, history and bank health as of today. */
+    loadDashboard: (month: string, asOf: string) => load<DashboardData>(async () => {
+      const [base, netWorth, trend, banks] = await Promise.all([
+        monthData(month),
+        call<NetWorth>('/api/budget/accounts'),
+        call<BudgetTrend>(`/api/budget/trend?asOf=${encodeURIComponent(asOf)}`),
+        // Bank connections are optional: without Plaid set up there are simply none to report.
+        call<{ links: Array<{ id: string; institution: string; status: string }> }>('/api/budget/banks')
+          .catch(err => { console.error('budget bank status failed', err); return { links: [] }; }),
+      ]);
+      const banksNeedingYou = banks.links.flatMap(l => (l.status === 'needs_login' || l.status === 'error' ? [{ id: l.id, institution: l.institution, status: l.status as 'needs_login' | 'error' }] : []));
+      return { ...base, netWorth, trend, banksNeedingYou };
+    }),
     loadNetWorth: () => load(() => call<NetWorth>('/api/budget/accounts')),
     async saveAccount({ id, ...fields }: AccountInput): Promise<void> {
       if (id) await call(`/api/budget/accounts/${encodeURIComponent(id)}`, 'PUT', fields);
@@ -72,15 +102,6 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
     async refreshBanks(): Promise<void> {
       await call('/api/budget/banks/sync', 'POST');
     },
-    loadMonth: (month: string) => load<MonthData>(async () => {
-      const m = encodeURIComponent(month);
-      const [cats, summary, review] = await Promise.all([
-        categories(),
-        call<BudgetSummary>(`/api/budget/summary?month=${m}`),
-        call<{ transactions: BudgetTxn[] }>(`/api/budget/transactions?month=${m}&needsReview=true&limit=500`),
-      ]);
-      return { categories: cats, summary, review: review.transactions };
-    }),
     async saveCategory({ id, ...fields }: CategoryInput): Promise<void> {
       if (id) await call(`/api/budget/categories/${encodeURIComponent(id)}`, 'PATCH', fields);
       else await call('/api/budget/categories', 'POST', fields);

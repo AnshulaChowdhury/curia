@@ -4258,3 +4258,117 @@ table.records-table tbody tr.active td { background: transparent; }
 .bud-link:hover { color: var(--app-fg); }
 .bud-form-4 { grid-template-columns: minmax(0, 2fr) minmax(0, 1.4fr) minmax(0, 1.4fr) auto; }
 @media (max-width: 760px) { .bud-form-4 { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---- Budget dashboard ---- */
+/* Chart colours: a checked categorical set, one fixed slot per category (light, then dark). */
+.bud-body { --viz-1: #257de0; --viz-2: #f47230; --viz-3: #00b894; --viz-4: #f2a600; --viz-5: #ee7fac; --viz-6: #008a17; --viz-7: #6a4ce2; --viz-8: #ec4647; }
+[data-theme="dark"] .bud-body { --viz-1: #338ced; --viz-2: #e76624; --viz-3: #00a888; --viz-4: #d28e05; --viz-5: #e24d8b; --viz-6: #0aac23; --viz-7: #9887ef; --viz-8: #eb6263; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .bud-body { --viz-1: #338ced; --viz-2: #e76624; --viz-3: #00a888; --viz-4: #d28e05; --viz-5: #e24d8b; --viz-6: #0aac23; --viz-7: #9887ef; --viz-8: #eb6263; } }
+.bud-body-wide { max-width: 1440px; }
+
+.bud-top { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 14px; align-items: stretch; }
+.bud-top-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.bud-tiles { display: grid; grid-auto-rows: 1fr; gap: 14px; }
+.bud-tile { display: flex; flex-direction: column; justify-content: center; gap: 6px; padding: 14px 16px; border: 1px solid var(--app-border); border-radius: 12px; background: var(--app-card); color: var(--app-fg); text-decoration: none; min-width: 0; }
+.bud-tile:hover { border-color: var(--app-input-bd); }
+.bud-tile-label { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--app-fg-muted); }
+.bud-tile-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.bud-dotmark { flex: none; width: 8px; height: 8px; border-radius: 999px; background: var(--app-fg-muted); }
+.bud-tile-blue .bud-dotmark { background: var(--viz-1); }
+.bud-tile-aqua .bud-dotmark { background: var(--viz-3); }
+.bud-tile-violet .bud-dotmark { background: var(--viz-7); }
+.bud-tile-alert { border-color: var(--app-destructive); background: color-mix(in srgb, var(--app-destructive) 12%, var(--app-card)); }
+.bud-tile-alert .bud-dotmark, .bud-dotmark.is-bad { background: var(--app-destructive); }
+.bud-dotmark.is-warn { background: var(--app-amber); }
+
+.bud-body .bud-spend { display: grid; grid-template-columns: minmax(260px, 2fr) minmax(0, 5fr); gap: 18px; }
+.bud-spend-figures { display: flex; flex-direction: column; gap: 10px; border-right: 1px solid var(--app-border); padding-right: 16px; min-width: 0; }
+.bud-spend-chart { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.bud-compare-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.bud-compare-table thead th { font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--app-fg-muted); padding-bottom: 6px; }
+.bud-compare-table tbody th, .bud-compare-table tbody td { padding: 10px 0; border-top: 1px solid var(--app-border); vertical-align: top; }
+.bud-compare-table tbody th { text-align: left; font-weight: 500; }
+.bud-compare-table tbody th .bud-hint { display: block; font-weight: 400; }
+.bud-compare-table .bud-right { text-align: right; padding-left: 8px; font-variant-numeric: tabular-nums; }
+.bud-big { display: block; font-size: 16px; font-weight: 700; }
+.bud-delta { display: inline-block; margin-top: 3px; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+.bud-delta.is-up { color: var(--app-destructive); background: color-mix(in srgb, var(--app-destructive) 14%, transparent); }
+.bud-delta.is-down { color: var(--app-green); background: color-mix(in srgb, var(--app-green) 14%, transparent); }
+.bud-ranges { display: flex; justify-content: flex-end; gap: 4px; }
+.bud-range { padding: 4px 10px; border: 0; border-radius: 6px; background: none; font: inherit; font-size: 12px; color: var(--app-fg-muted); cursor: pointer; }
+.bud-range:hover { color: var(--app-fg); }
+.bud-range.is-active { background: var(--app-accent-bg); color: var(--app-fg); font-weight: 600; }
+
+.bud-chart { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.bud-plot { position: relative; min-width: 0; overflow: hidden; }
+.bud-plot svg { display: block; }
+.bud-grid-line { stroke: var(--app-border); stroke-width: 1; opacity: 0.6; }
+.bud-axis { fill: var(--app-fg-muted); font-size: 11px; }
+.bud-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.bud-line-out { stroke: var(--viz-1); }
+.bud-line-in { stroke: var(--viz-2); }
+.bud-area { fill: var(--viz-1); opacity: 0.1; }
+.bud-dot { stroke: var(--app-card); stroke-width: 2; }
+.bud-dot-out { fill: var(--viz-1); }
+.bud-dot-in { fill: var(--viz-2); }
+.bud-cross { stroke: var(--app-fg-muted); stroke-width: 1; }
+.bud-tip { position: absolute; top: 4px; width: 160px; display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 1px solid var(--app-input-bd); border-radius: 8px; background: var(--app-card-elev); font-size: 12px; pointer-events: none; }
+.bud-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--app-fg-muted); }
+.bud-legend li { display: flex; align-items: center; gap: 6px; }
+.bud-legend strong { color: var(--app-fg); font-variant-numeric: tabular-nums; }
+.bud-key { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 2px; background: var(--app-fg-subtle); }
+.bud-key-out { background: var(--viz-1); }
+.bud-key-in { background: var(--viz-2); }
+.bud-table-toggle summary { font-size: 12px; color: var(--app-fg-muted); cursor: pointer; }
+.bud-table-toggle[open] summary { margin-bottom: 10px; }
+
+.bud-split { display: flex; gap: 2px; height: 28px; border-radius: 999px; overflow: hidden; }
+.bud-seg { display: flex; align-items: center; justify-content: center; flex-basis: 0; min-width: 4px; font-size: 11px; font-weight: 700; color: #fff; }
+.bud-slot-1 { background: var(--viz-1); } .bud-slot-2 { background: var(--viz-2); } .bud-slot-3 { background: var(--viz-3); }
+.bud-slot-4 { background: var(--viz-4); color: #0b0b0b; } .bud-slot-5 { background: var(--viz-5); } .bud-slot-6 { background: var(--viz-6); }
+.bud-slot-7 { background: var(--viz-7); } .bud-slot-8 { background: var(--viz-8); }
+.bud-slot-other { background: var(--app-fg-muted); color: #0b0b0b; }
+.bud-slot-none { background: var(--app-fg-subtle); }
+
+.bud-columns { display: grid; grid-template-columns: minmax(0, 1.8fr) repeat(3, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
+.bud-col { --tone: var(--app-teal); display: flex; flex-direction: column; min-width: 0; border: 1px solid color-mix(in srgb, var(--tone) 55%, transparent); border-radius: 12px; background: var(--app-card); overflow: hidden; }
+.bud-col-over { --tone: var(--app-destructive); }
+.bud-col-near { --tone: var(--app-amber); }
+.bud-col-under { --tone: var(--app-green); }
+.bud-col-actions { --tone: var(--viz-3); }
+.bud-col > header { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 14px 16px; background: color-mix(in srgb, var(--tone) 14%, transparent); }
+.bud-col h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 600; color: var(--app-fg); }
+.bud-col h2 .bud-dotmark { background: var(--tone); }
+.bud-count { font-size: 20px; font-weight: 700; color: var(--tone); font-variant-numeric: tabular-nums; }
+.bud-badge { min-width: 22px; padding: 2px 6px; border-radius: 999px; text-align: center; font-size: 12px; font-weight: 700; background: var(--tone); color: #0b0b0b; box-sizing: border-box; }
+.bud-col ul { list-style: none; margin: 0; padding: 0; }
+.bud-col li { border-top: 1px solid var(--app-border-soft); }
+.bud-col-empty { margin: 0; padding: 14px 16px; font-size: 12px; color: var(--app-fg-muted); }
+.bud-col-total { display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; }
+.bud-col-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 10px 16px; font-size: 13px; flex-wrap: wrap; }
+.bud-col-more { margin-top: auto; padding: 12px 16px; text-align: center; font-size: 12px; color: var(--app-fg); }
+.bud-action { display: flex; gap: 10px; padding: 12px 16px; font-size: 13px; }
+.bud-action .bud-dotmark { margin-top: 6px; }
+.bud-action p { margin: 0 0 4px; }
+.bud-action a { font-size: 12px; color: var(--app-fg-muted); }
+.bud-action a:hover { color: var(--app-fg); }
+.bud-review-scroll { max-height: 420px; overflow: auto; }
+
+@media (max-width: 1180px) {
+  .bud-body .bud-spend { grid-template-columns: minmax(0, 1fr); }
+  .bud-spend-figures { border-right: 0; padding-right: 0; }
+  .bud-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .bud-top { grid-template-columns: minmax(0, 1fr); }
+  .bud-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .bud-tile-value { font-size: 20px; }
+  .bud-columns { grid-template-columns: minmax(0, 1fr); }
+}
+.bud-col-under .bud-bar-fill { background: var(--app-green); }
+/* On the full-width dashboard the two ways of adding transactions sit side by side. */
+@media (min-width: 901px) {
+  #bud-add .bud-add { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 28px; align-items: start; }
+  #bud-add .bud-add > .dash-card-title { grid-column: 1 / -1; }
+  #bud-add .bud-add > .bud-section + .bud-section { border-top: 0; border-left: 1px solid var(--app-border); padding: 0 0 0 28px; }
+}

@@ -96,18 +96,6 @@ export const STATUS_LABEL: Record<BudgetStatus, string> = {
   over: 'Over budget',
 };
 
-/** Plain sentences for what the owner has to look at this month. */
-export function needsYouLines(summary: BudgetSummary): string[] {
-  const { uncategorised, guesses } = summary.needsYou;
-  const lines: string[] = [];
-  if (uncategorised > 0) lines.push(`${uncategorised} transaction${uncategorised === 1 ? '' : 's'} without a category`);
-  if (guesses > 0) lines.push(`${guesses} agent guess${guesses === 1 ? '' : 'es'} to confirm`);
-  for (const c of summary.categories) {
-    if (c.state === 'over' && c.remainingCents !== null) lines.push(`${c.name} is over budget by ${formatCents(-c.remainingCents)}`);
-  }
-  return lines;
-}
-
 /** Bar fill percent, clamped for display. The real ratio stays available for text. */
 export function barPercent(ratio: number): number {
   if (!Number.isFinite(ratio)) return 100;
@@ -119,6 +107,24 @@ export interface MoneySummary {
   month: string;
   top: Array<{ id: string; name: string; spentCents: number; budgetCents: number; status: BudgetStatus }>;
   needsYouCount: number;
+}
+
+// ---- Money over time (dashboard) ----
+
+export interface PeriodCompare { currentCents: number; previousCents: number | null }
+export interface TrendMonth { month: string; outCents: number; inCents: number }
+export interface BudgetTrend {
+  asOf: string;
+  firstDate: string | null;
+  months: TrendMonth[];
+  monthToDate: PeriodCompare;
+  lastMonth: PeriodCompare;
+  yearToDate: PeriodCompare;
+}
+
+/** Today in the viewer's own time zone, as YYYY-MM-DD. */
+export function today(now = new Date()): string {
+  return `${currentMonth(now)}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
 // ---- Assets and debts (Net worth page) ----

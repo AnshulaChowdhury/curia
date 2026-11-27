@@ -62,6 +62,28 @@ export interface BudgetSummary {
   needsYou: { uncategorised: number; guesses: number; overBudget: number };
 }
 
+export interface PeriodCompare {
+  /** Money out in the period, in cents. */
+  currentCents: number;
+  /** The same period one step earlier; null when the stored history does not reach back that far. */
+  previousCents: number | null;
+}
+
+export interface BudgetTrend {
+  asOf: string;
+  /** The date of the oldest stored transaction, or null when there are none. */
+  firstDate: string | null;
+  /** Up to 24 months ending with asOf's month, starting no earlier than the first transaction. */
+  months: Array<{ month: string; outCents: number; inCents: number }>;
+  monthToDate: PeriodCompare;
+  lastMonth: PeriodCompare;
+  yearToDate: PeriodCompare;
+}
+
+const isoDay = (y: number, m0: number, d: number): string => new Date(Date.UTC(y, m0, d)).toISOString().slice(0, 10);
+/** The same day of the month in another month, held to that month's last day (31 March -> 28 February). */
+const clampedDay = (y: number, m0: number, d: number): string => isoDay(y, m0, Math.min(d, new Date(Date.UTC(y, m0 + 1, 0)).getUTCDate()));
+
 export interface TransactionFilter {
   month?: string;
   categoryId?: string;
@@ -291,6 +313,43 @@ export class BudgetStore {
         uncategorisedSpentCents: Number(l.spent),
       },
       needsYou: { uncategorised: Number(l.uncategorised), guesses: Number(l.guesses), overBudget: categories.filter(c => c.state === 'over').length },
+    };
+  }
+
+  // -- money in and out over time ---------------------------------------------------------------------------------
+
+  /** Every stored transaction counts, whatever its category: money moved between the owner's accounts is included. */
+  async trend(asOf: string): Promise<BudgetTrend> {
+    const at = new Date(`${asOf}T00:00:00Z`);
+    if (!DAY.test(asOf) || Number.isNaN(at.getTime()) || at.toISOString().slice(0, 10) !== asOf) throw new BudgetError('asOf must be a YYYY-MM-DD date');
+    const [y, m0, d] = [at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()];
+    const first = (await this.pool.query<{ day: string | null }>(`SELECT to_char(min(txn_date), 'YYYY-MM-DD') AS day FROM budget_transactions`)).rows[0]!.day;
+    const { rows } = await this.pool.query<{ month: string; out: string; inn: string }>(
+      `SELECT to_char(txn_date, 'YYYY-MM') AS month,
+              COALESCE(-SUM(amount_cents) FILTER (WHERE amount_cents < 0), 0)::text AS out,
+              COALESCE(SUM(amount_cents) FILTER (WHERE amount_cents > 0), 0)::text AS inn
+       FROM budget_transactions WHERE txn_date >= $1 AND txn_date <= $2 GROUP BY 1`,
+      [isoDay(y, m0 - 23, 1), asOf],
+    );
+    const byMonth = new Map(rows.map(r => [r.month, r]));
+    const months: BudgetTrend['months'] = [];
+    for (let back = 23; back >= 0; back--) {
+      const month = isoDay(y, m0 - back, 1).slice(0, 7);
+      if (!first || month < first.slice(0, 7)) continue;
+      months.push({ month, outCents: Number(byMonth.get(month)?.out ?? 0), inCents: Number(byMonth.get(month)?.inn ?? 0) });
+    }
+    const spent = async (from: string, to: string): Promise<number> => Number((await this.pool.query<{ out: string }>(
+      `SELECT COALESCE(-SUM(amount_cents) FILTER (WHERE amount_cents < 0), 0)::text AS out FROM budget_transactions WHERE txn_date >= $1 AND txn_date <= $2`,
+      [from, to])).rows[0]!.out);
+    const compare = async (current: [string, string], previous: [string, string]): Promise<PeriodCompare> => ({
+      currentCents: await spent(...current),
+      previousCents: first !== null && first <= previous[0] ? await spent(...previous) : null,
+    });
+    return {
+      asOf, firstDate: first, months,
+      monthToDate: await compare([isoDay(y, m0, 1), asOf], [isoDay(y, m0 - 1, 1), clampedDay(y, m0 - 1, d)]),
+      lastMonth: await compare([isoDay(y, m0 - 1, 1), isoDay(y, m0, 0)], [isoDay(y, m0 - 2, 1), isoDay(y, m0 - 1, 0)]),
+      yearToDate: await compare([isoDay(y, 0, 1), asOf], [isoDay(y - 1, 0, 1), clampedDay(y - 1, m0, d)]),
     };
   }
 
