@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { BanksPanel, BankLinkRow } from './BudgetImportPage.js';
+import { BanksPanel, BankLinkRow } from './BudgetAccountsPanel.js';
 import { createBankClient, validateAccount, accountLabel, BudgetApiError } from './budget-banks.js';
 
 const noop = () => {};

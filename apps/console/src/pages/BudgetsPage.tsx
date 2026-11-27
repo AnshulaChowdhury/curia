@@ -76,7 +76,9 @@ export default function BudgetsPage() {
               <label className="bud-field">
                 <span>Category name</span>
                 <input
+                  className="bud-input"
                   type="text"
+                  placeholder="e.g. Groceries"
                   value={draft.name}
                   onChange={e => setDraft({ ...draft, name: e.target.value })}
                   aria-invalid={errors.name ? true : undefined}
@@ -88,8 +90,10 @@ export default function BudgetsPage() {
               <label className="bud-field">
                 <span>Monthly amount (CAD)</span>
                 <input
+                  className="bud-input"
                   type="text"
                   inputMode="decimal"
+                  placeholder="0.00"
                   value={draft.amount}
                   onChange={e => setDraft({ ...draft, amount: e.target.value })}
                   aria-invalid={errors.amount ? true : undefined}
@@ -97,39 +101,39 @@ export default function BudgetsPage() {
                 />
                 {errors.amount && <span id="bud-amt-err" className="bud-err" role="alert">{errors.amount}</span>}
               </label>
-              <label className="bud-check">
-                <input
-                  type="checkbox"
-                  checked={draft.rollover}
-                  onChange={e => setDraft({ ...draft, rollover: e.target.checked })}
-                />
-                <span>Carry unspent money into next month (saved, not counted in totals yet)</span>
-              </label>
+              <div className="bud-actions">
+                <button type="submit" className="btn btn-primary btn-sm">{editingId ? 'Save changes' : 'Add budget'}</button>
+                {editingId && <button type="button" className="btn btn-secondary btn-sm" onClick={reset}>Cancel</button>}
+              </div>
             </div>
-            <div className="bud-actions">
-              <button type="submit" className="btn btn-primary btn-sm">{editingId ? 'Save changes' : 'Add budget'}</button>
-              {editingId && <button type="button" className="btn btn-secondary btn-sm" onClick={reset}>Cancel</button>}
-            </div>
+            <label className="bud-check">
+              <input
+                type="checkbox"
+                checked={draft.rollover}
+                onChange={e => setDraft({ ...draft, rollover: e.target.checked })}
+              />
+              <span>Carry unspent money into next month (saved, not counted in totals yet)</span>
+            </label>
           </form>
 
-          {message && <p className="dash-card-quiet" role="status">{message}</p>}
+          {message && <p className="bud-hint" role="status">{message}</p>}
 
           <section className="dash-card" aria-labelledby="bud-list-h">
             <h2 id="bud-list-h" className="dash-card-title">Budgets</h2>
             {categories.length === 0 ? (
-              <p className="dash-card-quiet">No budgets yet. Add your first one above.</p>
+              <p className="bud-hint">No budgets yet. Add your first one above.</p>
             ) : (
-              <table className="records-table">
+              <div className="bud-table-wrap"><table className="bud-table">
                 <thead>
-                  <tr><th scope="col">Category</th><th scope="col" style={{ textAlign: 'right' }}>Per month</th><th scope="col">Rollover</th><th scope="col"><span className="bud-sr">Actions</span></th></tr>
+                  <tr><th scope="col">Category</th><th scope="col" className="bud-right">Per month</th><th scope="col">Rollover</th><th scope="col"><span className="bud-sr">Actions</span></th></tr>
                 </thead>
                 <tbody>
                   {categories.map(c => (
                     <tr key={c.id}>
-                      <td>{c.name}</td>
-                      <td style={{ textAlign: 'right' }}>{c.monthlyCents === null ? 'No budget' : formatCents(c.monthlyCents)}</td>
+                      <td className="bud-name">{c.name}</td>
+                      <td className="bud-right">{c.monthlyCents === null ? 'No budget' : formatCents(c.monthlyCents)}</td>
                       <td>{c.rollover ? 'Yes' : 'No'}</td>
-                      <td className="bud-row-actions">
+                      <td className="bud-right"><div className="bud-row-actions">
                         {confirmId === c.id ? (
                           <>
                             <span>Delete {c.name}?</span>
@@ -142,11 +146,11 @@ export default function BudgetsPage() {
                             <button type="button" className="btn btn-secondary btn-sm" onClick={() => setConfirmId(c.id)} aria-label={`Delete ${c.name}`}>Delete</button>
                           </>
                         )}
-                      </td>
+                      </div></td>
                     </tr>
                   ))}
                 </tbody>
-              </table>
+              </table></div>
             )}
           </section>
         </>

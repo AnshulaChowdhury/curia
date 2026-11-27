@@ -11,7 +11,7 @@ Personal finance is separate from the MowMow business books (the Books page). Ow
 | `/budget` | Overview | built |
 | `/budget/budgets` | Budgets | built |
 | `/budget/transactions` | Transactions | next PR |
-| `/budget/import` | Import | next PR |
+| `/budget/import` | Redirects to Overview, which holds file upload and bank connections | built |
 | `/budget/rules` | Rules | next PR |
 | `/budget/yearly`, `/budget/flow` | Yearly grid, Sankey | stub only |
 

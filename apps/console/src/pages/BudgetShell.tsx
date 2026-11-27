@@ -6,13 +6,12 @@ import { Topbar } from '../components/Topbar.js';
 import { useTheme } from '../hooks/useTheme.js';
 import type { BudgetLoad } from './budget-data.js';
 
-const TABS: Array<{ to: '/budget' | '/budget/budgets' | '/budget/import'; label: string }> = [
+const TABS: Array<{ to: '/budget' | '/budget/budgets'; label: string }> = [
   { to: '/budget', label: 'Overview' },
   { to: '/budget/budgets', label: 'Budgets' },
-  { to: '/budget/import', label: 'Import' },
 ];
 
-/** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions and Rules join the tabs later. */
+/** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions and Rules join the tabs later; importing lives on the overview. */
 export function BudgetShell({ active, children }: { active: string; children: ReactNode }) {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -40,8 +39,10 @@ export function BudgetShell({ active, children }: { active: string; children: Re
               </Link>
             ))}
           </nav>
-          <div className="bud-body">
-            {children}
+          <div className="bud-scroll">
+            <div className="bud-body">
+              {children}
+            </div>
           </div>
         </main>
       </div>
