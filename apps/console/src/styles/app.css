@@ -4416,9 +4416,19 @@ table.records-table tbody tr.active td { background: transparent; }
 
 /* Proposed budget changes, above the message box */
 .chat-proposal { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; padding: 10px 14px; background: var(--app-card); border: 1px solid var(--app-border); border-radius: 8px; font-size: 13px; }
-.chat-proposal.is-waiting { display: flex; flex-direction: column; align-items: stretch; border-color: var(--app-primary); }
+/* nowrap: a wrapping column takes the width of the table, which then runs past the card and cannot be scrolled. */
+.chat-proposal.is-waiting { display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; border-color: var(--app-primary); }
 .chat-proposal h2, .chat-proposal p { margin: 0; }
-.chat-proposal-scroll { max-height: 42vh; overflow: auto; }
+.chat-proposal-scroll { min-width: 0; max-height: 42vh; overflow: auto; scroll-padding: 28px 0 0 150px; /* a box tabbed to is not left under the pinned names */ }
+/* Scrollbars that stay visible: macOS otherwise hides them, and nothing shows there are more months to the right. */
+.chat-proposal-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
+.chat-proposal-scroll::-webkit-scrollbar-track, .chat-proposal-scroll::-webkit-scrollbar-corner { background: var(--app-bg-sunken); border-radius: 6px; }
+.chat-proposal-scroll::-webkit-scrollbar-thumb { min-width: 40px; min-height: 40px; background: var(--app-fg-subtle); border: 2px solid var(--app-bg-sunken); border-radius: 6px; }
+.chat-proposal-scroll::-webkit-scrollbar-thumb:hover { background: var(--app-fg-muted); }
+@supports not selector(::-webkit-scrollbar) { .chat-proposal-scroll { scrollbar-width: auto; scrollbar-color: var(--app-fg-subtle) var(--app-bg-sunken); } }
+/* Solid, not the chat's glass: figures must not show through the pinned headings and names. */
+[data-theme="dark"] .chat-page .chat-proposal { --app-card: var(--mr-surface-solid); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .chat-page .chat-proposal { --app-card: var(--mr-surface-solid); } }
 .chat-proposal td { white-space: nowrap; padding: 4px 10px 4px 0; vertical-align: top; }
 /* The month headings and the category names stay put while the amounts scroll under them. */
 .chat-proposal thead th { position: sticky; top: 0; z-index: 2; background: var(--app-card); }

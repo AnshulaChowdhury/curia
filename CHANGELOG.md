@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Proposal card** — later months were cut off; now scrolls, with a visible scrollbar.
 - **Spreadsheet dates** — month and day names show in English, not Chinese.
 - **Unbacked claims** — budget chats no longer say work was delegated when nothing ran.
 
