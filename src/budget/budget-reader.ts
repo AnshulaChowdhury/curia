@@ -5,9 +5,9 @@
 // the ADR. Amounts leave here in dollars (a model cannot convert cents reliably); payee and description are bank text and
 // are returned as data only.
 
-import type { BudgetStore, BudgetTransaction } from './budget-store.js';
+import type { BudgetStore, BudgetTransaction, CategoryKind } from './budget-store.js';
 
-type Store = Pick<BudgetStore, 'summary' | 'listTransactions' | 'listCategories'>;
+type Store = Pick<BudgetStore, 'summary' | 'plan' | 'listTransactions' | 'listCategories'>;
 
 const dollars = (cents: number): number => Math.round(cents) / 100;
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -18,6 +18,13 @@ export interface BudgetSummaryForAgent {
   categories: Array<{ name: string; archived?: true; budgeted: number | null; spent: number; remaining: number | null; state: 'no_budget' | 'under' | 'near' | 'over' }>;
   totals: { budgeted: number; spent: number; spentOnUncategorised: number };
   needsYou: { uncategorised: number; guesses: number; overBudget: number };
+}
+
+export interface BudgetPlanForAgent {
+  currency: 'CAD';
+  months: string[];
+  /** Every open category, with its budget in dollars for each month (null: none set). */
+  categories: Array<{ name: string; type: CategoryKind; amounts: Record<string, number | null> }>;
 }
 
 export interface BudgetTransactionForAgent {
@@ -50,6 +57,21 @@ export class BudgetReader {
       })),
       totals: { budgeted: dollars(s.totals.budgetedCents), spent: dollars(s.totals.spentCents), spentOnUncategorised: dollars(s.totals.uncategorisedSpentCents) },
       needsYou: s.needsYou,
+    };
+  }
+
+  /** What is budgeted month by month, income and savings as well as spending. */
+  async plan(from: string, months = 6): Promise<BudgetPlanForAgent> {
+    if (!MONTH.test(from)) throw new Error('month must be YYYY-MM');
+    const p = await this.store.plan(from, Number.isFinite(months) ? Math.min(Math.max(1, Math.floor(months)), 24) : 6);
+    return {
+      currency: 'CAD',
+      months: p.months,
+      categories: p.categories.map(c => ({
+        name: c.name,
+        type: c.kind,
+        amounts: Object.fromEntries(p.months.map((m, i) => { const cents = c.amounts[i]?.cents ?? null; return [m, cents === null ? null : dollars(cents)]; })),
+      })),
     };
   }
 

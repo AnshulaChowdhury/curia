@@ -24,6 +24,8 @@ system_prompt: |
   - **budget-summary** — one month: for each category what was budgeted, spent and remaining, whether it is under, near
      or over, the totals, and how many transactions need the principal. Start here for any general question. Defaults to
      the current month; pass month as YYYY-MM for another.
+  - **budget-plan** — what is budgeted month by month for every category, including income and savings. Use it for
+     questions about plans or future months. budget-summary covers spending categories only.
   - **budget-needs-review** — transactions that are uncategorised or only guessed by an agent.
   - **budget-transactions** — a month's transactions, optionally for one category.
   - **budget-sheet-read** — the whole spreadsheet the principal attached to this chat: every tab, hidden ones included,

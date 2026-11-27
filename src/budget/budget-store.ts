@@ -10,9 +10,27 @@ import type { DbPool } from '../db/connection.js';
 
 export type CategorisedBy = 'rule' | 'agent_guess' | 'you';
 
+export const CATEGORY_KINDS = ['expense', 'income', 'savings'] as const;
+export type CategoryKind = (typeof CATEGORY_KINDS)[number];
+
+/** Budgets month by month: for each open category, what is budgeted in each of `months`. */
+export interface BudgetPlan {
+  months: string[];
+  categories: Array<{
+    categoryId: string;
+    name: string;
+    kind: CategoryKind;
+    /** One per month, in order. `own` is true when the month has its own amount rather than the usual one. */
+    amounts: Array<{ cents: number | null; own: boolean }>;
+  }>;
+}
+
+export const MAX_PLAN_MONTHS = 24;
+
 export interface BudgetCategory {
   id: string;
   name: string;
+  kind: CategoryKind;
   monthlyCents: number | null;
   rollover: boolean;
   sortOrder: number;
@@ -134,23 +152,35 @@ export function stateFor(budgeted: number | null, spent: number): CategorySummar
   return budgeted > 0 && spent >= budgeted * NEAR_FRACTION ? 'near' : 'under';
 }
 
-interface CategoryRow { id: string; name: string; monthly_cents: number | null; rollover: boolean; sort_order: number; archived_at?: Date | null; transactions?: string }
+interface CategoryRow { id: string; name: string; kind: CategoryKind; monthly_cents: number | null; rollover: boolean; sort_order: number; archived_at?: Date | null; transactions?: string }
 interface TxnRow {
   id: string; account: string; txn_date: string; payee: string; description: string; amount_cents: number;
   category_id: string | null; source: CategorisedBy | null; rule_id: string | null; confidence: string | null;
 }
 
 const toCategory = (r: CategoryRow): BudgetCategory => ({
-  id: r.id, name: r.name, monthlyCents: r.monthly_cents, rollover: r.rollover, sortOrder: r.sort_order,
+  id: r.id, name: r.name, kind: r.kind, monthlyCents: r.monthly_cents, rollover: r.rollover, sortOrder: r.sort_order,
   archived: r.archived_at != null, transactionCount: Number(r.transactions ?? 0),
 });
 /** Every column toCategory reads, for a RETURNING clause on budget_categories. */
-const CATEGORY_COLUMNS = `id, name, monthly_cents, rollover, sort_order, archived_at,
+const CATEGORY_COLUMNS = `id, name, kind, monthly_cents, rollover, sort_order, archived_at,
   (SELECT count(*) FROM budget_transactions t WHERE t.category_id = budget_categories.id)::text AS transactions`;
 
 /** The database trigger refusing a new assignment to an archived category, as the caller's error. */
 const archivedConflict = (err: unknown): unknown =>
   (err as { constraint?: string }).constraint === 'budget_category_archived' ? new BudgetError('That category is archived', 'conflict') : err;
+/** `count` months starting at `from`. */
+export function monthsFrom(from: string, count: number): string[] {
+  if (!MONTH.test(from)) throw new BudgetError('month must be YYYY-MM');
+  const [y, m] = from.split('-').map(Number) as [number, number];
+  return Array.from({ length: count }, (_, i) => isoDay(y, m - 1 + i, 1).slice(0, 7));
+}
+
+function kindOf(v: unknown): CategoryKind {
+  if (!CATEGORY_KINDS.includes(v as CategoryKind)) throw new BudgetError('The type must be expense, income or savings');
+  return v as CategoryKind;
+}
+
 const toTxn = (r: TxnRow): BudgetTransaction => ({
   id: r.id, account: r.account, date: r.txn_date, payee: r.payee, description: r.description, amountCents: r.amount_cents,
   categoryId: r.category_id, source: r.source, ruleId: r.rule_id, confidence: r.confidence === null ? null : Number(r.confidence),
@@ -171,16 +201,17 @@ export class BudgetStore {
     return rows.map(toCategory);
   }
 
-  async createCategory(input: { name?: unknown; monthlyCents?: unknown; rollover?: unknown }): Promise<BudgetCategory> {
+  async createCategory(input: { name?: unknown; kind?: unknown; monthlyCents?: unknown; rollover?: unknown }): Promise<BudgetCategory> {
     const name = text(input.name, 60);
     if (!name) throw new BudgetError('A category needs a name');
     const monthlyCents = this.cents(input.monthlyCents);
+    const kind = input.kind === undefined ? 'expense' : kindOf(input.kind);
     try {
       const { rows } = await this.pool.query<CategoryRow>(
-        `INSERT INTO budget_categories (name, monthly_cents, rollover, sort_order)
-         VALUES ($1, $2, $3, COALESCE((SELECT max(sort_order) + 1 FROM budget_categories), 0))
+        `INSERT INTO budget_categories (name, monthly_cents, rollover, kind, sort_order)
+         VALUES ($1, $2, $3, $4, COALESCE((SELECT max(sort_order) + 1 FROM budget_categories), 0))
          RETURNING ${CATEGORY_COLUMNS}`,
-        [name, monthlyCents, input.rollover === true],
+        [name, monthlyCents, input.rollover === true, kind],
       );
       return toCategory(rows[0]!);
     } catch (err) {
@@ -188,7 +219,7 @@ export class BudgetStore {
     }
   }
 
-  async updateCategory(id: string, input: { name?: unknown; monthlyCents?: unknown; rollover?: unknown }): Promise<BudgetCategory> {
+  async updateCategory(id: string, input: { name?: unknown; kind?: unknown; monthlyCents?: unknown; rollover?: unknown }): Promise<BudgetCategory> {
     const sets: string[] = [];
     const args: unknown[] = [id];
     if (input.name !== undefined) {
@@ -198,6 +229,7 @@ export class BudgetStore {
     }
     if (input.monthlyCents !== undefined) { args.push(this.cents(input.monthlyCents)); sets.push(`monthly_cents = $${args.length}`); }
     if (input.rollover !== undefined) { args.push(input.rollover === true); sets.push(`rollover = $${args.length}`); }
+    if (input.kind !== undefined) { args.push(kindOf(input.kind)); sets.push(`kind = $${args.length}`); }
     if (sets.length === 0) throw new BudgetError('Nothing to change');
     try {
       const { rows } = await this.pool.query<CategoryRow>(
@@ -238,6 +270,45 @@ export class BudgetStore {
     }
     const there = await this.pool.query('SELECT 1 FROM budget_categories WHERE id = $1', [id]);
     throw there.rowCount ? used : new BudgetError('No such category', 'not_found');
+  }
+
+  // -- budgets by month -----------------------------------------------------------------------------------------
+
+  /** Sets one month's budget for an open category; null goes back to the usual monthly amount. */
+  async setMonthAmount(id: string, month: string, cents: unknown): Promise<void> {
+    if (!MONTH.test(month)) throw new BudgetError('month must be YYYY-MM');
+    const value = this.cents(cents);
+    const open = await this.pool.query('SELECT 1 FROM budget_categories WHERE id = $1 AND archived_at IS NULL', [id]);
+    if (!open.rowCount) throw new BudgetError('No such category', 'not_found');
+    if (value === null) await this.pool.query('DELETE FROM budget_month_amounts WHERE category_id = $1 AND month = $2', [id, month]);
+    else {
+      await this.pool.query(
+        `INSERT INTO budget_month_amounts (category_id, month, cents) VALUES ($1, $2, $3)
+         ON CONFLICT (category_id, month) DO UPDATE SET cents = EXCLUDED.cents`,
+        [id, month, value],
+      );
+    }
+  }
+
+  async plan(from: string, count = 6): Promise<BudgetPlan> {
+    if (!Number.isInteger(count) || count < 1 || count > MAX_PLAN_MONTHS) throw new BudgetError(`Choose between 1 and ${MAX_PLAN_MONTHS} months`);
+    const months = monthsFrom(from, count);
+    const [categories, own] = await Promise.all([
+      this.listCategories(),
+      this.pool.query<{ category_id: string; month: string; cents: number }>(
+        'SELECT category_id, month, cents FROM budget_month_amounts WHERE month >= $1 AND month <= $2', [months[0], months[months.length - 1]]),
+    ]);
+    const set = new Map(own.rows.map(r => [`${r.category_id} ${r.month}`, r.cents]));
+    return {
+      months,
+      categories: categories.map(c => ({
+        categoryId: c.id, name: c.name, kind: c.kind,
+        amounts: months.map(month => {
+          const cents = set.get(`${c.id} ${month}`);
+          return cents === undefined ? { cents: c.monthlyCents, own: false } : { cents, own: true };
+        }),
+      })),
+    };
   }
 
   private cents(v: unknown): number | null {
@@ -308,17 +379,20 @@ export class BudgetStore {
 
   async summary(month: string): Promise<BudgetSummary> {
     const { start, end } = monthBounds(month);
+    // Spending only: income and savings categories are planned by month but are not budgets that can be overspent.
     // An archived category appears only in months where it has transactions, and keeps its budget only for months that
     // were over before it was archived.
     const { rows } = await this.pool.query<{ id: string; name: string; archived: boolean; monthly_cents: number | null; spent: string }>(
       `SELECT c.id, c.name, c.archived_at IS NOT NULL AS archived,
-              CASE WHEN c.archived_at IS NULL OR c.archived_at >= $2::date THEN c.monthly_cents END AS monthly_cents,
+              CASE WHEN c.archived_at IS NULL OR c.archived_at >= $2::date THEN COALESCE(m.cents, c.monthly_cents) END AS monthly_cents,
               COALESCE(-SUM(t.amount_cents) FILTER (WHERE t.amount_cents < 0), 0)::text AS spent
        FROM budget_categories c
+       LEFT JOIN budget_month_amounts m ON m.category_id = c.id AND m.month = $3
        LEFT JOIN budget_transactions t ON t.category_id = c.id AND t.txn_date >= $1 AND t.txn_date < $2
-       GROUP BY c.id HAVING c.archived_at IS NULL OR count(t.id) > 0
+       WHERE c.kind = 'expense'
+       GROUP BY c.id, m.cents HAVING c.archived_at IS NULL OR count(t.id) > 0
        ORDER BY (c.archived_at IS NOT NULL), c.sort_order, lower(c.name)`,
-      [start, end],
+      [start, end, month],
     );
     const loose = await this.pool.query<{ uncategorised: string; spent: string; guesses: string }>(
       `SELECT count(*) FILTER (WHERE source IS NULL)::text AS uncategorised,

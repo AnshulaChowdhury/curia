@@ -3,7 +3,7 @@
 // The server computes the month's summary, so the console, the morning brief and the budget specialist show the same
 // numbers; nothing here recalculates spending. A 401 or 403 means "locked": the pages never show partial data.
 import { apiFetch } from '../api.js';
-import type { AccountType, BudgetCategory, BudgetSummary, BudgetTrend, BudgetTxn, NetWorth } from './budget-utils.js';
+import type { AccountType, BudgetCategory, BudgetPlan, BudgetSummary, CategoryKind, BudgetTrend, BudgetTxn, NetWorth } from './budget-utils.js';
 
 type Fetcher = (path: string, init?: RequestInit) => Promise<Response>;
 
@@ -15,6 +15,8 @@ export type BudgetLoad<T> =
 export interface ReconcileData {
   month: string;
   categories: BudgetCategory[];
+  /** What is budgeted in this month and the five after it. */
+  plan: BudgetPlan;
   /** This month's transactions with no category, or a guess the owner has not confirmed. */
   review: BudgetTxn[];
 }
@@ -29,7 +31,7 @@ export interface DashboardData {
 
 export interface AccountInput { id: string | null; name: string; type: AccountType; balanceCents: number }
 
-export interface CategoryInput { id: string | null; name: string; monthlyCents: number; rollover: boolean }
+export interface CategoryInput { id: string | null; name: string; kind: CategoryKind; monthlyCents: number; rollover: boolean }
 
 /** Map an HTTP status to a load state. 401 and 403 are treated the same: locked. */
 export function stateForStatus(status: number): 'ok' | 'locked' | 'error' {
@@ -70,11 +72,12 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
   return {
     /** The budgets and what still needs a category in one month. */
     loadBudgets: (month: string) => load<ReconcileData>(async () => {
-      const [cats, review] = await Promise.all([
+      const [cats, plan, review] = await Promise.all([
         categories(),
+        call<BudgetPlan>(`/api/budget/plan?from=${encodeURIComponent(month)}&months=6`),
         call<{ transactions: BudgetTxn[] }>(`/api/budget/transactions?month=${encodeURIComponent(month)}&needsReview=true&limit=500`),
       ]);
-      return { month, categories: cats, review: review.transactions };
+      return { month, categories: cats, plan, review: review.transactions };
     }),
     /** Everything the dashboard shows: the chosen month, plus net worth, history and bank health as of today. */
     loadDashboard: (month: string, asOf: string) => load<DashboardData>(async () => {
@@ -103,6 +106,10 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
     async saveCategory({ id, ...fields }: CategoryInput): Promise<void> {
       if (id) await call(`/api/budget/categories/${encodeURIComponent(id)}`, 'PATCH', fields);
       else await call('/api/budget/categories', 'POST', fields);
+    },
+    /** One month's own budget; null goes back to the usual amount. */
+    async setMonthAmount(id: string, month: string, cents: number | null): Promise<void> {
+      await call(`/api/budget/categories/${encodeURIComponent(id)}/months/${encodeURIComponent(month)}`, 'PUT', { cents });
     },
     async archiveCategory(id: string): Promise<void> {
       await call(`/api/budget/categories/${encodeURIComponent(id)}/archive`, 'POST');

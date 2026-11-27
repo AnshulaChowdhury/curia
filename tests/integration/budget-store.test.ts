@@ -30,6 +30,34 @@ describeIf('budget store', () => {
   beforeEach(wipe);
   afterAll(async () => { await wipe(); await pool.end(); });
 
+  it('budgets by month, falling back to the usual amount, and counts only spending in the summary', async () => {
+    const food = await store.createCategory({ name: 'T-Food', monthlyCents: 10000 });
+    const pay = await store.createCategory({ name: 'T-Pay', kind: 'income' });
+    await expect(store.createCategory({ name: 'T-Bad', kind: 'other' })).rejects.toMatchObject({ kind: 'invalid' });
+    await store.setMonthAmount(food.id, '2031-04', 25000);
+    await store.setMonthAmount(food.id, '2031-04', 20000);
+    await store.setMonthAmount(pay.id, '2031-03', 500000);
+    await expect(store.setMonthAmount(pay.id, '2031-13', 1)).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(store.setMonthAmount(pay.id, '2031-03', -1)).rejects.toMatchObject({ kind: 'invalid' });
+
+    const plan = await store.plan('2031-03', 2);
+    expect(plan.months).toEqual(['2031-03', '2031-04']);
+    const row = (id: string) => plan.categories.find(c => c.categoryId === id)!;
+    expect(row(food.id).amounts).toEqual([{ cents: 10000, own: false }, { cents: 20000, own: true }]);
+    expect(row(pay.id)).toMatchObject({ kind: 'income', amounts: [{ cents: 500000, own: true }, { cents: null, own: false }] });
+
+    const april = await store.summary('2031-04');
+    expect(april.categories.find(c => c.categoryId === food.id)).toMatchObject({ budgetedCents: 20000 });
+    expect(april.categories.some(c => c.categoryId === pay.id)).toBe(false);
+
+    await store.setMonthAmount(food.id, '2031-04', null);
+    expect((await store.summary('2031-04')).categories.find(c => c.categoryId === food.id)).toMatchObject({ budgetedCents: 10000 });
+    await store.setMonthAmount(food.id, '2031-04', 1);
+    await store.deleteCategory(food.id); // its month amounts go with it
+    await store.archiveCategory(pay.id);
+    await expect(store.setMonthAmount(pay.id, '2031-03', 1)).rejects.toMatchObject({ kind: 'not_found' });
+  });
+
   it('keeps open names unique, deletes only an empty category, and frees an archived name', async () => {
     const food = await store.createCategory({ name: 'T-Food', monthlyCents: 10000 });
     await expect(store.createCategory({ name: 't-food' })).rejects.toMatchObject({ kind: 'conflict' });

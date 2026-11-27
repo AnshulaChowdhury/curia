@@ -5,7 +5,7 @@ import {
 } from './budget-utils.js';
 import { createBudgetClient, stateForStatus } from './budget-data.js';
 
-const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', monthlyCents: 60000, rollover: false, archived: false, transactionCount: 0 }];
+const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', kind: 'expense', monthlyCents: 60000, rollover: false, archived: false, transactionCount: 0 }];
 
 describe('months', () => {
   it('shifts across year boundaries', () => {
@@ -102,6 +102,7 @@ describe('budget client', () => {
     expect(await client.loadBudgets('2031-03')).toMatchObject({ state: 'ok', data: { month: '2031-03', categories: CATEGORIES, review: [] } });
     expect(seen.map(s => s.path).sort()).toEqual([
       '/api/budget/categories?archived=1',
+      '/api/budget/plan?from=2031-03&months=6',
       '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
     ]);
   });
@@ -112,13 +113,13 @@ describe('budget client', () => {
   it('creates, edits, deletes and categorises', async () => {
     const seen: Seen[] = [];
     const client = fake(seen, () => json({ ok: true }));
-    await client.saveCategory({ id: null, name: 'Home', monthlyCents: 100, rollover: false });
-    await client.saveCategory({ id: 'c1', name: 'Home', monthlyCents: 200, rollover: true });
+    await client.saveCategory({ id: null, name: 'Home', kind: 'expense', monthlyCents: 100, rollover: false });
+    await client.saveCategory({ id: 'c1', name: 'Home', kind: 'income', monthlyCents: 200, rollover: true });
     await client.deleteCategory('c1');
     await client.categorise('t1', 'c1');
     expect(seen).toEqual([
-      { path: '/api/budget/categories', method: 'POST', body: { name: 'Home', monthlyCents: 100, rollover: false } },
-      { path: '/api/budget/categories/c1', method: 'PATCH', body: { name: 'Home', monthlyCents: 200, rollover: true } },
+      { path: '/api/budget/categories', method: 'POST', body: { name: 'Home', kind: 'expense', monthlyCents: 100, rollover: false } },
+      { path: '/api/budget/categories/c1', method: 'PATCH', body: { name: 'Home', kind: 'income', monthlyCents: 200, rollover: true } },
       { path: '/api/budget/categories/c1', method: 'DELETE', body: undefined },
       { path: '/api/budget/transactions/t1', method: 'PATCH', body: { categoryId: 'c1' } },
     ]);
@@ -126,24 +127,24 @@ describe('budget client', () => {
   it('shows locked for 401, and the server message when a save fails', async () => {
     expect(await fake([], () => json({ error: 'no' }, 401)).loadBudgets('2031-03')).toEqual({ state: 'locked' });
     await expect(fake([], () => json({ error: 'A category with that name already exists' }, 409))
-      .saveCategory({ id: null, name: 'Home', monthlyCents: 1, rollover: false })).rejects.toThrow('already exists');
+      .saveCategory({ id: null, name: 'Home', kind: 'expense', monthlyCents: 1, rollover: false })).rejects.toThrow('already exists');
   });
 });
 
 describe('validateDraft', () => {
   it('lets a new category reuse an archived name', () => {
     const gone = [{ ...CATEGORIES[0]!, archived: true }];
-    expect(validateDraft({ name: 'Groceries', amount: '10', rollover: false }, gone, null).ok).toBe(true);
+    expect(validateDraft({ name: 'Groceries', kind: 'expense', amount: '10', rollover: false }, gone, null).ok).toBe(true);
   });
   it('rejects blank, duplicate and bad amounts', () => {
-    expect(validateDraft({ name: ' ', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
-    expect(validateDraft({ name: 'groceries', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
-    expect(validateDraft({ name: 'New', amount: 'x', rollover: false }, CATEGORIES, null).errors.amount).toBeTruthy();
+    expect(validateDraft({ name: ' ', kind: 'expense', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
+    expect(validateDraft({ name: 'groceries', kind: 'expense', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
+    expect(validateDraft({ name: 'New', kind: 'expense', amount: 'x', rollover: false }, CATEGORIES, null).errors.amount).toBeTruthy();
   });
   it('allows keeping the same name while editing', () => {
-    const r = validateDraft({ name: 'Groceries', amount: '650', rollover: true }, CATEGORIES, 'cat-groceries');
+    const r = validateDraft({ name: 'Groceries', kind: 'expense', amount: '650', rollover: true }, CATEGORIES, 'cat-groceries');
     expect(r.ok).toBe(true);
-    expect(r.value).toEqual({ name: 'Groceries', monthlyCents: 65000, rollover: true });
+    expect(r.value).toEqual({ name: 'Groceries', kind: 'expense', monthlyCents: 65000, rollover: true });
   });
 });
 

@@ -1,7 +1,7 @@
 {
   "name": "budget-summary",
-  "description": "The owner's personal budget for one month: for each category what was budgeted, spent and remaining (in Canadian dollars), whether it is under, near or over, the totals, and how many transactions need the owner. Defaults to the current month. Read-only.",
-  "version": "0.1.0",
+  "description": "The owner's personal spending budget for one month: for each expense category what was budgeted, spent and remaining (in Canadian dollars), whether it is under, near or over, the totals, and how many transactions need the owner. Defaults to the current month. Read-only.",
+  "version": "0.2.0",
   "sensitivity": "normal",
   "action_risk": "none",
   "inputs": {

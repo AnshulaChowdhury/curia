@@ -1,0 +1,25 @@
+{
+  "name": "budget-plan",
+  "description": "What the owner's budget holds month by month: every open category (income, expense or savings) with its budgeted amount in Canadian dollars for each month. Defaults to six months from the current one. Read-only.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "from": "string? (first month, YYYY-MM; defaults to the current month)",
+    "months": "number? (1 to 24; defaults to 6)"
+  },
+  "outputs": {
+    "currency": "CAD",
+    "months": "array",
+    "categories": "array (name, type, amounts by month)"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetReader"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}
