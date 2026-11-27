@@ -236,3 +236,43 @@ describe('EventRouter Ant Farm SSE', () => {
     expect(writeCount).toBe(firstPassWrites);
   });
 });
+
+describe('EventRouter progress for the chat', () => {
+  const client = (conversationId?: string) => {
+    const frames: Array<Record<string, unknown>> = [];
+    const res = { write: (data: string) => { frames.push(JSON.parse(data.replace(/^data: /, '')) as Record<string, unknown>); return true; } } as unknown as ServerResponse;
+    return { frames, sse: { res, ...(conversationId ? { conversationId } : {}) } };
+  };
+  const event = (type: 'tool.invoke' | 'tool.result', payload: Record<string, unknown>) =>
+    ({ type, timestamp: new Date(), payload: { agentId: 'budget', toolName: 'budget-sheet-read', conversationId: 'delegate-1', result: { success: false, error: 'private detail' }, input: {}, ...payload } }) as unknown as BusEvent;
+
+  it('shows a specialist\'s steps to the chat that asked, with no input or output', () => {
+    const { router, emit } = makeRouter();
+    const asking = client('chat-1');
+    const other = client('chat-2');
+    const watcher = client();
+    for (const c of [asking, other, watcher]) router.addSseClient(c.sse);
+
+    emit(event('tool.invoke', { originConversationId: 'chat-1', input: { secret: 'private detail' } }));
+    emit(event('tool.result', { originConversationId: 'chat-1' }));
+
+    expect(asking.frames.map(f => [f['type'], f['agent'], f['tool'], f['conversation_id']])).toEqual([
+      ['tool.invoke', 'budget', 'budget-sheet-read', 'chat-1'], ['tool.result', 'budget', 'budget-sheet-read', 'chat-1'],
+    ]);
+    expect(asking.frames[1]).toMatchObject({ success: false });
+    expect(JSON.stringify(asking.frames)).not.toContain('private detail');
+    expect(other.frames).toEqual([]);
+    expect(watcher.frames).toHaveLength(2); // once each, as before
+  });
+
+  it('names the specialist a delegation goes to, and nothing else from its input', () => {
+    const { router, emit } = makeRouter();
+    const chat = client('chat-1');
+    router.addSseClient(chat.sse);
+    emit(event('tool.invoke', { agentId: 'coordinator', toolName: 'delegate', conversationId: 'chat-1', input: { agent: 'budget', task: 'private detail' } }));
+    emit(event('tool.invoke', { agentId: 'coordinator', toolName: 'delegate', conversationId: 'chat-1', input: { agent: 'Not a name <x>' } }));
+    expect(chat.frames[0]).toMatchObject({ delegate_to: 'budget' });
+    expect(chat.frames[1]).not.toHaveProperty('delegate_to');
+    expect(JSON.stringify(chat.frames)).not.toContain('private detail');
+  });
+});

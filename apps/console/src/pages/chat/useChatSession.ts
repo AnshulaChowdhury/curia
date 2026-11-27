@@ -2,6 +2,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { apiFetch } from '../../api.js';
 import { makeMessage, parseSseEvent, pickRecoveredReply } from './chat-utils.js';
+import { endStep, startStep, trace, type Work } from './activity.js';
 import type { Message, HistoryMessage } from './types.js';
 
 // localStorage key for persisting the conversationId across page reloads.
@@ -36,6 +37,8 @@ const RECOVERY_FAILED_TEXT =
 interface ChatSession {
   messages: Message[];
   sending: boolean;
+  /** The turn still being worked on, or null. Outlasts `sending` when a slow reply unlocks the message box. */
+  work: Work | null;
   hasMore: boolean;
   loadingHistory: boolean;
   send: (text: string) => Promise<void>;
@@ -75,6 +78,9 @@ function ensureId(held: { current: string | null }, announce: (id: string) => vo
 export function useChatSession(): ChatSession {
   const [messages, setMessages] = useState<Message[]>([]);
   const [sending, setSending] = useState(false);
+  const [work, setWork] = useState<Work | null>(null);
+  // The same, for the stream handlers: they must see the latest steps without waiting for a render.
+  const workRef = useRef<Work | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
@@ -242,6 +248,10 @@ export function useChatSession(): ChatSession {
     ]);
     isSending.current = true;
     setSending(true);
+    const showWork = (next: Work | null) => { workRef.current = next; setWork(next); };
+    showWork({ startedAt: Date.now(), steps: [] });
+    /** What was done stays in the thread, above whatever ends the turn. */
+    const stepsDone = (): Message[] => trace(workRef.current?.steps ?? []).map(line => makeMessage('status', line));
 
     let source: EventSource | undefined;
     let settled = false;
@@ -263,6 +273,7 @@ export function useChatSession(): ChatSession {
       if (settled) return;
       settled = true;
       unlock();
+      showWork(null);
       source?.close();
       sourceRef.current = null;
     };
@@ -292,8 +303,10 @@ export function useChatSession(): ChatSession {
           if (settled) return;
           const recovered = pickRecoveredReply(data.messages);
           if (recovered) {
+            const done = stepsDone();
             setMessages((prev) => [
               ...prev,
+              ...done,
               makeMessage('agent', recovered.text, { html: recovered.html ?? undefined, timestamp: new Date() }),
             ]);
             finalize();
@@ -338,21 +351,25 @@ export function useChatSession(): ChatSession {
       source.onmessage = (event: MessageEvent<string>) => {
         const parsed = parseSseEvent(event.data);
         if (!parsed) return;
-        if (parsed.kind === 'status') {
-          setMessages((prev) => [...prev, makeMessage('status', parsed.text)]);
+        if (parsed.kind === 'step-start' || parsed.kind === 'step-end') {
+          const current = workRef.current;
+          if (!current) return;
+          showWork({ ...current, steps: parsed.kind === 'step-start' ? startStep(current.steps, parsed) : endStep(current.steps, parsed) });
           return;
         }
+        const done = stepsDone();
         if (parsed.kind === 'reply') {
           // Terminal: the agent's final reply for this turn.
           setMessages((prev) => [
             ...prev,
+            ...done,
             makeMessage('agent', parsed.text, { html: parsed.html ?? undefined, timestamp: new Date() }),
           ]);
           finalize();
           return;
         }
         // parsed.kind === 'rejected' — terminal error.
-        setMessages((prev) => [...prev, makeMessage('error', parsed.text)]);
+        setMessages((prev) => [...prev, ...done, makeMessage('error', parsed.text)]);
         finalize();
       };
 
@@ -417,5 +434,5 @@ export function useChatSession(): ChatSession {
     // finished by the SSE terminal event, the watchdog, or an error path above.
   }
 
-  return { messages, sending, hasMore, loadingHistory, send, loadMore, conversationId: knownConversationId, ensureConversationId };
+  return { messages, sending, work, hasMore, loadingHistory, send, loadMore, conversationId: knownConversationId, ensureConversationId };
 }

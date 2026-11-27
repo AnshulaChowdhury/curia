@@ -116,6 +116,9 @@ export interface SseClient {
   conversationId?: string; // Optional filter
 }
 
+/** An agent's name as written in its YAML. */
+const AGENT_NAME = /^[a-z0-9][a-z0-9-]{0,40}$/;
+
 /** Event types forwarded to Ant Farm live stream (interpreter catalog superset). */
 export const ANT_FARM_EVENT_TYPES = [
   'schedule.fired',
@@ -224,29 +227,32 @@ export class EventRouter {
     // tool.invoke — observability stream for SSE clients
     bus.subscribe('tool.invoke', 'system', (event: BusEvent) => {
       if (event.type !== 'tool.invoke') return;
-      const sseData = JSON.stringify({
+      // Which specialist a delegation goes to: a registered agent's name, never the task given to it.
+      const target = event.payload.toolName === 'delegate' ? event.payload.input?.['agent'] : undefined;
+      const progress = {
         type: 'tool.invoke',
         agent: event.payload.agentId,
         tool: event.payload.toolName,
-        conversation_id: event.payload.conversationId,
+        ...(typeof target === 'string' && AGENT_NAME.test(target) ? { delegate_to: target } : {}),
         timestamp: event.timestamp,
-      });
-      this.broadcastToSseClients(sseData, event.payload.conversationId);
+      };
+      this.broadcastToSseClients(JSON.stringify({ ...progress, conversation_id: event.payload.conversationId }), event.payload.conversationId);
+      this.relayToOrigin(progress, event.payload.conversationId, event.payload.originConversationId);
     });
 
     // tool.result — observability stream for SSE clients
     bus.subscribe('tool.result', 'system', (event: BusEvent) => {
       if (event.type !== 'tool.result') return;
-      const sseData = JSON.stringify({
+      const progress = {
         type: 'tool.result',
         agent: event.payload.agentId,
         tool: event.payload.toolName,
         success: event.payload.result.success,
         duration_ms: event.payload.durationMs,
-        conversation_id: event.payload.conversationId,
         timestamp: event.timestamp,
-      });
-      this.broadcastToSseClients(sseData, event.payload.conversationId);
+      };
+      this.broadcastToSseClients(JSON.stringify({ ...progress, conversation_id: event.payload.conversationId }), event.payload.conversationId);
+      this.relayToOrigin(progress, event.payload.conversationId, event.payload.originConversationId);
     });
 
     // message.rejected — immediately reject the pending POST promise so the caller
@@ -361,22 +367,37 @@ export class EventRouter {
    * filter matches are written to. When omitted, ALL clients receive the event
    * (system-wide notifications that apply to all clients).
    */
+  /**
+   * A delegated specialist works in a conversation of its own. Its progress is also shown to the chat that asked, so the
+   * owner sees what is happening during a long delegation. Only clients watching that chat get this copy.
+   */
+  private relayToOrigin(progress: Record<string, unknown>, conversationId: string, origin: string | undefined): void {
+    if (!origin || origin === conversationId) return;
+    const sseData = JSON.stringify({ ...progress, conversation_id: origin });
+    for (const client of this.sseClients) {
+      if (client.conversationId === origin) this.write(client, sseData);
+    }
+  }
+
+  private write(client: SseClient, sseData: string): void {
+    try {
+      client.res.write(`data: ${sseData}\n\n`);
+    } catch (err) {
+      // Client connection is dead — remove it. The 'close' event handler
+      // will also fire eventually, but cleaning up here prevents repeated
+      // failed writes for subsequent events in this tick.
+      this.sseClients.delete(client);
+      this.logger.debug({ err, conversationId: client.conversationId }, 'Removed dead SSE client');
+    }
+  }
+
   private broadcastToSseClients(sseData: string, conversationId?: string): void {
     for (const client of this.sseClients) {
       // Skip filtered clients unless the filter matches OR this is a system-wide broadcast
       const shouldSend = conversationId === undefined
         || !client.conversationId
         || client.conversationId === conversationId;
-      if (!shouldSend) continue;
-      try {
-        client.res.write(`data: ${sseData}\n\n`);
-      } catch (err) {
-        // Client connection is dead — remove it. The 'close' event handler
-        // will also fire eventually, but cleaning up here prevents repeated
-        // failed writes for subsequent events in this tick.
-        this.sseClients.delete(client);
-        this.logger.debug({ err, conversationId: client.conversationId }, 'Removed dead SSE client');
-      }
+      if (shouldSend) this.write(client, sseData);
     }
   }
 

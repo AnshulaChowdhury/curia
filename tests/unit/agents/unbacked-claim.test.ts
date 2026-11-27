@@ -4,7 +4,7 @@ import { claimsUnbackedWork, UNBACKED_CLAIM_CORRECTION, UNBACKED_CLAIM_REPLY } f
 import type { LLMProvider, ToolDefinition } from '../../../src/agents/llm/provider.js';
 import type { ExecutionLayer } from '../../../src/skills/execution.js';
 import { EventBus } from '../../../src/bus/bus.js';
-import { createAgentTask, type AgentResponseEvent } from '../../../src/bus/events.js';
+import { createAgentTask, type AgentResponseEvent, type ToolInvokeEvent } from '../../../src/bus/events.js';
 import { createLogger } from '../../../src/logger.js';
 import { WorkingMemory } from '../../../src/memory/working-memory.js';
 
@@ -98,5 +98,25 @@ describe('AgentRuntime holds back an unbacked claim (ADR-068)', () => {
     const { sent, chat } = await turn([text('Your sheet has five visible tabs.')]);
     expect(sent).toEqual(['Your sheet has five visible tabs.']);
     expect(chat).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('a specialist\'s tool calls name the chat that delegated', () => {
+  it('stamps tool.invoke with the origin conversation, only on a delegated task', async () => {
+    for (const [metadata, expected] of [[{ delegationOrigin: { conversationId: 'chat-1', channelId: 'web', agentId: 'coordinator' } }, 'chat-1'], [undefined, undefined]] as const) {
+      const logger = createLogger('error');
+      const bus = new EventBus(logger);
+      const seen: Array<string | undefined> = [];
+      bus.subscribe('tool.invoke', 'system', e => { seen.push((e as ToolInvokeEvent).payload.originConversationId); });
+      bus.subscribe('agent.response', 'dispatch', () => {});
+      const chat = vi.fn().mockResolvedValueOnce(delegate).mockResolvedValue(text('Done.'));
+      new AgentRuntime({
+        agentId: 'budget', systemPrompt: 'You are the budget agent.', provider: { id: 'mock', chat } as LLMProvider, resolvedModel: 'mock-model', bus, logger,
+        executionLayer: { invoke: async () => ({ success: true as const, data: {} }), provenanceSourceText: () => undefined } as unknown as ExecutionLayer,
+        skillToolDefs: [DELEGATE_DEF],
+      }).register();
+      await bus.publish('dispatch', createAgentTask({ agentId: 'budget', conversationId: 'delegate-1', channelId: 'internal', senderId: 'coordinator', content: 'Read', parentEventId: 'p', ...(metadata ? { metadata } : {}) }));
+      expect(seen).toEqual([expected]);
+    }
   });
 });

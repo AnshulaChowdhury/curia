@@ -2203,6 +2203,10 @@ export class AgentRuntime {
             input: skillInput,
             taskEventId: taskEvent.id,
             parentEventId: taskEvent.id,
+            ...(isDelegatedSpecialistTask(taskEvent.payload.metadata)
+              && delegationOriginConversationId(taskEvent.payload.metadata) !== undefined
+              ? { originConversationId: delegationOriginConversationId(taskEvent.payload.metadata) }
+              : {}),
           });
           await bus.publish('agent', invokeEvent);
 
