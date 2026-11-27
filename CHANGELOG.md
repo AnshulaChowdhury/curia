@@ -13,6 +13,14 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Security
+
+- **Spreadsheet page policy** — allows three grid stylesheets and inline images; converter sandboxed.
+
+### Added
+
+- **Budget spreadsheets** — open .xlsx or .csv files and edit them in Curia (migration 134).
+
 ### Changed
 
 - **Budget categories** — used ones archive and keep history; only empty ones delete (migration 133).

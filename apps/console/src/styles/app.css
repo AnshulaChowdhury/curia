@@ -453,7 +453,8 @@ body {
 }
 
 /* ── 6. Forms ────────────────────────────────────────────────────────── */
-input[type="text"], input[type="password"], input[type="email"], textarea, select {
+/* Not on the spreadsheet page: these would repaint the grid library's own controls. :where() adds no weight. */
+:where(html:not(.sheet-document)) input[type="text"], :where(html:not(.sheet-document)) input[type="password"], :where(html:not(.sheet-document)) input[type="email"], :where(html:not(.sheet-document)) textarea, :where(html:not(.sheet-document)) select {
   background: var(--app-card);
   border: 1px solid var(--app-input-bd);
   border-radius: 6px;
@@ -462,7 +463,7 @@ input[type="text"], input[type="password"], input[type="email"], textarea, selec
   width: 100%;
   transition: border-color 120ms, box-shadow 120ms;
 }
-input:focus, textarea:focus, select:focus {
+:where(html:not(.sheet-document)) input:focus, :where(html:not(.sheet-document)) textarea:focus, :where(html:not(.sheet-document)) select:focus {
   border-color: var(--app-teal);
   box-shadow: 0 0 0 3px var(--app-teal-soft);
 }
@@ -4372,3 +4373,16 @@ table.records-table tbody tr.active td { background: transparent; }
   #bud-add .bud-add > .dash-card-title { grid-column: 1 / -1; }
   #bud-add .bud-add > .bud-section + .bud-section { border-top: 0; border-left: 1px solid var(--app-border); padding: 0 0 0 28px; }
 }
+
+/* ---- Budget spreadsheets (the page that holds the Univer grid) ---- */
+.sheet-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; overflow: hidden; background: var(--app-bg); color: var(--app-fg); }
+.sheet-nav { display: flex; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--app-border); font-size: 13px; flex-shrink: 0; }
+.sheet-nav a, .sheet-item a { color: var(--app-fg); }
+.sheet-library { display: flex; flex-direction: column; gap: 14px; width: 100%; max-width: 720px; margin: 0 auto; padding: 16px; box-sizing: border-box; overflow-y: auto; }
+.sheet-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.sheet-status { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 16px; font-size: 13px; flex-shrink: 0; }
+.sheet-wait { padding: 16px; }
+/* The grid is drawn light in both themes, like the spreadsheet it came from. */
+.sheet-grid { position: relative; flex: 1; min-height: 0; background: #fff; color: #111; }
+.sheet-host { position: absolute; inset: 0; }
+.sheet-converter { position: absolute; width: 0; height: 0; border: 0; }

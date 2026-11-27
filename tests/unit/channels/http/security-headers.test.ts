@@ -10,7 +10,11 @@ import {
   CONSOLE_CONTENT_SECURITY_POLICY,
   ANTFARM_CONTENT_SECURITY_POLICY,
   PLAID_LINK_CONTENT_SECURITY_POLICY,
+  SHEET_CONTENT_SECURITY_POLICY,
+  CONVERTER_CONTENT_SECURITY_POLICY,
+  UNIVER_STYLE_HASHES,
 } from '../../../../src/channels/http/security-headers.js';
+import { readFileSync } from 'node:fs';
 
 let app: FastifyInstance | undefined;
 
@@ -31,6 +35,10 @@ async function build(): Promise<FastifyInstance> {
   // Register headers BEFORE routes/other hooks so the header is set even when a later
   // onRequest hook short-circuits the response (e.g. an auth 401).
   registerSecurityHeaders(instance);
+  for (const url of ['/budget/sheet-frame', '/budget/sheet-frame-evil', '/budget/sheet-frame/x', '/budget/convert-frame', '/convert-frame.html']) {
+    instance.get(url, async (_req, reply) => reply.type('text/html; charset=utf-8').send('<!doctype html><html><body>s</body></html>'));
+  }
+  instance.get('/assets/a.js', async (_req, reply) => reply.type('text/javascript').send('1'));
   // The budget pages: only /budget/connect-bank may load Plaid Link.
   for (const url of ['/budget', '/budget/connect-bank', '/budget/connect-bank/', '/budget/connect-bank-evil', '/budget/connect-bank/x', '/budget-extra']) {
     instance.get(url, async (_req, reply) => reply.type('text/html; charset=utf-8').send('<!doctype html><html><body>b</body></html>'));
@@ -228,5 +236,62 @@ describe('registerSecurityHeaders', () => {
     expect(PLAID_LINK_CONTENT_SECURITY_POLICY).not.toContain('unsafe-eval');
     const hosts = PLAID_LINK_CONTENT_SECURITY_POLICY.match(/https:\/\/[^\s;]+/g)!.filter(h => !/plaid\.com$/.test(h) && !/fonts\.g/.test(h));
     expect(hosts).toEqual([]);
+  });
+});
+
+describe('spreadsheet pages', () => {
+  const headersFor = async (url: string, headers: Record<string, string> = {}) => {
+    app = await build();
+    const res = await app.inject({ method: 'GET', url, headers });
+    await app.close(); app = undefined;
+    return res.headers;
+  };
+  const directive = (policy: string, name: string) => policy.split('; ').find(d => d.startsWith(`${name} `)) ?? '';
+
+  it('loosens only the exact sheet page, which Curia alone may frame', async () => {
+    for (const url of ['/budget/sheet-frame', '/budget/sheet-frame?id=1']) {
+      const h = await headersFor(url);
+      expect(h['content-security-policy'], url).toBe(SHEET_CONTENT_SECURITY_POLICY);
+      expect(h['x-frame-options']).toBe('SAMEORIGIN');
+    }
+    for (const url of ['/budget', '/budget/sheet-frame-evil', '/budget/sheet-frame/x']) {
+      const h = await headersFor(url);
+      expect(h['content-security-policy'], url).toBe(CONSOLE_CONTENT_SECURITY_POLICY);
+      expect(h['x-frame-options']).toBe('DENY');
+    }
+  });
+
+  it('allows the grid three exact stylesheets and inline images, never inline or evaluated script', () => {
+    expect(directive(SHEET_CONTENT_SECURITY_POLICY, 'script-src')).toBe("script-src 'self'");
+    expect(SHEET_CONTENT_SECURITY_POLICY).not.toContain('unsafe-eval');
+    const styles = directive(SHEET_CONTENT_SECURITY_POLICY, 'style-src-elem');
+    expect(styles).not.toContain('unsafe-inline');
+    for (const hash of UNIVER_STYLE_HASHES) expect(styles).toContain(hash);
+    expect(directive(SHEET_CONTENT_SECURITY_POLICY, 'img-src')).toBe("img-src 'self' data:");
+  });
+
+  it('shuts the converter in: sandboxed without an origin, no network, own scripts only', async () => {
+    for (const url of ['/budget/convert-frame', '/convert-frame.html']) {
+      expect((await headersFor(url))['content-security-policy'], url).toBe(CONVERTER_CONTENT_SECURITY_POLICY);
+    }
+    expect(CONVERTER_CONTENT_SECURITY_POLICY).toContain("connect-src 'none'");
+    expect(CONVERTER_CONTENT_SECURITY_POLICY).toContain('sandbox allow-scripts');
+    expect(CONVERTER_CONTENT_SECURITY_POLICY).not.toContain('allow-same-origin');
+    expect(directive(CONVERTER_CONTENT_SECURITY_POLICY, 'script-src')).toBe("script-src 'self'");
+  });
+
+  it('lets the originless frame load public assets, without credentials, and nothing else', async () => {
+    expect((await headersFor('/assets/a.js', { origin: 'null' }))['access-control-allow-origin']).toBe('*');
+    expect((await headersFor('/assets/a.js', { origin: 'null' }))['access-control-allow-credentials']).toBeUndefined();
+    expect((await headersFor('/assets/a.js'))['access-control-allow-origin']).toBeUndefined();
+    expect((await headersFor('/ok', { origin: 'null' }))['access-control-allow-origin']).toBeUndefined();
+  });
+
+  it('keeps the grid library pinned to the version whose styles are allowed', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../../../../apps/console/package.json', import.meta.url), 'utf8')) as { dependencies: Record<string, string> };
+    // Changing these changes the injected stylesheets: recompute UNIVER_STYLE_HASHES, then update this test.
+    expect(pkg.dependencies['@univerjs/presets']).toBe('1.5.2');
+    expect(pkg.dependencies['@univerjs/preset-sheets-core']).toBe('1.5.2');
+    expect(pkg.dependencies['@zwight/luckyexcel']).toBe('1.1.6');
   });
 });

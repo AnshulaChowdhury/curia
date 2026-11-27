@@ -14,6 +14,13 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    rollupOptions: {
+      // Two pages: the console, and the spreadsheet file converter that runs alone in a sandboxed frame.
+      input: {
+        main: path.resolve(import.meta.dirname, 'index.html'),
+        convert: path.resolve(import.meta.dirname, 'convert-frame.html'),
+      },
+    },
     // Emit source maps only in development; production builds omit .map files
     // so internal implementation details are not publicly accessible via the
     // static file server.
