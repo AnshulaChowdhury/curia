@@ -134,7 +134,7 @@ export function today(now = new Date()): string {
   return `${currentMonth(now)}-${String(now.getDate()).padStart(2, '0')}`;
 }
 
-// ---- Assets and debts (Net worth page) ----
+// ---- Assets and debts (net worth) ----
 
 export const ASSET_LABELS = { cash: 'Cash', investment: 'Investments', property: 'Property', vehicle: 'Vehicles', other_asset: 'Other assets' } as const;
 export const DEBT_LABELS = { credit_card: 'Credit cards', line_of_credit: 'Lines of credit', mortgage: 'Mortgages', loan: 'Loans', other_debt: 'Other debts' } as const;

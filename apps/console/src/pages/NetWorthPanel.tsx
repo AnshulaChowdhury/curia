@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
-import { BudgetShell, BudgetGate } from './BudgetShell.js';
-import { budgetClient, type BudgetLoad } from './budget-data.js';
+// What the owner owns and owes: totals, each side's accounts, and hand-kept entries. Shown on the budget overview.
+import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { budgetClient } from './budget-data.js';
 import {
   ASSET_LABELS, DEBT_LABELS, counted, groupAccounts, formatCents, centsToDollarInput, parseDollarsToCents,
   type AccountType, type BudgetAccount, type NetWorth,
@@ -83,7 +83,7 @@ export function NetWorthSummary({ totals }: { totals: NetWorth['totals'] }) {
   const largest = Math.max(totals.assetsCents, totals.debtsCents, 1);
   const width = (cents: number) => `${Math.min(Math.max((cents / largest) * 100, 0), 100)}%`;
   return (
-    <section className="dash-card" aria-label="Net worth">
+    <section className="dash-card" aria-label="Net worth totals">
       <dl className="bud-stats">
         <div className={totals.netCents < 0 ? 'is-over' : undefined}><dt>Net worth</dt><dd>{formatCents(totals.netCents)}</dd></div>
         <div><dt>You own</dt><dd>{formatCents(totals.assetsCents)}</dd></div>
@@ -101,22 +101,23 @@ export function NetWorthSummary({ totals }: { totals: NetWorth['totals'] }) {
   );
 }
 
-export default function NetWorthPage() {
-  const [load, setLoad] = useState<BudgetLoad<NetWorth> | null>(null);
-  const [draft, setDraft] = useState<Draft>(EMPTY);
+export function NetWorthSection({ data, onChanged }: { data: NetWorth; onChanged: () => Promise<void> }) {
+  const [draft, setDraft] = useState<Draft | null>(null); // null: the form is closed
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const nameInput = useRef<HTMLInputElement>(null);
 
-  const refresh = useCallback(async () => setLoad(await budgetClient.loadNetWorth()), []);
-  useEffect(() => { void refresh(); }, [refresh]);
+  // Opening the form, or switching it to another entry, moves to its first field.
+  const open = draft === null ? null : draft.id ?? 'new';
+  useEffect(() => { if (open !== null) nameInput.current?.focus(); }, [open]);
 
   async function run(action: () => Promise<void>, done: string) {
     setBusy(true); setError(null); setMessage(null);
     try {
       await action();
       setMessage(done);
-      await refresh();
+      await onChanged();
     } catch (err) {
       console.error('budget accounts action failed', err);
       setError(err instanceof Error ? err.message : 'Something went wrong.');
@@ -126,77 +127,82 @@ export default function NetWorthPage() {
 
   function submit(e: FormEvent) {
     e.preventDefault();
+    if (!draft) return;
     const cents = parseDollarsToCents(draft.amount);
     if (!draft.name.trim()) return setError('Give it a name.');
     if (cents === null) return setError('Enter an amount like 2500 or 2500.00.');
     void run(async () => {
       await budgetClient.saveAccount({ id: draft.id, name: draft.name.trim(), type: draft.type, balanceCents: cents });
-      setDraft(EMPTY);
+      setDraft(null);
     }, `Saved ${draft.name.trim()}.`);
   }
 
-  const data = load?.state === 'ok' ? load.data : null;
+  const close = () => { setDraft(null); setError(null); };
   const edit = (a: BudgetAccount) => {
     setError(null);
     setDraft({ id: a.id, name: a.name, type: a.type, amount: centsToDollarInput(a.balanceCents ?? 0) });
-    document.getElementById('bud-account-name')?.focus();
   };
   const remove = (a: BudgetAccount) => void run(async () => {
     await budgetClient.deleteAccount(a.id);
-    if (draft.id === a.id) setDraft(EMPTY);
+    setDraft(d => (d?.id === a.id ? null : d));
   }, `Deleted ${a.name}.`);
 
   return (
-    <BudgetShell active="/budget/net-worth">
-      <BudgetGate load={load} />
-      {data && (
-        <>
-          <div className="bud-row">
-            <button type="button" className="btn btn-secondary btn-sm" disabled={busy}
-              onClick={() => void run(() => budgetClient.refreshBanks(), 'Sync finished. Each balance shows the date it was read.')}>
-              {busy ? 'Working…' : 'Refresh bank balances'}
-            </button>
-          </div>
-          {message && <p className="bud-ok" role="status">{message}</p>}
-          <NetWorthSummary totals={data.totals} />
-          <div className="bud-pair">
-            <SideCard title="Assets" side="asset" data={data} onEdit={edit} onDelete={remove} />
-            <SideCard title="Liabilities" side="debt" data={data} onEdit={edit} onDelete={remove} />
-          </div>
-          <form className="dash-card" onSubmit={submit} noValidate aria-labelledby="bud-acct-h">
-            <h2 id="bud-acct-h" className="dash-card-title">{draft.id ? 'Edit entry' : 'Add an asset or liability'}</h2>
-            <p className="bud-hint">For anything a connected bank does not show, such as a home, a car, investments or a mortgage.</p>
-            <div className="bud-form bud-form-4">
-              <label className="bud-field">
-                <span>Name</span>
-                <input id="bud-account-name" className="bud-input" type="text" maxLength={120} placeholder="e.g. Home"
-                  value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} />
-              </label>
-              <label className="bud-field">
-                <span>Kind</span>
-                <select className="bud-input" value={draft.type} onChange={e => setDraft({ ...draft, type: e.target.value as AccountType })}>
-                  <optgroup label="Assets">
-                    {Object.entries(ASSET_LABELS).map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-                  </optgroup>
-                  <optgroup label="Liabilities">
-                    {Object.entries(DEBT_LABELS).map(([v, label]) => <option key={v} value={v}>{label}</option>)}
-                  </optgroup>
-                </select>
-              </label>
-              <label className="bud-field">
-                <span>Value or amount owed (CAD)</span>
-                <input className="bud-input" type="text" inputMode="decimal" placeholder="0.00"
-                  value={draft.amount} onChange={e => setDraft({ ...draft, amount: e.target.value })} />
-              </label>
-              <div className="bud-actions">
-                <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>{draft.id ? 'Save changes' : 'Add'}</button>
-                {draft.id && <button type="button" className="btn btn-secondary btn-sm" onClick={() => { setDraft(EMPTY); setError(null); }}>Cancel</button>}
-              </div>
+    <section id="bud-networth" className="bud-networth" aria-labelledby="bud-networth-h">
+      <div className="bud-section-head">
+        <h2 id="bud-networth-h" className="bud-heading">Assets and liabilities</h2>
+        <div className="bud-row">
+          <button type="button" className="btn btn-secondary btn-sm" disabled={busy}
+            onClick={() => void run(() => budgetClient.refreshBanks(), 'Sync finished. Each balance shows the date it was read.')}>
+            {busy ? 'Working…' : 'Refresh bank balances'}
+          </button>
+          <button type="button" className="btn btn-primary btn-sm" aria-expanded={draft !== null}
+            onClick={() => (draft ? close() : setDraft(EMPTY))}>
+            Add an asset or liability
+          </button>
+        </div>
+      </div>
+      {message && <p className="bud-ok" role="status">{message}</p>}
+      {error && !draft && <p className="bud-error" role="alert">{error}</p>}
+      {draft && (
+        <form className="dash-card" onSubmit={submit} noValidate aria-labelledby="bud-acct-h">
+          <h3 id="bud-acct-h" className="dash-card-title">{draft.id ? 'Edit entry' : 'Add an asset or liability'}</h3>
+          <p className="bud-hint">For anything a connected bank does not show, such as a home, a car, investments or a mortgage.</p>
+          <div className="bud-form bud-form-4">
+            <label className="bud-field">
+              <span>Name</span>
+              <input ref={nameInput} className="bud-input" type="text" maxLength={120} placeholder="e.g. Home"
+                value={draft.name} onChange={e => setDraft({ ...draft, name: e.target.value })} />
+            </label>
+            <label className="bud-field">
+              <span>Kind</span>
+              <select className="bud-input" value={draft.type} onChange={e => setDraft({ ...draft, type: e.target.value as AccountType })}>
+                <optgroup label="Assets">
+                  {Object.entries(ASSET_LABELS).map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+                </optgroup>
+                <optgroup label="Liabilities">
+                  {Object.entries(DEBT_LABELS).map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+                </optgroup>
+              </select>
+            </label>
+            <label className="bud-field">
+              <span>Value or amount owed (CAD)</span>
+              <input className="bud-input" type="text" inputMode="decimal" placeholder="0.00"
+                value={draft.amount} onChange={e => setDraft({ ...draft, amount: e.target.value })} />
+            </label>
+            <div className="bud-actions">
+              <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>{draft.id ? 'Save changes' : 'Add'}</button>
+              <button type="button" className="btn btn-secondary btn-sm" onClick={close}>Cancel</button>
             </div>
-            {error && <p className="bud-error" role="alert">{error}</p>}
-          </form>
-        </>
+          </div>
+          {error && <p className="bud-error" role="alert">{error}</p>}
+        </form>
       )}
-    </BudgetShell>
+      <NetWorthSummary totals={data.totals} />
+      <div className="bud-pair">
+        <SideCard title="Assets" side="asset" data={data} onEdit={edit} onDelete={remove} />
+        <SideCard title="Liabilities" side="debt" data={data} onEdit={edit} onDelete={remove} />
+      </div>
+    </section>
   );
 }

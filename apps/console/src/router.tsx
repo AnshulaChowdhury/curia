@@ -39,7 +39,6 @@ const JobsPage = lazy(() => import('./pages/JobsPage'));
 const BooksReviewPage = lazy(() => import('./pages/BooksReviewPage'));
 const BudgetOverviewPage = lazy(() => import('./pages/BudgetOverviewPage'));
 const BudgetsPage = lazy(() => import('./pages/BudgetsPage'));
-const NetWorthPage = lazy(() => import('./pages/NetWorthPage'));
 const SheetPage = lazy(() => import('./pages/SheetPage'));
 const BudgetConnectBankPage = lazy(() => import('./pages/BudgetConnectBankPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
@@ -236,7 +235,8 @@ const budgetBudgetsRoute = createRoute({
 const budgetNetWorthRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/budget/net-worth',
-  component: NetWorthPage,
+  // Net worth moved onto the overview.
+  beforeLoad: () => { throw redirect({ to: '/budget' }); },
 });
 
 const budgetSheetRoute = createRoute({

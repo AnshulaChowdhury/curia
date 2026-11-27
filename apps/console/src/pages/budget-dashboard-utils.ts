@@ -96,13 +96,14 @@ export function actionItems(input: {
 }): ActionItem[] {
   const { summary, netWorth, banks } = input;
   const items: ActionItem[] = [];
+  const reconcile = `/budget/budgets?month=${summary.month}`;
   const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
   for (const b of banks) {
     items.push({ key: `bank-${b.id}`, tone: 'bad', strong: b.institution, rest: b.status === 'needs_login' ? 'needs you to log in again' : 'failed to sync', href: '#bud-add', action: 'Fix connection' });
   }
   const { uncategorised, guesses } = summary.needsYou;
-  if (uncategorised > 0) items.push({ key: 'loose', tone: 'bad', strong: plural(uncategorised, 'transaction'), rest: `${uncategorised === 1 ? 'has' : 'have'} no category`, href: '#bud-review', action: 'Categorise' });
-  if (guesses > 0) items.push({ key: 'guess', tone: 'warn', strong: `${guesses} guess${guesses === 1 ? '' : 'es'}`, rest: 'to confirm', href: '#bud-review', action: 'Review' });
+  if (uncategorised > 0) items.push({ key: 'loose', tone: 'bad', strong: plural(uncategorised, 'transaction'), rest: `${uncategorised === 1 ? 'has' : 'have'} no category`, href: reconcile, action: 'Categorise' });
+  if (guesses > 0) items.push({ key: 'guess', tone: 'warn', strong: `${guesses} guess${guesses === 1 ? '' : 'es'}`, rest: 'to confirm', href: reconcile, action: 'Review' });
   const over = summary.categories.filter(c => c.state === 'over' && !c.archived);
   if (over.length > 0) {
     const by = over.reduce((n, c) => n - (c.remainingCents ?? 0), 0);
@@ -112,9 +113,9 @@ export function actionItems(input: {
     items.push({ key: 'nobudget', tone: 'warn', strong: 'No budgets yet', rest: 'so nothing can be tracked against a plan', href: '/budget/budgets', action: 'Set budgets' });
   }
   if (netWorth.accounts.length === 0) {
-    items.push({ key: 'nobalances', tone: 'warn', strong: 'No balances yet', rest: 'so net worth is unknown', href: '/budget/net-worth', action: 'Add balances' });
+    items.push({ key: 'nobalances', tone: 'warn', strong: 'No balances yet', rest: 'so net worth is unknown', href: '#bud-networth', action: 'Add balances' });
   } else if (netWorth.totals.leftOut > 0) {
-    items.push({ key: 'leftout', tone: 'warn', strong: plural(netWorth.totals.leftOut, 'account'), rest: 'not counted in net worth', href: '/budget/net-worth', action: 'See which' });
+    items.push({ key: 'leftout', tone: 'warn', strong: plural(netWorth.totals.leftOut, 'account'), rest: 'not counted in net worth', href: '#bud-networth', action: 'See which' });
   }
   return items;
 }

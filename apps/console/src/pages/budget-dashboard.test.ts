@@ -68,7 +68,8 @@ describe('action items and columns', () => {
   it('lists what needs the owner', () => {
     const items = actionItems({ summary: summary(cats, 2), netWorth: NOTHING, banks: [{ id: 'l', institution: 'Invented Bank', status: 'needs_login' }] });
     expect(items.map(i => i.key)).toEqual(['bank-l', 'loose', 'over', 'nobalances']);
-    expect(items[1]).toMatchObject({ strong: '2 transactions', rest: 'have no category' });
+    expect(items[1]).toMatchObject({ strong: '2 transactions', rest: 'have no category', href: '/budget/budgets?month=2031-03' });
+    expect(items.at(-1)).toMatchObject({ href: '#bud-networth' });
   });
   it('is empty when nothing is wrong', () => {
     const fine = { ...NOTHING, accounts: [{ id: 'x', source: 'manual' as const, institution: '', name: 'x', mask: null, type: 'cash' as const, side: 'asset' as const, currency: 'CAD', balanceCents: 1, asOf: '' }] };

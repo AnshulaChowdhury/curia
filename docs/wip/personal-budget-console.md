@@ -1,6 +1,6 @@
 # Personal budget in the console: plan and proposed API
 
-Status: Overview, Budgets and Import read and write the real `/api/budget/*` routes. The server's summary is the only source of spending totals and states; rollover is saved but not counted yet. The sections below are the original plan.
+Status: Overview and Budgets read and write the real `/api/budget/*` routes. The server's summary is the only source of spending totals and states; rollover is saved but not counted yet. The sections below are the original plan.
 
 Personal finance is separate from the MowMow business books (the Books page). Owner-only.
 
@@ -8,10 +8,10 @@ Personal finance is separate from the MowMow business books (the Books page). Ow
 
 | Path | Page | First pass |
 |---|---|---|
-| `/budget` | Dashboard: net worth, spending history, category split, action items, budget status, review list, adding transactions | built |
-| `/budget/budgets` | Budgets: add and edit; delete an empty category, archive a used one (it keeps its transactions) | built |
+| `/budget` | Overview: net worth, spending history, category split, action items, budget status, assets and liabilities (bank balances plus hand entries; owner-only, no agent can read them), adding transactions | built |
+| `/budget/budgets` | Budgets: reconcile a month (assign categories, confirm guesses); add and edit; delete an empty category, archive a used one (it keeps its transactions) | built |
 | `/budget/sheet-frame` | Spreadsheets: open an .xlsx or .csv and edit it in a Univer grid. Its own page and security policy; kept 14 days after the last change | built |
-| `/budget/net-worth` | Assets, liabilities and net worth: bank balances plus hand entries. Owner-only; no agent can read it | built |
+| `/budget/net-worth` | Redirects to Overview | built |
 | `/budget/transactions` | Transactions | next PR |
 | `/budget/import` | Redirects to Overview, which holds file upload and bank connections | built |
 | `/budget/rules` | Rules | next PR |

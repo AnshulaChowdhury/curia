@@ -26,11 +26,11 @@ export function Tiles({ data }: { data: DashboardData }) {
   const waiting = summary.needsYou.uncategorised + summary.needsYou.guesses;
   return (
     <div className="bud-tiles">
-      <Tile label="Net worth" tone="blue" href="/budget/net-worth" value={known ? formatCents(totals.netCents) : '—'}
+      <Tile label="Net worth" tone="blue" href="#bud-networth" value={known ? formatCents(totals.netCents) : '—'}
         hint={known ? `${formatCents(totals.assetsCents)} owned` : 'Add balances'} />
-      <Tile label="Cash" tone="aqua" href="/budget/net-worth" value={known ? formatCents(cashCents(netWorth)) : '—'} hint="In cash accounts" />
-      <Tile label="Owed" tone="violet" href="/budget/net-worth" value={known ? formatCents(totals.debtsCents) : '—'} hint="Cards, loans and mortgages" />
-      <Tile label="To categorise" tone={waiting > 0 ? 'alert' : 'plain'} href="#bud-review" value={String(waiting)} hint={formatMonth(summary.month)} />
+      <Tile label="Cash" tone="aqua" href="#bud-networth" value={known ? formatCents(cashCents(netWorth)) : '—'} hint="In cash accounts" />
+      <Tile label="Owed" tone="violet" href="#bud-networth" value={known ? formatCents(totals.debtsCents) : '—'} hint="Cards, loans and mortgages" />
+      <Tile label="To categorise" tone={waiting > 0 ? 'alert' : 'plain'} href={`/budget/budgets?month=${summary.month}`} value={String(waiting)} hint={formatMonth(summary.month)} />
     </div>
   );
 }

@@ -4354,6 +4354,10 @@ table.records-table tbody tr.active td { background: transparent; }
 .bud-action a { font-size: 12px; color: var(--app-fg-muted); }
 .bud-action a:hover { color: var(--app-fg); }
 .bud-review-scroll { max-height: 420px; overflow: auto; }
+.bud-networth { display: flex; flex-direction: column; gap: 14px; }
+.bud-body .dash-card-head { flex-wrap: wrap; }
+.bud-section-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+.bud-heading { margin: 0; font-size: 16px; font-weight: 600; color: var(--app-fg); }
 
 @media (max-width: 1180px) {
   .bud-body .bud-spend { grid-template-columns: minmax(0, 1fr); }

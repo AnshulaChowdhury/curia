@@ -88,14 +88,21 @@ describe('budget client', () => {
     const seen: Seen[] = [];
     const client = fake(seen, path => reply(path, json({ links: [{ id: 'a', institution: 'Fine', status: 'active' }, { id: 'b', institution: 'Stuck', status: 'needs_login' }] })));
     const result = await client.loadDashboard('2031-03', '2031-03-15');
-    expect(result).toMatchObject({ state: 'ok', data: { categories: CATEGORIES, summary: SUMMARY, review: [], banksNeedingYou: [{ id: 'b', institution: 'Stuck', status: 'needs_login' }] } });
+    expect(result).toMatchObject({ state: 'ok', data: { summary: SUMMARY, banksNeedingYou: [{ id: 'b', institution: 'Stuck', status: 'needs_login' }] } });
     expect(seen.map(s => s.path).sort()).toEqual([
       '/api/budget/accounts',
       '/api/budget/banks',
-      '/api/budget/categories?archived=1',
       '/api/budget/summary?month=2031-03',
-      '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
       '/api/budget/trend?asOf=2031-03-15',
+    ]);
+  });
+  it('loads the budgets with what needs a category that month', async () => {
+    const seen: Seen[] = [];
+    const client = fake(seen, path => reply(path, json({ links: [] })));
+    expect(await client.loadBudgets('2031-03')).toMatchObject({ state: 'ok', data: { month: '2031-03', categories: CATEGORIES, review: [] } });
+    expect(seen.map(s => s.path).sort()).toEqual([
+      '/api/budget/categories?archived=1',
+      '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
     ]);
   });
   it('still loads when bank connections are not available', async () => {
@@ -117,7 +124,7 @@ describe('budget client', () => {
     ]);
   });
   it('shows locked for 401, and the server message when a save fails', async () => {
-    expect(await fake([], () => json({ error: 'no' }, 401)).loadCategories()).toEqual({ state: 'locked' });
+    expect(await fake([], () => json({ error: 'no' }, 401)).loadBudgets('2031-03')).toEqual({ state: 'locked' });
     await expect(fake([], () => json({ error: 'A category with that name already exists' }, 409))
       .saveCategory({ id: null, name: 'Home', monthlyCents: 1, rollover: false })).rejects.toThrow('already exists');
   });
