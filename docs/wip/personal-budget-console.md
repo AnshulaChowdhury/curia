@@ -8,8 +8,8 @@ Personal finance is separate from the MowMow business books (the Books page). Ow
 
 | Path | Page | First pass |
 |---|---|---|
-| `/budget` | Overview | built |
-| `/budget/budgets` | Budgets | built |
+| `/budget` | Dashboard: net worth, spending history, category split, action items, budget status, review list, adding transactions | built |
+| `/budget/budgets` | Budgets: add and edit; delete an empty category, archive a used one (it keeps its transactions) | built |
 | `/budget/net-worth` | Assets, liabilities and net worth: bank balances plus hand entries. Owner-only; no agent can read it | built |
 | `/budget/transactions` | Transactions | next PR |
 | `/budget/import` | Redirects to Overview, which holds file upload and bank connections | built |

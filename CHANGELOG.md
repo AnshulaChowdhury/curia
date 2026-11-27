@@ -17,8 +17,13 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 - **Dependency pins** — raised eight stale floors, clearing a critical Vite advisory.
 
+### Changed
+
+- **Budget categories** — used ones archive and keep history; only empty ones delete (migration 133).
+
 ### Added
 
+- **Household finance dashboard** — net worth, spending history and budget status on one screen.
 - **Household net worth** — assets and liabilities from connected banks and hand entries (migration 132).
 - **Budget screens use real data** — categories and budgets save; assign categories on Overview.
 - **Budget bank-file import** — upload RBC, Tangerine, CIBC or .qbo/.ofx files into budget transactions, duplicates skipped.

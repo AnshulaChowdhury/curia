@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
-  shiftMonth, isMonth, currentMonth, formatCents, parseDollarsToCents, centsToDollarInput, barPercent, needsYouLines, validateDraft, groupAccounts,
+  shiftMonth, isMonth, currentMonth, formatCents, parseDollarsToCents, centsToDollarInput, barPercent, validateDraft, groupAccounts,
   type AccountType, type BudgetCategory, type BudgetSummary,
 } from './budget-utils.js';
 import { createBudgetClient, stateForStatus } from './budget-data.js';
 
-const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', monthlyCents: 60000, rollover: false }];
+const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', monthlyCents: 60000, rollover: false, archived: false, transactionCount: 0 }];
 
 describe('months', () => {
   it('shifts across year boundaries', () => {
@@ -53,21 +53,10 @@ describe('bar', () => {
 
 const SUMMARY: BudgetSummary = {
   month: '2031-03',
-  categories: [{ categoryId: 'cat-groceries', name: 'Groceries', budgetedCents: 60000, spentCents: 61000, remainingCents: -1000, state: 'over' }],
+  categories: [{ categoryId: 'cat-groceries', name: 'Groceries', archived: false, budgetedCents: 60000, spentCents: 61000, remainingCents: -1000, state: 'over' }],
   totals: { budgetedCents: 60000, spentCents: 63000, uncategorisedSpentCents: 2000 },
   needsYou: { uncategorised: 2, guesses: 1, overBudget: 1 },
 };
-
-describe('needs you', () => {
-  it('words the server counts and over-budget categories', () => {
-    expect(needsYouLines(SUMMARY)).toEqual([
-      '2 transactions without a category',
-      '1 agent guess to confirm',
-      expect.stringContaining('Groceries is over budget by'),
-    ]);
-    expect(needsYouLines({ ...SUMMARY, categories: [], needsYou: { uncategorised: 0, guesses: 0, overBudget: 0 } })).toEqual([]);
-  });
-});
 
 describe('assets and liabilities', () => {
   const row = (id: string, type: AccountType, side: 'asset' | 'debt', balanceCents: number | null, currency = 'CAD') =>
@@ -90,15 +79,28 @@ describe('budget client', () => {
   });
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
-  it('loads a month from the server routes', async () => {
+  const reply = (path: string, banks: Response) =>
+    path.includes('banks') ? banks
+      : json(path.includes('summary') ? SUMMARY : path.includes('transactions') ? { transactions: [] }
+        : path.includes('accounts') ? { accounts: [], totals: {} } : path.includes('trend') ? { months: [] } : { categories: CATEGORIES });
+
+  it('loads the dashboard from the server routes, listing only banks that need the owner', async () => {
     const seen: Seen[] = [];
-    const client = fake(seen, path => json(path.includes('summary') ? SUMMARY : path.includes('transactions') ? { transactions: [] } : { categories: CATEGORIES }));
-    expect(await client.loadMonth('2031-03')).toEqual({ state: 'ok', data: { categories: CATEGORIES, summary: SUMMARY, review: [] } });
-    expect(seen.map(s => s.path)).toEqual([
-      '/api/budget/categories',
+    const client = fake(seen, path => reply(path, json({ links: [{ id: 'a', institution: 'Fine', status: 'active' }, { id: 'b', institution: 'Stuck', status: 'needs_login' }] })));
+    const result = await client.loadDashboard('2031-03', '2031-03-15');
+    expect(result).toMatchObject({ state: 'ok', data: { categories: CATEGORIES, summary: SUMMARY, review: [], banksNeedingYou: [{ id: 'b', institution: 'Stuck', status: 'needs_login' }] } });
+    expect(seen.map(s => s.path).sort()).toEqual([
+      '/api/budget/accounts',
+      '/api/budget/banks',
+      '/api/budget/categories?archived=1',
       '/api/budget/summary?month=2031-03',
       '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
+      '/api/budget/trend?asOf=2031-03-15',
     ]);
+  });
+  it('still loads when bank connections are not available', async () => {
+    const client = fake([], path => reply(path, json({ error: 'nope' }, 404)));
+    expect(await client.loadDashboard('2031-03', '2031-03-15')).toMatchObject({ state: 'ok', data: { banksNeedingYou: [] } });
   });
   it('creates, edits, deletes and categorises', async () => {
     const seen: Seen[] = [];
@@ -122,6 +124,10 @@ describe('budget client', () => {
 });
 
 describe('validateDraft', () => {
+  it('lets a new category reuse an archived name', () => {
+    const gone = [{ ...CATEGORIES[0]!, archived: true }];
+    expect(validateDraft({ name: 'Groceries', amount: '10', rollover: false }, gone, null).ok).toBe(true);
+  });
   it('rejects blank, duplicate and bad amounts', () => {
     expect(validateDraft({ name: ' ', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
     expect(validateDraft({ name: 'groceries', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();

@@ -3,7 +3,10 @@
 import { describe, it, expect } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MoneyCard } from '../components/MoneyCard.js';
-import { CategoryLine, ReviewList } from './BudgetOverviewPage.js';
+import { ReviewList } from './BudgetOverviewPage.js';
+import { RetireActions } from './BudgetsPage.js';
+import { ActionItems, SpendingPanel, StatusColumn, Tiles, CategoryBar } from './BudgetDashboard.js';
+import type { DashboardData } from './budget-data.js';
 import { NetWorthSummary, SideCard } from './NetWorthPage.js';
 
 describe('MoneyCard', () => {
@@ -30,7 +33,7 @@ describe('overview', () => {
     const html = renderToStaticMarkup(
       <ReviewList
         txns={[{ id: 't', account: 'Card', date: '2031-03-02', payee: '<b>MARKET</b>', description: '', amountCents: -2400, categoryId: null, source: null }]}
-        categories={[{ id: 'c', name: 'Groceries', monthlyCents: 100, rollover: false }]}
+        categories={[{ id: 'c', name: 'Groceries', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0 }]}
         busy={false}
         onCategorise={() => {}}
       />,
@@ -39,10 +42,66 @@ describe('overview', () => {
     expect(html).toContain('&lt;b&gt;MARKET');
     expect(html).toContain('Groceries');
   });
-  it('handles a category with no budget', () => {
-    const html = renderToStaticMarkup(<CategoryLine c={{ categoryId: 'c', name: 'Gifts', budgetedCents: null, spentCents: 500, remainingCents: null, state: 'no_budget' }} />);
-    expect(html).toContain('No budget set');
-    expect(html).not.toContain('role="progressbar"');
+});
+
+describe('archived categories', () => {
+  const category = (over: Partial<{ archived: boolean; transactionCount: number }>) =>
+    ({ id: 'c', name: 'Old', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0, ...over });
+  const actions = (transactionCount: number, confirming = false) => renderToStaticMarkup(
+    <RetireActions c={category({ transactionCount })} confirming={confirming} onAsk={() => {}} onKeep={() => {}} onConfirm={() => {}} />);
+
+  it('offers delete for an empty category and archive for a used one, saying what happens', () => {
+    expect(actions(0)).toContain('aria-label="Delete Old"');
+    expect(actions(2)).toContain('aria-label="Archive Old"');
+    expect(actions(2, true)).toContain('Its 2 transactions keep it');
+  });
+  it('shows an archived guess without letting it be confirmed or chosen again', () => {
+    const html = renderToStaticMarkup(
+      <ReviewList
+        txns={[{ id: 't', account: 'Card', date: '2031-03-02', payee: 'Shop', description: '', amountCents: -100, categoryId: 'c', source: 'agent_guess' }]}
+        categories={[category({ archived: true })]} busy={false} onCategorise={() => {}}
+      />,
+    );
+    expect(html).toContain('Old (archived)');
+    expect(html).toContain('disabled=""');
+    expect(html).not.toContain('Confirm guess');
+  });
+});
+
+describe('dashboard', () => {
+  const data: DashboardData = {
+    categories: [], review: [], banksNeedingYou: [{ id: 'l', institution: '<i>Bank</i>', status: 'error' }],
+    summary: {
+      month: '2031-03',
+      categories: [{ categoryId: 'a', name: '<b>Food</b>', archived: false, budgetedCents: 10000, spentCents: 12000, remainingCents: -2000, state: 'over' }],
+      totals: { budgetedCents: 10000, spentCents: 12000, uncategorisedSpentCents: 0 },
+      needsYou: { uncategorised: 0, guesses: 0, overBudget: 1 },
+    },
+    netWorth: { accounts: [{ id: 'x', source: 'manual', institution: '', name: 'Cash', mask: null, type: 'cash', side: 'asset', currency: 'CAD', balanceCents: 50000, asOf: '' }], totals: { assetsCents: 50000, debtsCents: 20000, netCents: 30000, leftOut: 0 } },
+    trend: {
+      asOf: '2031-03-15', firstDate: '2031-01-02',
+      months: [{ month: '2031-01', outCents: 100, inCents: 200 }, { month: '2031-02', outCents: 300, inCents: 100 }],
+      monthToDate: { currentCents: 150, previousCents: 100 }, lastMonth: { currentCents: 300, previousCents: null }, yearToDate: { currentCents: 400, previousCents: null },
+    },
+  };
+
+  it('shows net worth up front', () => {
+    const html = renderToStaticMarkup(<Tiles data={data} />);
+    expect(html).toContain('Net worth');
+    expect(html).toContain('300.00');
+  });
+  it('renders names from banks and the owner as text', () => {
+    const html = renderToStaticMarkup(<><ActionItems data={data} /><StatusColumn data={data} column="over" /><CategoryBar data={data} /></>);
+    expect(html).not.toContain('<b>Food');
+    expect(html).not.toContain('<i>Bank');
+    expect(html).toContain('&lt;b&gt;Food');
+  });
+  it('draws the chart with a table of the same values, and a dash where there is nothing to compare', () => {
+    const html = renderToStaticMarkup(<SpendingPanel data={data} />);
+    expect(html).toContain('<svg');
+    expect(html).toContain('Show as a table');
+    expect(html).toContain('+50.0%');
+    expect(html).toContain('—');
   });
 });
 

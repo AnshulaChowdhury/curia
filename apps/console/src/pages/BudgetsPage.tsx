@@ -8,6 +8,31 @@ import {
 
 const EMPTY: CategoryDraft = { name: '', amount: '', rollover: false };
 
+/** Edit, then Delete (empty) or Archive (used), each confirmed in place. */
+export function RetireActions({ c, confirming, onAsk, onKeep, onConfirm, onEdit }: {
+  c: BudgetCategory; confirming: boolean; onAsk: () => void; onKeep: () => void; onConfirm: () => void; onEdit?: () => void;
+}) {
+  const verb = c.transactionCount > 0 ? 'Archive' : 'Delete';
+  return (
+    <div className="bud-row-actions">
+      {confirming ? (
+        <>
+          <span>
+            {verb} {c.name}?{c.transactionCount > 0 ? ` Its ${c.transactionCount} transaction${c.transactionCount === 1 ? ' keeps' : 's keep'} it; nothing new can be added.` : ''}
+          </span>
+          <button type="button" className="btn btn-danger btn-sm" onClick={onConfirm}>{verb}</button>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={onKeep}>Keep</button>
+        </>
+      ) : (
+        <>
+          {onEdit && <button type="button" className="btn btn-secondary btn-sm" onClick={onEdit} aria-label={`Edit ${c.name}`}>Edit</button>}
+          <button type="button" className="btn btn-secondary btn-sm" onClick={onAsk} aria-label={`${verb} ${c.name}`}>{verb}</button>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function BudgetsPage() {
   const [load, setLoad] = useState<BudgetLoad<BudgetCategory[]> | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -21,7 +46,9 @@ export default function BudgetsPage() {
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
 
-  const categories: BudgetCategory[] = load?.state === 'ok' ? load.data : [];
+  const all: BudgetCategory[] = load?.state === 'ok' ? load.data : [];
+  const categories = all.filter(c => !c.archived);
+  const archived = all.filter(c => c.archived);
 
   function startEdit(c: BudgetCategory) {
     setEditingId(c.id);
@@ -52,17 +79,20 @@ export default function BudgetsPage() {
     }
   }
 
-  async function remove(c: BudgetCategory) {
+  // A category with transactions is archived (they keep it); an empty one is deleted.
+  async function retire(c: BudgetCategory) {
+    const used = c.transactionCount > 0;
     try {
-      await budgetClient.deleteCategory(c.id);
-      setMessage(`Deleted ${c.name}. Its transactions are now uncategorised.`);
-      setConfirmId(null);
+      if (used) await budgetClient.archiveCategory(c.id);
+      else await budgetClient.deleteCategory(c.id);
+      setMessage(used ? `Archived ${c.name}. Its transactions keep it.` : `Deleted ${c.name}.`);
       if (editingId === c.id) reset();
-      await refresh();
     } catch (err) {
-      console.error('budget delete failed', err);
-      setMessage('Could not delete the category.');
+      console.error('budget retire failed', err);
+      setMessage(`Could not ${used ? 'archive' : 'delete'} the category. ${err instanceof Error ? err.message : ''}`);
     }
+    setConfirmId(null);
+    await refresh();
   }
 
   return (
@@ -133,26 +163,38 @@ export default function BudgetsPage() {
                       <td className="bud-name">{c.name}</td>
                       <td className="bud-right">{c.monthlyCents === null ? 'No budget' : formatCents(c.monthlyCents)}</td>
                       <td>{c.rollover ? 'Yes' : 'No'}</td>
-                      <td className="bud-right"><div className="bud-row-actions">
-                        {confirmId === c.id ? (
-                          <>
-                            <span>Delete {c.name}?</span>
-                            <button type="button" className="btn btn-danger btn-sm" onClick={() => void remove(c)}>Delete</button>
-                            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setConfirmId(null)}>Keep</button>
-                          </>
-                        ) : (
-                          <>
-                            <button type="button" className="btn btn-secondary btn-sm" onClick={() => startEdit(c)} aria-label={`Edit ${c.name}`}>Edit</button>
-                            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setConfirmId(c.id)} aria-label={`Delete ${c.name}`}>Delete</button>
-                          </>
-                        )}
-                      </div></td>
+                      <td className="bud-right"><RetireActions c={c} confirming={confirmId === c.id}
+                        onAsk={() => setConfirmId(c.id)} onKeep={() => setConfirmId(null)} onConfirm={() => void retire(c)}
+                        onEdit={() => startEdit(c)} /></td>
                     </tr>
                   ))}
                 </tbody>
               </table></div>
             )}
           </section>
+
+          {archived.length > 0 && (
+            <section className="dash-card" aria-labelledby="bud-arch-h">
+              <h2 id="bud-arch-h" className="dash-card-title">Archived</h2>
+              <p className="bud-hint">Their transactions keep them and past months still show them. Nothing new can be added.</p>
+              <div className="bud-table-wrap"><table className="bud-table">
+                <thead>
+                  <tr><th scope="col">Category</th><th scope="col" className="bud-right">Transactions</th><th scope="col"><span className="bud-sr">Actions</span></th></tr>
+                </thead>
+                <tbody>
+                  {archived.map(c => (
+                    <tr key={c.id}>
+                      <td>{c.name}</td>
+                      <td className="bud-right">{c.transactionCount}</td>
+                      <td className="bud-right">{c.transactionCount === 0 && (
+                        <RetireActions c={c} confirming={confirmId === c.id} onAsk={() => setConfirmId(c.id)} onKeep={() => setConfirmId(null)} onConfirm={() => void retire(c)} />
+                      )}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table></div>
+            </section>
+          )}
         </>
       )}
     </BudgetShell>

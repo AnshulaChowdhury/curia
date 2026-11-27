@@ -16,6 +16,9 @@ export interface BudgetCategory {
   monthlyCents: number | null;
   rollover: boolean;
   sortOrder: number;
+  /** Archived: its transactions keep it, and nothing new can be put in it. */
+  archived: boolean;
+  transactionCount: number;
 }
 
 export interface BudgetTransaction {
@@ -48,6 +51,8 @@ export interface NewTransaction {
 export interface CategorySummary {
   categoryId: string;
   name: string;
+  /** Listed only in months where it has transactions. */
+  archived: boolean;
   budgetedCents: number | null;
   spentCents: number;
   /** budgeted - spent; null when no budget is set. Negative when over. */
@@ -61,6 +66,28 @@ export interface BudgetSummary {
   totals: { budgetedCents: number; spentCents: number; uncategorisedSpentCents: number };
   needsYou: { uncategorised: number; guesses: number; overBudget: number };
 }
+
+export interface PeriodCompare {
+  /** Money out in the period, in cents. */
+  currentCents: number;
+  /** The same period one step earlier; null when the stored history does not reach back that far. */
+  previousCents: number | null;
+}
+
+export interface BudgetTrend {
+  asOf: string;
+  /** The date of the oldest stored transaction, or null when there are none. */
+  firstDate: string | null;
+  /** Up to 24 months ending with asOf's month, starting no earlier than the first transaction. */
+  months: Array<{ month: string; outCents: number; inCents: number }>;
+  monthToDate: PeriodCompare;
+  lastMonth: PeriodCompare;
+  yearToDate: PeriodCompare;
+}
+
+const isoDay = (y: number, m0: number, d: number): string => new Date(Date.UTC(y, m0, d)).toISOString().slice(0, 10);
+/** The same day of the month in another month, held to that month's last day (31 March -> 28 February). */
+const clampedDay = (y: number, m0: number, d: number): string => isoDay(y, m0, Math.min(d, new Date(Date.UTC(y, m0 + 1, 0)).getUTCDate()));
 
 export interface TransactionFilter {
   month?: string;
@@ -107,13 +134,23 @@ export function stateFor(budgeted: number | null, spent: number): CategorySummar
   return budgeted > 0 && spent >= budgeted * NEAR_FRACTION ? 'near' : 'under';
 }
 
-interface CategoryRow { id: string; name: string; monthly_cents: number | null; rollover: boolean; sort_order: number }
+interface CategoryRow { id: string; name: string; monthly_cents: number | null; rollover: boolean; sort_order: number; archived_at?: Date | null; transactions?: string }
 interface TxnRow {
   id: string; account: string; txn_date: string; payee: string; description: string; amount_cents: number;
   category_id: string | null; source: CategorisedBy | null; rule_id: string | null; confidence: string | null;
 }
 
-const toCategory = (r: CategoryRow): BudgetCategory => ({ id: r.id, name: r.name, monthlyCents: r.monthly_cents, rollover: r.rollover, sortOrder: r.sort_order });
+const toCategory = (r: CategoryRow): BudgetCategory => ({
+  id: r.id, name: r.name, monthlyCents: r.monthly_cents, rollover: r.rollover, sortOrder: r.sort_order,
+  archived: r.archived_at != null, transactionCount: Number(r.transactions ?? 0),
+});
+/** Every column toCategory reads, for a RETURNING clause on budget_categories. */
+const CATEGORY_COLUMNS = `id, name, monthly_cents, rollover, sort_order, archived_at,
+  (SELECT count(*) FROM budget_transactions t WHERE t.category_id = budget_categories.id)::text AS transactions`;
+
+/** The database trigger refusing a new assignment to an archived category, as the caller's error. */
+const archivedConflict = (err: unknown): unknown =>
+  (err as { constraint?: string }).constraint === 'budget_category_archived' ? new BudgetError('That category is archived', 'conflict') : err;
 const toTxn = (r: TxnRow): BudgetTransaction => ({
   id: r.id, account: r.account, date: r.txn_date, payee: r.payee, description: r.description, amountCents: r.amount_cents,
   categoryId: r.category_id, source: r.source, ruleId: r.rule_id, confidence: r.confidence === null ? null : Number(r.confidence),
@@ -125,9 +162,11 @@ export class BudgetStore {
 
   // -- categories ------------------------------------------------------------------------------------------------
 
-  async listCategories(): Promise<BudgetCategory[]> {
+  /** The open categories; with `includeArchived`, the archived ones too, after them. */
+  async listCategories(options: { includeArchived?: boolean } = {}): Promise<BudgetCategory[]> {
     const { rows } = await this.pool.query<CategoryRow>(
-      `SELECT id, name, monthly_cents, rollover, sort_order FROM budget_categories WHERE archived_at IS NULL ORDER BY sort_order, lower(name)`,
+      `SELECT ${CATEGORY_COLUMNS} FROM budget_categories ${options.includeArchived ? '' : 'WHERE archived_at IS NULL'}
+       ORDER BY (archived_at IS NOT NULL), sort_order, lower(name)`,
     );
     return rows.map(toCategory);
   }
@@ -139,8 +178,8 @@ export class BudgetStore {
     try {
       const { rows } = await this.pool.query<CategoryRow>(
         `INSERT INTO budget_categories (name, monthly_cents, rollover, sort_order)
-         VALUES ($1, $2, $3, COALESCE((SELECT max(sort_order) + 1 FROM budget_categories WHERE archived_at IS NULL), 0))
-         RETURNING id, name, monthly_cents, rollover, sort_order`,
+         VALUES ($1, $2, $3, COALESCE((SELECT max(sort_order) + 1 FROM budget_categories), 0))
+         RETURNING ${CATEGORY_COLUMNS}`,
         [name, monthlyCents, input.rollover === true],
       );
       return toCategory(rows[0]!);
@@ -163,7 +202,7 @@ export class BudgetStore {
     try {
       const { rows } = await this.pool.query<CategoryRow>(
         `UPDATE budget_categories SET ${sets.join(', ')}, updated_at = now() WHERE id = $1 AND archived_at IS NULL
-         RETURNING id, name, monthly_cents, rollover, sort_order`,
+         RETURNING ${CATEGORY_COLUMNS}`,
         args,
       );
       if (!rows[0]) throw new BudgetError('No such category', 'not_found');
@@ -173,21 +212,32 @@ export class BudgetStore {
     }
   }
 
-  /** Archives the category; its transactions go back to uncategorised so nothing is silently left under a hidden name. */
+  /** Closes a category to new transactions. The ones it has stay, so past months still add up. */
+  async archiveCategory(id: string): Promise<BudgetCategory> {
+    const { rows } = await this.pool.query<CategoryRow>(
+      `UPDATE budget_categories SET archived_at = now(), updated_at = now() WHERE id = $1 AND archived_at IS NULL RETURNING ${CATEGORY_COLUMNS}`,
+      [id],
+    );
+    if (!rows[0]) throw new BudgetError('No such category', 'not_found');
+    return toCategory(rows[0]);
+  }
+
+  /** Removes a category that has no transactions. One that has any can only be archived. */
   async deleteCategory(id: string): Promise<void> {
-    const client = await this.pool.connect();
+    const used = new BudgetError('This category has transactions. Archive it instead.', 'conflict');
     try {
-      await client.query('BEGIN');
-      const done = await client.query(`UPDATE budget_categories SET archived_at = now() WHERE id = $1 AND archived_at IS NULL`, [id]);
-      if (done.rowCount === 0) throw new BudgetError('No such category', 'not_found');
-      await client.query(`UPDATE budget_transactions SET category_id = NULL, source = NULL, rule_id = NULL, confidence = NULL WHERE category_id = $1`, [id]);
-      await client.query('COMMIT');
+      const done = await this.pool.query(
+        `DELETE FROM budget_categories c WHERE c.id = $1 AND NOT EXISTS (SELECT 1 FROM budget_transactions t WHERE t.category_id = c.id)`,
+        [id],
+      );
+      if (done.rowCount) return;
     } catch (err) {
-      await client.query('ROLLBACK');
+      // A transaction landed in it between the check and the delete: the foreign key refuses.
+      if ((err as { code?: string }).code === '23503') throw used;
       throw err;
-    } finally {
-      client.release();
     }
+    const there = await this.pool.query('SELECT 1 FROM budget_categories WHERE id = $1', [id]);
+    throw there.rowCount ? used : new BudgetError('No such category', 'not_found');
   }
 
   private cents(v: unknown): number | null {
@@ -213,7 +263,7 @@ export class BudgetStore {
         [text(t.account, 60), t.date, text(t.payee, 200), text(t.description, 500), t.amountCents,
           t.categoryId ?? null, t.categoryId ? (t.source ?? 'you') : null, t.categoryId ? (t.ruleId ?? null) : null, t.categoryId ? (t.confidence ?? null) : null,
           fingerprint({ account: text(t.account, 60), date: t.date, payee: text(t.payee, 200), description: text(t.description, 500), amountCents: t.amountCents, externalId: t.externalId })],
-      );
+      ).catch((err: unknown) => { throw archivedConflict(err); });
       added += res.rowCount ?? 0;
     }
     return { added, duplicates: items.length - added };
@@ -249,7 +299,7 @@ export class BudgetStore {
       `UPDATE budget_transactions SET category_id = $2::uuid, source = CASE WHEN $2::uuid IS NULL THEN NULL ELSE 'you' END,
          rule_id = NULL, confidence = NULL WHERE id = ANY($1::uuid[])`,
       [ids, categoryId],
-    );
+    ).catch((err: unknown) => { throw archivedConflict(err); });
     if (res.rowCount === 0) throw new BudgetError('No such transaction', 'not_found');
     return res.rowCount ?? 0;
   }
@@ -258,12 +308,16 @@ export class BudgetStore {
 
   async summary(month: string): Promise<BudgetSummary> {
     const { start, end } = monthBounds(month);
-    const { rows } = await this.pool.query<{ id: string; name: string; monthly_cents: number | null; spent: string }>(
-      `SELECT c.id, c.name, c.monthly_cents,
+    // An archived category appears only in months where it has transactions, and keeps its budget only for months that
+    // were over before it was archived.
+    const { rows } = await this.pool.query<{ id: string; name: string; archived: boolean; monthly_cents: number | null; spent: string }>(
+      `SELECT c.id, c.name, c.archived_at IS NOT NULL AS archived,
+              CASE WHEN c.archived_at IS NULL OR c.archived_at >= $2::date THEN c.monthly_cents END AS monthly_cents,
               COALESCE(-SUM(t.amount_cents) FILTER (WHERE t.amount_cents < 0), 0)::text AS spent
        FROM budget_categories c
        LEFT JOIN budget_transactions t ON t.category_id = c.id AND t.txn_date >= $1 AND t.txn_date < $2
-       WHERE c.archived_at IS NULL GROUP BY c.id ORDER BY c.sort_order, lower(c.name)`,
+       GROUP BY c.id HAVING c.archived_at IS NULL OR count(t.id) > 0
+       ORDER BY (c.archived_at IS NOT NULL), c.sort_order, lower(c.name)`,
       [start, end],
     );
     const loose = await this.pool.query<{ uncategorised: string; spent: string; guesses: string }>(
@@ -276,7 +330,7 @@ export class BudgetStore {
     const categories: CategorySummary[] = rows.map(r => {
       const spentCents = Number(r.spent);
       return {
-        categoryId: r.id, name: r.name, budgetedCents: r.monthly_cents, spentCents,
+        categoryId: r.id, name: r.name, archived: r.archived, budgetedCents: r.monthly_cents, spentCents,
         remainingCents: r.monthly_cents === null ? null : r.monthly_cents - spentCents,
         state: stateFor(r.monthly_cents, spentCents),
       };
@@ -290,7 +344,44 @@ export class BudgetStore {
         spentCents: categories.reduce((n, c) => n + c.spentCents, 0) + Number(l.spent),
         uncategorisedSpentCents: Number(l.spent),
       },
-      needsYou: { uncategorised: Number(l.uncategorised), guesses: Number(l.guesses), overBudget: categories.filter(c => c.state === 'over').length },
+      needsYou: { uncategorised: Number(l.uncategorised), guesses: Number(l.guesses), overBudget: categories.filter(c => c.state === 'over' && !c.archived).length },
+    };
+  }
+
+  // -- money in and out over time ---------------------------------------------------------------------------------
+
+  /** Every stored transaction counts, whatever its category: money moved between the owner's accounts is included. */
+  async trend(asOf: string): Promise<BudgetTrend> {
+    const at = new Date(`${asOf}T00:00:00Z`);
+    if (!DAY.test(asOf) || Number.isNaN(at.getTime()) || at.toISOString().slice(0, 10) !== asOf) throw new BudgetError('asOf must be a YYYY-MM-DD date');
+    const [y, m0, d] = [at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()];
+    const first = (await this.pool.query<{ day: string | null }>(`SELECT to_char(min(txn_date), 'YYYY-MM-DD') AS day FROM budget_transactions`)).rows[0]!.day;
+    const { rows } = await this.pool.query<{ month: string; out: string; inn: string }>(
+      `SELECT to_char(txn_date, 'YYYY-MM') AS month,
+              COALESCE(-SUM(amount_cents) FILTER (WHERE amount_cents < 0), 0)::text AS out,
+              COALESCE(SUM(amount_cents) FILTER (WHERE amount_cents > 0), 0)::text AS inn
+       FROM budget_transactions WHERE txn_date >= $1 AND txn_date <= $2 GROUP BY 1`,
+      [isoDay(y, m0 - 23, 1), asOf],
+    );
+    const byMonth = new Map(rows.map(r => [r.month, r]));
+    const months: BudgetTrend['months'] = [];
+    for (let back = 23; back >= 0; back--) {
+      const month = isoDay(y, m0 - back, 1).slice(0, 7);
+      if (!first || month < first.slice(0, 7)) continue;
+      months.push({ month, outCents: Number(byMonth.get(month)?.out ?? 0), inCents: Number(byMonth.get(month)?.inn ?? 0) });
+    }
+    const spent = async (from: string, to: string): Promise<number> => Number((await this.pool.query<{ out: string }>(
+      `SELECT COALESCE(-SUM(amount_cents) FILTER (WHERE amount_cents < 0), 0)::text AS out FROM budget_transactions WHERE txn_date >= $1 AND txn_date <= $2`,
+      [from, to])).rows[0]!.out);
+    const compare = async (current: [string, string], previous: [string, string]): Promise<PeriodCompare> => ({
+      currentCents: await spent(...current),
+      previousCents: first !== null && first <= previous[0] ? await spent(...previous) : null,
+    });
+    return {
+      asOf, firstDate: first, months,
+      monthToDate: await compare([isoDay(y, m0, 1), asOf], [isoDay(y, m0 - 1, 1), clampedDay(y, m0 - 1, d)]),
+      lastMonth: await compare([isoDay(y, m0 - 1, 1), isoDay(y, m0, 0)], [isoDay(y, m0 - 2, 1), isoDay(y, m0 - 1, 0)]),
+      yearToDate: await compare([isoDay(y, 0, 1), asOf], [isoDay(y - 1, 0, 1), clampedDay(y - 1, m0, d)]),
     };
   }
 

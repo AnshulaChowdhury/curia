@@ -15,7 +15,7 @@ const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 export interface BudgetSummaryForAgent {
   month: string;
   currency: 'CAD';
-  categories: Array<{ name: string; budgeted: number | null; spent: number; remaining: number | null; state: 'no_budget' | 'under' | 'near' | 'over' }>;
+  categories: Array<{ name: string; archived?: true; budgeted: number | null; spent: number; remaining: number | null; state: 'no_budget' | 'under' | 'near' | 'over' }>;
   totals: { budgeted: number; spent: number; spentOnUncategorised: number };
   needsYou: { uncategorised: number; guesses: number; overBudget: number };
 }
@@ -42,6 +42,7 @@ export class BudgetReader {
       currency: 'CAD',
       categories: s.categories.map(c => ({
         name: c.name,
+        ...(c.archived ? { archived: true as const } : {}),
         budgeted: c.budgetedCents === null ? null : dollars(c.budgetedCents),
         spent: dollars(c.spentCents),
         remaining: c.remainingCents === null ? null : dollars(c.remainingCents),
@@ -62,7 +63,8 @@ export class BudgetReader {
     let categoryId: string | undefined;
     if (filter.category) {
       const wanted = filter.category.trim().toLowerCase();
-      categoryId = (await this.store.listCategories()).find(c => c.name.toLowerCase() === wanted)?.id;
+      // Open categories are listed first, so a reused name finds the open one.
+      categoryId = (await this.store.listCategories({ includeArchived: true })).find(c => c.name.toLowerCase() === wanted)?.id;
       if (!categoryId) return { transactions: [] };
     }
     return { transactions: await this.shape({ month: filter.month, categoryId, limit: this.clamp(filter.limit, 25) }) };
@@ -73,8 +75,8 @@ export class BudgetReader {
   }
 
   private async shape(filter: Parameters<Store['listTransactions']>[0]): Promise<BudgetTransactionForAgent[]> {
-    const [rows, categories] = await Promise.all([this.store.listTransactions(filter), this.store.listCategories()]);
-    const names = new Map(categories.map(c => [c.id, c.name]));
+    const [rows, categories] = await Promise.all([this.store.listTransactions(filter), this.store.listCategories({ includeArchived: true })]);
+    const names = new Map(categories.map(c => [c.id, c.archived ? `${c.name} (archived)` : c.name]));
     return rows.map((t: BudgetTransaction) => ({
       date: t.date, account: t.account, payee: t.payee, description: t.description, amount: dollars(t.amountCents),
       category: t.categoryId ? (names.get(t.categoryId) ?? null) : null, categorisedBy: t.source,
