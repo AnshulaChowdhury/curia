@@ -120,6 +120,9 @@ fetchTimeout: 90000
 #     that still ships a CommonJS build, which the CJS Nylas SDK requires; uuid@12+
 #     is ESM-only and would break `require('uuid')`.
 overrides:
+  # The spreadsheet converter (@zwight/luckyexcel) brings an old @univerjs/core that pins nanoid 5.1.5 exactly:
+  # CVE-2026-73086 (HIGH, <5.1.11), CVE-2026-67213 (<5.1.6) and CVE-2026-67214 (<5.1.16). Stays on 5.x.
+  '@univerjs/core>nanoid': '>=5.1.16 <6'
   # Raised off >=4.13.5, the follow-up 792fbabe deferred (Refs #1934): that floor admitted
   # 4.13.5-4.13.10, which carry two more MED advisories:
   #   - GHSA-5r4p-p66f-jhc7 (>=4.12.4 <4.13.11): serveStatic decodes the request path a
@@ -128,7 +131,9 @@ overrides:
   #   - GHSA-hxh3-vqpv-xpqv (<4.13.7): hono/jsx renders plain strings unescaped in
   #     boundary components (XSS)
   # 4.13.11, not 4.13.7: the serveStatic advisory runs four patches further up the line.
-  hono: '>=4.13.11'
+  # Raised off >=4.13.11: it admitted releases carrying later advisories. 4.13.22 is the
+  # newest release past minimumReleaseAge on 2026-11-27; 4.13.23 clears the rest once it is.
+  hono: '>=4.13.22'
   # fast-uri ships authority-parser advisories faster than any floor keeps up with, so
   # this pin is deliberately set at the newest published release rather than at the
   # minimum patched version. The prior >=4.1.2 floor was satisfied by 4.1.3, so ajv
@@ -163,7 +168,8 @@ overrides:
   # >=8.3.3 is the computed safe floor: anything lower still admits 8.3.0-8.3.2.
   # 8.3.4 is also clean but younger than minimumReleaseAge, so this install resolves
   # 8.3.3; resolution moves up on its own once the quarantine passes.
-  vite: '>=8.3.3'
+  # Raised off >=8.3.3: 8.3.3-8.3.6 carry GHSA-p4f5-76q4-ffq7 (CRITICAL, upstream only).
+  vite: '>=8.3.7'
   # Pulled in by googleapis-common and express (MCP SDK). 6.16.2 is the first release clear of every known
   # advisory; the newest, GHSA-w4cr-vjpx-p82q (LOW, <6.16.2), is published upstream only.
   qs: '>=6.16.2'
@@ -182,7 +188,7 @@ overrides:
   ip-address: '>=10.7.4'
   uuid: '^11.1.1'
   # Security pins for v0.35 release gate (HIGH CVEs flagged by Trivy image scan):
-  ws: '>=8.21.0'         # CVE-2026-48779
+  ws: '>=8.23.0'         # CVE-2026-48779; GHSA-37g9-w4hg-h9qr (HIGH, <8.23.0)
   form-data: '>=4.0.6'   # CVE-2026-12143
   esbuild: '>=0.28.1'    # GHSA-gv7w-rqvm-qjhr (dev-server SSRF)
   # Reached via promptfoo. The old >=7.28.0 floor did NOT "patch all": it admitted the
@@ -203,7 +209,9 @@ overrides:
   #   - GHSA-xjj6-f33q-929c (HIGH): DoS via unhandled error on excessive content-encodings
   #   - GHSA-4qv8-2p9j-2685, GHSA-55wc-3pg8-jfw6, GHSA-9fm3-97px-rjf6,
   #     GHSA-f72v-6w45-q472 (MED): EventSource, decompress, PONG-buffer DoS; SRI bypass
-  undici: '>=8.12.2'
+  # Raised off >=8.12.2: 8.12.2-8.12.3 carry GHSA-mqg3-3v4r-cm32 (HIGH) and five MED,
+  # all published upstream only.
+  undici: '>=8.12.4'
   # Scorecard vulnerability pins (GHSA alerts flagged in code-scanning #155):
   '@opentelemetry/core': '>=2.8.0'          # GHSA-8988-4f7v-96qf (unbounded baggage header memory allocation)
   # Targeted to onnxruntime-web only, so the 7.x line is what this constrains. >=7.6.3
@@ -221,7 +229,7 @@ overrides:
   # optional: promptfoo, directly and via @huggingface/transformers).
   # allowBuilds stays false (prebuilt binary).
   sharp: '>=0.35.5'
-  find-my-way: '>=9.7.0'                    # GHSA-c96f-x56v-gq3h (HTTP/2 DoS)
+  find-my-way: '>=9.10.1'                   # GHSA-c96f-x56v-gq3h (HTTP/2 DoS); GHSA-fcj7-c534-vj7f (<9.10.1)
   # Raised off >=1.9.0, which sat INSIDE the vulnerable range of GHSA-pqg4-j6r4-53mv
   # (HIGH, >=1.8.4 <1.11.0): quote() command injection via a line terminator in a token
   # after a `{ comment }` token. Not a backstop: resolution was 1.10.0, inside that
@@ -233,7 +241,8 @@ overrides:
   # GHSA-rmxm-3fg6-px4f (MED, >=1.19.10 <2.1.3) — the same serveStatic double-decode
   # middleware bypass as hono's GHSA-5r4p-p66f-jhc7, and likewise not in GitHub's global
   # advisory DB.
-  '@hono/node-server': '>=2.1.3'
+  # Raised off >=2.1.3: 2.1.3-2.1.10 carry six MED advisories, among them GHSA-jpvv-r467-5p4w.
+  '@hono/node-server': '>=2.1.11'
   # GHSA-724g-mxrg-4qvm (!!omap) + GHSA-pm4m-ph32-ghv5 (nested flow DoS); targeted —
   # js-yaml@4.x via @apidevtools/json-schema-ref-parser stays on 4.x. Raised off >=5.2.2
   # (#1934): that floor admitted 5.2.2-5.4.0, which carry GHSA-r3ph-w7gj-g6xm (MED,
@@ -245,7 +254,8 @@ overrides:
   # GHSA-6j4f-fj2g-mc7p (HIGH, <5.0.10), GHSA-qhr7-859c-m2p7 (HIGH, <5.0.11) and
   # GHSA-q2hr-2g5m-vwhr (MED, <5.0.12). Resolution already sits at 5.0.12, so the
   # lockfile does not move.
-  brace-expansion: '>=5.0.12'
+  # Raised off >=5.0.12, which carries GHSA-6jwq-xf8q-xcwh (HIGH, upstream only).
+  brace-expansion: '>=5.0.13'
   # Drop the only brace-expansion@2.x path (promptfoo→gaxios→rimraf@5→glob@10→minimatch@9).
   # rimraf@6 uses glob@11+/minimatch@10 which consume brace-expansion@5; gaxios only needs
   # rimraf for temp cleanup and the v6 API is compatible for that call site.
@@ -279,7 +289,8 @@ overrides:
   # pins ^5.3.1, so only an override moves it across the major. 6.0's one breaking change
   # refuses separate FTP transfer hosts by default (bounce-attack hardening); get-uri
   # calls only access/list/lastMod/downloadTo/close, which are unchanged.
-  'get-uri>basic-ftp': '>=6.2.4'
+  # Raised off >=6.2.4, which carries GHSA-2w5v-vj22-jp27 (MED, upstream only).
+  'get-uri>basic-ftp': '>=6.2.5'
   # HIGH CVE from Trivy, 2026-10-24 (code-scanning #321, #323):
   # GHSA-mrhx-c7xc-m3w5 / CVE-2023-54404 (HIGH, <4.6.6): memory-exhaustion DoS when an
   # unbounded z.array()/set/map schema validates a large failing input. Unpinned, the

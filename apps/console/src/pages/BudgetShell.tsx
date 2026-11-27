@@ -39,6 +39,8 @@ export function BudgetShell({ active, children, wide = false }: { active: string
                 {t.label}
               </Link>
             ))}
+            {/* A plain link on purpose: the sheet page has its own policy, which only applies to a full page load. */}
+            <a className="bud-tab" href="/budget/sheet-frame">Spreadsheets</a>
           </nav>
           <div className="bud-scroll">
             <div className={`bud-body${wide ? ' bud-body-wide' : ''}`}>

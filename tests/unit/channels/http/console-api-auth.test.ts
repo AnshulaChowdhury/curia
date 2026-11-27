@@ -8,6 +8,7 @@ import { bypassesBearerAuth } from '../../../../src/channels/http/auth.js';
 import { budgetRoutes } from '../../../../src/channels/http/routes/budget.js';
 import { budgetBanksRoutes } from '../../../../src/channels/http/routes/budget-banks.js';
 import { budgetAccountsRoutes } from '../../../../src/channels/http/routes/budget-accounts.js';
+import { budgetSheetsRoutes } from '../../../../src/channels/http/routes/budget-sheets.js';
 import type { Logger } from '../../../../src/logger.js';
 import type { SessionStore } from '../../../../src/channels/http/session-auth.js';
 
@@ -36,9 +37,10 @@ describe('console API authentication', () => {
     await app.register(budgetRoutes, { ...shared, store: {} as never });
     await app.register(budgetBanksRoutes, { ...shared, sync: {} as never, plaid: {} as never });
     await app.register(budgetAccountsRoutes, { ...shared, accounts: {} as never });
+    await app.register(budgetSheetsRoutes, { ...shared, sheets: {} as never });
     await app.ready();
 
-    expect(routes.length).toBeGreaterThanOrEqual(21);
+    expect(routes.length).toBeGreaterThanOrEqual(26);
     for (const { method, url } of routes) {
       expect(bypassesBearerAuth(url), url).toBe(true);
       const res = await app.inject({

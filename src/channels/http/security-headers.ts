@@ -80,6 +80,55 @@ export const PLAID_LINK_CONTENT_SECURITY_POLICY = [
   "frame-ancestors 'none'",
 ].join('; ');
 
+/**
+ * The stylesheets Univer (the spreadsheet grid) adds to the page as it starts, allowed by their exact content. They are
+ * fixed strings in @univerjs 1.5.2; upgrading Univer changes them (a test pins the version to these).
+ */
+export const UNIVER_STYLE_HASHES = [
+  "'sha256-StEaX+se6YS7pqjzrzMIA0KaX9zF/8zAhvQXZAe5epY='",
+  "'sha256-ioO0ZNGs1LU5pqEAS0n5sHeg5xpjO/oL7vzfturr0r8='",
+  "'sha256-h0U+/knzOJuIcvR0/TuOqrf5AqNY1z+bD2FeM2fUt+I='",
+] as const;
+
+/**
+ * CSP for the spreadsheet page (`/budget/sheet-frame` only). Owner-approved loosening, kept to this document: Univer's
+ * three stylesheets by hash, images embedded as data:, and framing (Curia's own pages may frame it; it frames the file
+ * converter). Scripts stay same-origin only: no inline script, no eval.
+ */
+export const SHEET_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' https://fonts.googleapis.com",
+  `style-src-elem 'self' https://fonts.googleapis.com ${UNIVER_STYLE_HASHES.join(' ')}`,
+  "style-src-attr 'unsafe-inline'",
+  "font-src https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "frame-src 'self'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'self'",
+].join('; ');
+
+/**
+ * CSP for the file converter, a third-party library run in a locked-down frame: sandboxed to an opaque origin (no
+ * cookies, no reach into the page that framed it), with no network at all. It can only load its own scripts and answer
+ * the page that asked.
+ */
+export const CONVERTER_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "connect-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'self'",
+  'sandbox allow-scripts',
+].join('; ');
+
+const pathOf = (url: string): string => url.split('?', 1)[0]!.replace(/\/$/, '');
+const isSheetRequest = (url: string): boolean => pathOf(url) === '/budget/sheet-frame';
+const isConverterRequest = (url: string): boolean => pathOf(url) === '/budget/convert-frame' || pathOf(url) === '/convert-frame.html';
+
 function isHtmlResponse(reply: { getHeader(name: string): unknown }): boolean {
   const raw = reply.getHeader('content-type');
   const value = Array.isArray(raw) ? raw[0] : raw;
@@ -133,14 +182,23 @@ function isPlaidLinkRequest(url: string): boolean {
 export function registerSecurityHeaders(app: FastifyInstance): void {
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('X-Content-Type-Options', 'nosniff');
+    // The converter frame has an opaque origin, so the browser asks for permission even to load Curia's own public
+    // scripts. The built assets hold no data; no credentials are allowed with them.
+    if (pathOf(request.url).startsWith('/assets/') && request.headers.origin === 'null') {
+      reply.header('Access-Control-Allow-Origin', '*');
+      reply.removeHeader('Access-Control-Allow-Credentials');
+    }
     if (isHtmlResponse(reply)) {
-      const csp = isAntfarmRequest(request.url)
+      const framed = isSheetRequest(request.url) ? SHEET_CONTENT_SECURITY_POLICY
+        : isConverterRequest(request.url) ? CONVERTER_CONTENT_SECURITY_POLICY : null;
+      const csp = framed ?? (isAntfarmRequest(request.url)
         ? ANTFARM_CONTENT_SECURITY_POLICY
         : isPlaidLinkRequest(request.url)
           ? PLAID_LINK_CONTENT_SECURITY_POLICY
-          : CONSOLE_CONTENT_SECURITY_POLICY;
+          : CONSOLE_CONTENT_SECURITY_POLICY);
       reply.header('Content-Security-Policy', csp);
-      reply.header('X-Frame-Options', 'DENY');
+      // Only the two spreadsheet pages may be framed, and only by Curia itself.
+      reply.header('X-Frame-Options', framed ? 'SAMEORIGIN' : 'DENY');
     }
     return payload;
   });

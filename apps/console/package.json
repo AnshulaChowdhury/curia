@@ -21,9 +21,13 @@
     "vite": "^8.3.4"
   },
   "dependencies": {
+    "@univerjs/preset-sheets-core": "1.5.2",
+    "@univerjs/presets": "1.5.2",
     "@xyflow/react": "^12.12.0",
+    "@zwight/luckyexcel": "1.1.6",
     "cronstrue": "^3.32.0",
     "d3-force": "^3.0.0",
-    "livekit-client": "^2.23.0"
+    "livekit-client": "^2.23.0",
+    "rxjs": "^7.8.2"
   }
 }

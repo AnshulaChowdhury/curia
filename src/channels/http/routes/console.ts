@@ -55,6 +55,9 @@ export const consoleRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
+    // The spreadsheet file converter has its own small page, served with a locked-down policy (security-headers.ts).
+    if (urlPath === 'budget/convert-frame') return reply.sendFile('convert-frame.html', consoleDist);
+
     // Serve index.html for root and all client-side routes.
     return reply.sendFile('index.html', consoleDist);
   });
