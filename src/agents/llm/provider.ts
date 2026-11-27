@@ -247,6 +247,8 @@ export interface LLMProvider {
     toolResults?: ToolResult[];
     model?: string;
     options?: Record<string, unknown>;
+    /** Require the model to call this tool. Best effort: a provider or request that cannot require one ignores it. */
+    toolChoice?: string;
   }): Promise<LLMResponse>;
 
   /**

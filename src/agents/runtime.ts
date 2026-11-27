@@ -108,6 +108,7 @@ import {
   seedAlreadyDelivered,
   type DelegationFailureInfo,
 } from './delegation-guard.js';
+import { claimsUnbackedWork, UNBACKED_CLAIM_CORRECTION, UNBACKED_CLAIM_REPLY } from './unbacked-claim.js';
 import {
   delegationOriginAgentId,
   delegationOriginConversationId,
@@ -904,6 +905,9 @@ export class AgentRuntime {
     // Accumulate skill names across all tool-use turns so we can report them
     // on the agent.response event for audit and monitoring.
     const skillsCalled: string[] = [];
+    // Turns whose reply is checked against what actually ran: those that can ask for budget changes (ADR-068).
+    const checksClaims = turnGuidanceKeys.includes('budget-sheet-attached')
+      && (workingToolDefs?.some(t => t.name === 'delegate') ?? false);
     // Successful calls that sent a message or calendar notification (#2055).
     const sends: string[] = [];
     // Skills that returned success:false — surfaced to the scheduler as
@@ -1783,6 +1787,10 @@ export class AgentRuntime {
         return framed;
       };
 
+      // A reply saying work was delegated or done, when the specialist was never called, is not sent (ADR-068).
+      let claimCorrected = false;
+      let requiredTool: string | undefined;
+
       // Text turns are intentionally non-cancellable today (same as pre-#1563):
       // chatWithRetry does not take an AbortSignal, and openStream ignores
       // params.signal. The controller is kept reachable as a required-arg
@@ -1803,9 +1811,11 @@ export class AgentRuntime {
         openStream: async function* (this: AgentRuntime, params: StreamingTurnOpenStreamParams) {
           // NOTE: beforeRound already mutated working messages; params.messages is a
           // snapshot taken AFTER beforeRound — use params for chatWithRetry.
+          const toolChoice = requiredTool;
+          requiredTool = undefined; // for one round only
           const chatResponse = await this.chatWithRetry(
             provider,
-            { messages: params.messages, tools: workingToolDefs },
+            { messages: params.messages, tools: workingToolDefs, ...(toolChoice ? { toolChoice } : {}) },
             budget,
             taskEvent,
             budgetHandoff,
@@ -1848,8 +1858,17 @@ export class AgentRuntime {
             const drained = await drainInjected(drainPoint);
             for (const message of drained) workingMessages.push(message);
           },
-          ...(laned && lanes ? {
-            beforeFinish: async (): Promise<{ action: 'finish' } | { action: 'continue'; append: Message[] }> => {
+          ...(checksClaims || (laned && lanes) ? {
+            beforeFinish: async ({ finalText }): Promise<{ action: 'finish' } | { action: 'continue'; append: Message[] }> => {
+              if (checksClaims && !claimCorrected && !skillsCalled.includes('delegate') && claimsUnbackedWork(finalText)
+                && budget.turnsUsed + 1 < budget.maxTurns) {
+                claimCorrected = true;
+                requiredTool = 'delegate';
+                budget.turnsUsed += 1;
+                logger.warn({ agentId, conversationId }, 'Reply claimed work no tool did — held back and asking for the delegation');
+                return { action: 'continue', append: [{ role: 'user', content: UNBACKED_CLAIM_CORRECTION }] };
+              }
+              if (!(laned && lanes)) return { action: 'finish' };
               if (lanes.closeIfIdle(taskEvent.id)) return { action: 'finish' };
               // The budget was already spent. Leave the follow-up queued.
               // publishAgentResponse releases after the assistant row is stored,
@@ -2991,6 +3010,12 @@ export class AgentRuntime {
       }
     }
 
+    // The last check, whether or not the correction above had room to run: an unbacked claim never reaches the owner.
+    if (checksClaims && !isResponseError && !skillsCalled.includes('delegate') && claimsUnbackedWork(responseContent)) {
+      logger.error({ agentId, conversationId }, 'Reply still claimed work no tool did — replaced with the truth');
+      responseContent = UNBACKED_CLAIM_REPLY;
+    }
+
     // Lift NO_REPLY out of content before persist/publish so scheduler summaries
     // and working-memory turns do not store a control token (#1732).
     const prepared = isResponseError
@@ -3449,7 +3474,7 @@ export class AgentRuntime {
    */
   private async chatWithRetry(
     provider: LLMProvider,
-    params: { messages: Message[]; tools?: ToolDefinition[] },
+    params: { messages: Message[]; tools?: ToolDefinition[]; toolChoice?: string },
     budget: ErrorBudget,
     taskEvent: AgentTaskEvent,
     budgetHandoff?: {
