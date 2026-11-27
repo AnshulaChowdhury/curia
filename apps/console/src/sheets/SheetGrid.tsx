@@ -25,7 +25,9 @@ export default function SheetGrid({ sheet, onState }: { sheet: Sheet; onState: (
       locales: { [LocaleType.EN_US]: mergeLocales(enUS) },
       presets: [UniverSheetsCorePreset({ container: host })],
     });
-    univerAPI.createWorkbook(sheet.workbook as Parameters<typeof univerAPI.createWorkbook>[0]);
+    // The library takes a workbook that names no language to be Chinese (month names came out as "11月"), and stored
+    // workbooks name none.
+    univerAPI.createWorkbook({ ...sheet.workbook, locale: LocaleType.EN_US } as Parameters<typeof univerAPI.createWorkbook>[0]);
     const autosave = createAutosave({
       read: () => univerAPI.getActiveWorkbook()?.save() ?? null,
       save: (version, workbook) => sheetClient.save(sheet.id, version, workbook),
