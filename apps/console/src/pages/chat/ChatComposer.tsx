@@ -1,13 +1,15 @@
 // apps/console/src/pages/chat/ChatComposer.tsx
-import { useState, useRef } from 'react';
+import { useState, useRef, type ReactNode } from 'react';
 import { IconSend } from '../../components/Icons.js';
 
 interface ChatComposerProps {
   disabled: boolean;
   onSend: (text: string) => void;
+  /** The attach control, shown before the message box. */
+  attach?: ReactNode;
 }
 
-export function ChatComposer({ disabled, onSend }: ChatComposerProps) {
+export function ChatComposer({ disabled, onSend, attach }: ChatComposerProps) {
   const [value, setValue] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -49,6 +51,7 @@ export function ChatComposer({ disabled, onSend }: ChatComposerProps) {
       className="chat-composer"
       onSubmit={handleSubmit}
     >
+      {attach}
       <textarea
         ref={textareaRef}
         value={value}

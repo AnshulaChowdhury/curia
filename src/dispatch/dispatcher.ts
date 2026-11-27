@@ -205,6 +205,8 @@ export interface DispatcherConfig {
    * (prompt trim PR 7). Absent: no line.
    */
   principalBacklog?: PrincipalBacklogSource;
+  /** Whether a budget spreadsheet is attached to this web conversation (ADR-065). */
+  attachedBudgetSheet?: (conversationId: string) => Promise<boolean>;
   /**
    * Delegated sign-in verification (#2017). On a live principal turn, codes the principal
    * relays in their own words are tracked while an sms/app verification is open; every
@@ -397,6 +399,7 @@ export class Dispatcher {
   private principalIdentities?: readonly ChannelIdentity[];
   private principalAcquaintance?: PrincipalAcquaintanceConfig;
   private principalBacklog?: PrincipalBacklogSource;
+  private attachedBudgetSheet?: (conversationId: string) => Promise<boolean>;
   private verification?: VerificationRuntime;
   private turnLanes?: TurnLanes;
   private outreachMatcher?: Pick<OutreachMatcher, 'match'>;
@@ -425,6 +428,7 @@ export class Dispatcher {
     this.principalIdentities = config.principalIdentities;
     this.principalAcquaintance = config.principalAcquaintance;
     this.principalBacklog = config.principalBacklog;
+    this.attachedBudgetSheet = config.attachedBudgetSheet;
     this.verification = config.verification;
     this.turnLanes = config.turnLanes;
     this.outreachMatcher = config.outreachMatcher;
@@ -1291,6 +1295,17 @@ export class Dispatcher {
       ...(linkedTask ? { linkedTask } : {}),
     };
 
+    // Whether this web chat has a spreadsheet attached (ADR-065). Asked only on the principal's own web turns, and
+    // best-effort: without it the turn still runs, just without the note.
+    let budgetSheetAttached = false;
+    if (this.attachedBudgetSheet && liveTurn && payload.channelId === 'web') {
+      try {
+        budgetSheetAttached = await this.attachedBudgetSheet(payload.conversationId);
+      } catch (err) {
+        this.logger.error({ err, conversationId: payload.conversationId }, 'Failed to look up the attached budget sheet — proceeding without the note');
+      }
+    }
+
     // Trigger guidance (#1959): the coordinator's conditional rules travel with the
     // trigger instead of sitting in its always-on prompt. Rendered by the runtime into
     // this turn's user message only, never into `content` (which working memory keeps).
@@ -1310,6 +1325,7 @@ export class Dispatcher {
       principalAcquaintance: acquaintanceEvidence,
       // The principal's own words only: text above any quote or forward marker.
       makeRoom: looksLikeMakeRoom(spotCheckText),
+      budgetSheetAttached,
     });
 
     // The backlog line (prompt trim PR 7): on a principal turn with anything waiting on

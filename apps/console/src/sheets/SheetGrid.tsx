@@ -33,12 +33,15 @@ export default function SheetGrid({ sheet, onState }: { sheet: Sheet; onState: (
       onState: (state, message) => report.current(state, message),
     });
     const timer = window.setInterval(() => void autosave.tick(), SAVE_EVERY_MS);
-    // Leaving the page: one last try, so the final edit is not lost.
+    // Leaving the page, or (beside the chat) moving to the message box: save at once, so the assistant reads the
+    // latest and the final edit is not lost.
     const flush = () => void autosave.tick();
     window.addEventListener('pagehide', flush);
+    window.addEventListener('blur', flush);
     return () => {
       window.clearInterval(timer);
       window.removeEventListener('pagehide', flush);
+      window.removeEventListener('blur', flush);
       autosave.stop();
       // Disposed after this render pass: Univer unmounts its own React tree, which React refuses mid-render.
       window.setTimeout(() => { univer.dispose(); host.remove(); }, 0);

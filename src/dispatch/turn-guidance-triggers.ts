@@ -59,6 +59,11 @@ export interface InboundGuidanceFacts {
    * (looksLikeMakeRoom). Only honoured on a live principal turn. Absent means no.
    */
   makeRoom?: boolean;
+  /**
+   * A budget spreadsheet is attached to this chat (ADR-065). Only honoured on a live principal
+   * turn in the web chat, the one place a sheet can be attached. Absent means no.
+   */
+  budgetSheetAttached?: boolean;
 }
 
 // "Make room" language (#2227): the principal offering to move their own commitments. Plain
@@ -279,6 +284,7 @@ export function inboundTurnGuidance(facts: InboundGuidanceFacts): TurnGuidanceKe
   if (principalForward) keys.push('principal-forward');
   if (facts.bookingLink === true) keys.push('booking-link');
   if (facts.liveTurn && facts.makeRoom === true) keys.push('make-room');
+  if (facts.liveTurn && facts.channelId === 'web' && facts.budgetSheetAttached === true) keys.push('budget-sheet-attached');
   if (facts.liveTurn && entries.length > 0) {
     keys.push('outbound-context');
     if (entries.some((m) => isTaskWakeReplyBinding(m))) keys.push('outbound-context-task-wake');

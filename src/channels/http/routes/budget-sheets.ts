@@ -1,12 +1,15 @@
 // budget-sheets.ts — the budget spreadsheets, owner only.
 //
 //   GET    /api/budget/sheets       — the stored sheets (no cell data)
-//   POST   /api/budget/sheets       — { name, workbook }: store a new one
+//   POST   /api/budget/sheets       — { name, workbook, conversationId? }: store a new one, attached to that chat
+//   GET    /api/budget/sheets/attached?conversationId=  — the sheet attached to a chat (no cell data), or null
+//   DELETE /api/budget/sheets/attached?conversationId=  — detach it; the sheet is kept
 //   GET    /api/budget/sheets/:id   — one sheet with its workbook
 //   PUT    /api/budget/sheets/:id   — { version, workbook }: save over the version loaded (409 if it moved on)
 //   DELETE /api/budget/sheets/:id   — remove it
 //
-// Every workbook is cleaned before it is stored (see budget/sheet-snapshot.ts). Nothing here is reachable by an agent.
+// Every workbook is cleaned before it is stored (see budget/sheet-snapshot.ts). No agent can call these routes; the
+// budget specialist reads only the sheet attached to the chat it was asked from (budget/sheet-reader.ts).
 
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import type { Logger } from '../../../logger.js';
@@ -17,7 +20,7 @@ import { isUuid } from '../../../util/uuid.js';
 
 export interface BudgetSheetsRouteOptions {
   logger: Logger;
-  sheets: Pick<SheetStore, 'list' | 'create' | 'get' | 'save' | 'remove'>;
+  sheets: Pick<SheetStore, 'list' | 'create' | 'get' | 'save' | 'remove' | 'attachedInfo' | 'detach'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -55,6 +58,23 @@ export async function budgetSheetsRoutes(app: FastifyInstance, options: BudgetSh
   app.post<{ Body: Body }>('/api/budget/sheets', { ...WRITE, ...early }, async (request, reply) => {
     try {
       return noStore(reply).status(201).send({ sheet: await sheets.create(request.body ?? {}) });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.get<{ Querystring: { conversationId?: string } }>('/api/budget/sheets/attached', { ...READ, ...early }, async (request, reply) => {
+    try {
+      return noStore(reply).send({ sheet: await sheets.attachedInfo(request.query.conversationId) });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.delete<{ Querystring: { conversationId?: string } }>('/api/budget/sheets/attached', { ...READ, ...early }, async (request, reply) => {
+    try {
+      await sheets.detach(request.query.conversationId);
+      return noStore(reply).send({ ok: true });
     } catch (err) {
       return fail(reply, err);
     }

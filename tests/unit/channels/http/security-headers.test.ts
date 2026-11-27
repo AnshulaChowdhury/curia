@@ -12,6 +12,7 @@ import {
   PLAID_LINK_CONTENT_SECURITY_POLICY,
   SHEET_CONTENT_SECURITY_POLICY,
   CONVERTER_CONTENT_SECURITY_POLICY,
+  CHAT_CONTENT_SECURITY_POLICY,
   UNIVER_STYLE_HASHES,
 } from '../../../../src/channels/http/security-headers.js';
 import { readFileSync } from 'node:fs';
@@ -37,6 +38,9 @@ async function build(): Promise<FastifyInstance> {
   registerSecurityHeaders(instance);
   for (const url of ['/budget/sheet-frame', '/budget/sheet-frame-evil', '/budget/sheet-frame/x', '/budget/convert-frame', '/convert-frame.html']) {
     instance.get(url, async (_req, reply) => reply.type('text/html; charset=utf-8').send('<!doctype html><html><body>s</body></html>'));
+  }
+  for (const url of ['/chat', '/chat/', '/chat-evil', '/chat/x']) {
+    instance.get(url, async (_req, reply) => reply.type('text/html; charset=utf-8').send('<!doctype html><html><body>c</body></html>'));
   }
   instance.get('/assets/a.js', async (_req, reply) => reply.type('text/javascript').send('1'));
   // The budget pages: only /budget/connect-bank may load Plaid Link.
@@ -259,6 +263,18 @@ describe('spreadsheet pages', () => {
       expect(h['content-security-policy'], url).toBe(CONSOLE_CONTENT_SECURITY_POLICY);
       expect(h['x-frame-options']).toBe('DENY');
     }
+  });
+
+  it('lets only the exact chat page frame Curia\'s own pages, and loosens nothing else there', async () => {
+    for (const url of ['/chat', '/chat/', '/chat?attach=1']) {
+      const h = await headersFor(url);
+      expect(h['content-security-policy'], url).toBe(CHAT_CONTENT_SECURITY_POLICY);
+      expect(h['x-frame-options']).toBe('DENY');
+    }
+    for (const url of ['/chat-evil', '/chat/x']) {
+      expect((await headersFor(url))['content-security-policy'], url).toBe(CONSOLE_CONTENT_SECURITY_POLICY);
+    }
+    expect(CHAT_CONTENT_SECURITY_POLICY.split('; ')).toEqual([...CONSOLE_CONTENT_SECURITY_POLICY.split('; '), "frame-src 'self'"]);
   });
 
   it('allows the grid three exact stylesheets and inline images, never inline or evaluated script', () => {

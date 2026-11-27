@@ -270,6 +270,8 @@ import { BooksToken } from './quickbooks/books-token.js';
 import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.js';
 import { BooksReader } from './books/books-reader.js';
 import { BudgetReader } from './budget/budget-reader.js';
+import { BudgetSheetReader } from './budget/sheet-reader.js';
+import { SheetStore, isConversationId } from './budget/sheet-store.js';
 import { BudgetStore } from './budget/budget-store.js';
 import { AccountStore } from './budget/accounts-store.js';
 import { BooksRunner } from './books/books-runner.js';
@@ -1697,6 +1699,17 @@ async function main(): Promise<void> {
   // The budget specialist's read-only view of the owner's personal budget (ADR-062).
   const budgetReader = new BudgetReader(new BudgetStore(pool));
 
+  // Layer 1 inbound injection scanner — extra patterns come from the already-merged
+  // config (default.yaml + local.yaml, see loadYamlConfig()) so operator overrides in
+  // local.yaml actually take effect (#1397). A broken custom pattern warns and the
+  // built-in defaults still protect. createInboundScanner keeps that try around the
+  // parse only.
+  const injectionScanner = createInboundScanner(yamlConfig, logger);
+
+  // The spreadsheet the owner attached to a chat: the specialist reads it (ADR-065), the dispatcher notes that it is there.
+  const budgetSheets = new SheetStore(pool);
+  const budgetSheetReader = new BudgetSheetReader(budgetSheets, injectionScanner);
+
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
   // #2322: parked agendas and the post-call pipeline share this store.
@@ -2669,7 +2682,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, budgetReader, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, budgetReader, budgetSheetReader, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>
@@ -3124,13 +3137,6 @@ async function main(): Promise<void> {
     'PII scrubber active',
   );
 
-  // Layer 1 inbound injection scanner — extra patterns come from the already-merged
-  // config (default.yaml + local.yaml, see loadYamlConfig()) so operator overrides in
-  // local.yaml actually take effect (#1397). A broken custom pattern warns and the
-  // built-in defaults still protect. createInboundScanner keeps that try around the
-  // parse only.
-  const injectionScanner = createInboundScanner(yamlConfig, logger);
-
   // Parse trust scorer weights from config (security.trust_score section in default.yaml).
   // Falls back to DEFAULT_TRUST_WEIGHTS (0.4/0.4/0.2) if the section is absent.
   const trustScoreConfig = yamlConfig.security?.trust_score;
@@ -3200,6 +3206,7 @@ async function main(): Promise<void> {
         }
       : undefined,
     principalBacklog: createPrincipalBacklogSource(pool, actionLogRepo),
+    attachedBudgetSheet: async conversationId => isConversationId(conversationId) && (await budgetSheets.attachedInfo(conversationId)) !== null,
     verification: verificationRuntime,
     turnLanes,
     // A non-principal email that replies to Curia's outreach arrives linked to its task

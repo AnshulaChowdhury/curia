@@ -10,7 +10,7 @@ Personal finance is separate from the MowMow business books (the Books page). Ow
 |---|---|---|
 | `/budget` | Overview: net worth, spending history, category split, action items, budget status, assets and liabilities (bank balances plus hand entries; owner-only, no agent can read them), adding transactions | built |
 | `/budget/budgets` | Budgets: reconcile a month (assign categories, confirm guesses); add and edit; delete an empty category, archive a used one (it keeps its transactions) | built |
-| `/budget/sheet-frame` | Spreadsheets: open an .xlsx or .csv and edit it in a Univer grid. Its own page and security policy; kept 14 days after the last change | built |
+| `/budget/sheet-frame` | Spreadsheets: open an .xlsx or .csv and edit it in a Univer grid. Its own page and security policy; kept 14 days after the last change. A file attached in Chat opens beside the conversation, where the budget agent can read it (ADR-065) | built |
 | `/budget/net-worth` | Redirects to Overview | built |
 | `/budget/transactions` | Transactions | next PR |
 | `/budget/import` | Redirects to Overview, which holds file upload and bank connections | built |

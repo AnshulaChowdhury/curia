@@ -25,7 +25,12 @@ export function createSheetClient(f: Fetcher = apiFetch) {
   const one = (id: string) => `/api/budget/sheets/${encodeURIComponent(id)}`;
   return {
     list: async () => (await call<{ sheets: SheetInfo[] }>('/api/budget/sheets')).sheets,
-    create: async (name: string, workbook: unknown) => (await call<{ sheet: Sheet }>('/api/budget/sheets', 'POST', { name, workbook })).sheet,
+    create: async (name: string, workbook: unknown, conversationId?: string) =>
+      (await call<{ sheet: Sheet }>('/api/budget/sheets', 'POST', { name, workbook, ...(conversationId ? { conversationId } : {}) })).sheet,
+    /** The sheet attached to a chat, without its cells. */
+    attached: async (conversationId: string) =>
+      (await call<{ sheet: SheetInfo | null }>(`/api/budget/sheets/attached?conversationId=${encodeURIComponent(conversationId)}`)).sheet,
+    detach: async (conversationId: string) => { await call(`/api/budget/sheets/attached?conversationId=${encodeURIComponent(conversationId)}`, 'DELETE'); },
     get: async (id: string) => (await call<{ sheet: Sheet }>(one(id))).sheet,
     save: async (id: string, version: number, workbook: unknown) => (await call<{ sheet: SheetInfo }>(one(id), 'PUT', { version, workbook })).sheet,
     remove: async (id: string) => { await call(one(id), 'DELETE'); },
