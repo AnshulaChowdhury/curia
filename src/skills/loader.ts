@@ -48,7 +48,7 @@ export const VALID_CAPABILITIES: ReadonlySet<string> = new Set([
   'actionLogRepo', 'approvalDelivery', 'auditLogRepo', 'executionLayer', 'confidencePipeline', 'tempFileStore',
   'infraLlm', 'outboundContext', 'taskRepo', 'workingDocs', 'secretCapture', 'secretResolver',
   'userSecretIndex',
-  'diagnosticsRepo', 'booksReader', 'budgetReader', 'budgetSheetReader', 'sensitivityClassifier', 'verification', 'taskOutreach', 'disclosureDecisions',
+  'diagnosticsRepo', 'booksReader', 'budgetReader', 'budgetSheetReader', 'budgetProposer', 'sensitivityClassifier', 'verification', 'taskOutreach', 'disclosureDecisions',
   'voiceSessions',
 ]);
 

@@ -293,6 +293,9 @@ export interface ToolContext {
   /** Attached-spreadsheet read facade — available to skills declaring 'budgetSheetReader' in capabilities.
    *  Reads only the sheet the owner attached to one web chat (ADR-065). It has no method that changes anything. */
   budgetSheetReader?: import('../budget/sheet-reader.js').BudgetSheetReader;
+  /** Budget proposals — available to skills declaring 'budgetProposer' in capabilities.
+   *  Writes a proposal of category changes for the owner to approve (ADR-067). It cannot apply one or change a budget. */
+  budgetProposer?: Pick<import('../budget/proposal-store.js').ProposalStore, 'propose'>;
   /** Task repo — available to skills declaring 'taskRepo' in capabilities.
    *  Provides CRUD access to the tasks table and manages linked wake-up scheduled_jobs rows.
    *  Used by task-create, task-list, task-update, task-complete. */

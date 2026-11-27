@@ -1,0 +1,27 @@
+{
+  "name": "budget-propose",
+  "description": "Show the owner proposed changes to budget categories and monthly amounts, as a card in the web chat they asked from. CHANGES NOTHING: the owner must reply \"yes\" or press Apply on the card. Replaces any proposal still waiting in that chat, so send every category in one call. Amounts are Canadian dollars.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "low",
+  "inputs": {
+    "months": "string[]? (the months the amounts are for, each YYYY-MM, in order)",
+    "categories": "object[] (each { name, type: expense|income|savings, amounts: [dollars or null, one per month in the same order], renameFrom?: current name when renaming, archive?: true to close a category })"
+  },
+  "outputs": {
+    "proposed": "boolean",
+    "status": "string",
+    "toCreate": "number",
+    "toUpdate": "number",
+    "toArchive": "number"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetProposer"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}

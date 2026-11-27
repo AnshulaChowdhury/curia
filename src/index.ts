@@ -271,6 +271,7 @@ import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.j
 import { BooksReader } from './books/books-reader.js';
 import { BudgetReader } from './budget/budget-reader.js';
 import { BudgetSheetReader } from './budget/sheet-reader.js';
+import { ProposalStore } from './budget/proposal-store.js';
 import { SheetStore, isConversationId } from './budget/sheet-store.js';
 import { BudgetStore } from './budget/budget-store.js';
 import { AccountStore } from './budget/accounts-store.js';
@@ -1709,6 +1710,9 @@ async function main(): Promise<void> {
   // The spreadsheet the owner attached to a chat: the specialist reads it (ADR-065), the dispatcher notes that it is there.
   const budgetSheets = new SheetStore(pool);
   const budgetSheetReader = new BudgetSheetReader(budgetSheets, injectionScanner);
+  // The assistant gets `propose` alone: applying a proposal belongs to the owner's console (ADR-067).
+  const budgetProposals = new ProposalStore(pool);
+  const budgetProposer = { propose: budgetProposals.propose.bind(budgetProposals) };
 
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
@@ -2682,7 +2686,7 @@ async function main(): Promise<void> {
   // the subscriber and sweep below. Wiring the lookup while those are off would let a
   // pending row block that agent in that conversation with nothing left to resolve it.
   const lateDeliveryConfig = resolveLateDeliveryConfig(yamlConfig.delegate);
-  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, budgetReader, budgetSheetReader, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
+  const executionLayer = new ExecutionLayer(toolRegistry, logger, { bus, agentRegistry, contactService, outboundGateway, schedulerService, entityMemory, agentPersona, nylasCalendarClient, entityContextAssembler, agentContactId: agentIdentityContactId, autonomyService, secretsService, executiveProfileService, officeIdentityService, browserService, bullpenService, approvalTrigger, escalationJudge, gating: autonomyGating, sendEvidence, actionLogRepo, approvalDelivery, auditLogRepo, diagnosticsRepo, booksReader, budgetReader, budgetSheetReader, budgetProposer, taskRepo, workingDocsRepo, voiceSessions: voiceSessionStore, confidencePipeline, tempFileStore, infraLlmService, outboundContextService, taskOutreach, disclosureDecisions, exportControlService, timezone: config.timezone, selfEmail: resolvedEmailAccounts[0]?.selfEmail, selfEmails: resolvedEmailAccounts.map(a => a.selfEmail), skillOutputMaxLength: yamlConfig.skillOutput?.maxLength, defaultDelegateTimeoutMs: yamlConfig.delegate?.defaultTimeoutMs, appOrigin: config.appOrigin, httpPort: config.httpPort, bypassLadder, resumableCeilings: resolveTasksConfig(yamlConfig.tasks).resumableCeilings, principalIdentities, sensitivityClassifier, skillRegistry, verification: verificationRuntime,       ...(lateDeliveryConfig.enabled ? { openDelegationLookup: {
     findInFlight: (targetAgent: string, originConversationId: string) =>
       findInFlightPendingDelegation(pool, { targetAgent, originConversationId }),
     acquireRunning: (params: Parameters<typeof acquireRunningDelegation>[1]) =>

@@ -4413,3 +4413,10 @@ table.records-table tbody tr.active td { background: transparent; }
 .bud-plan .bud-plan-total th, .bud-plan .bud-plan-total td { font-weight: 600; padding-top: 6px; padding-bottom: 6px; border-top: 1px solid var(--app-border); }
 .bud-plan td { padding-top: 4px; padding-bottom: 4px; }
 .bud-plan .bud-plan-input { width: 104px; text-align: right; }
+
+/* Proposed budget changes, above the message box */
+.chat-proposal { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; padding: 10px 14px; background: var(--app-card); border: 1px solid var(--app-border); border-radius: 8px; font-size: 13px; }
+.chat-proposal.is-waiting { display: flex; flex-direction: column; align-items: stretch; border-color: var(--app-primary); }
+.chat-proposal h2, .chat-proposal p { margin: 0; }
+.chat-proposal-scroll { max-height: 34vh; overflow: auto; }
+.chat-proposal td { white-space: nowrap; padding-right: 10px; }
