@@ -36,6 +36,13 @@ describe('BudgetReader', () => {
     expect(store.listTransactions).not.toHaveBeenCalled();
   });
 
+  it('names an archived category as archived', async () => {
+    const { reader, store } = build();
+    store.listCategories.mockResolvedValue([{ ...CAT, archived: true }]);
+    expect((await reader.needsReview()).transactions[0]!.category).toBe('Groceries (archived)');
+    expect(store.listCategories).toHaveBeenCalledWith({ includeArchived: true });
+  });
+
   it('caps limits and returns bank text only as data', async () => {
     const { reader, store } = build();
     const out = await reader.needsReview(9999);

@@ -5,7 +5,7 @@ import {
 } from './budget-utils.js';
 import { createBudgetClient, stateForStatus } from './budget-data.js';
 
-const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', monthlyCents: 60000, rollover: false }];
+const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', monthlyCents: 60000, rollover: false, archived: false, transactionCount: 0 }];
 
 describe('months', () => {
   it('shifts across year boundaries', () => {
@@ -53,7 +53,7 @@ describe('bar', () => {
 
 const SUMMARY: BudgetSummary = {
   month: '2031-03',
-  categories: [{ categoryId: 'cat-groceries', name: 'Groceries', budgetedCents: 60000, spentCents: 61000, remainingCents: -1000, state: 'over' }],
+  categories: [{ categoryId: 'cat-groceries', name: 'Groceries', archived: false, budgetedCents: 60000, spentCents: 61000, remainingCents: -1000, state: 'over' }],
   totals: { budgetedCents: 60000, spentCents: 63000, uncategorisedSpentCents: 2000 },
   needsYou: { uncategorised: 2, guesses: 1, overBudget: 1 },
 };
@@ -92,7 +92,7 @@ describe('budget client', () => {
     expect(seen.map(s => s.path).sort()).toEqual([
       '/api/budget/accounts',
       '/api/budget/banks',
-      '/api/budget/categories',
+      '/api/budget/categories?archived=1',
       '/api/budget/summary?month=2031-03',
       '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
       '/api/budget/trend?asOf=2031-03-15',
@@ -124,6 +124,10 @@ describe('budget client', () => {
 });
 
 describe('validateDraft', () => {
+  it('lets a new category reuse an archived name', () => {
+    const gone = [{ ...CATEGORIES[0]!, archived: true }];
+    expect(validateDraft({ name: 'Groceries', amount: '10', rollover: false }, gone, null).ok).toBe(true);
+  });
   it('rejects blank, duplicate and bad amounts', () => {
     expect(validateDraft({ name: ' ', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
     expect(validateDraft({ name: 'groceries', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();

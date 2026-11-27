@@ -3,7 +3,7 @@ import { actionItems, axisTicks, cashCents, categorySegments, change, columnOf, 
 import { today, type BudgetSummary, type CategorySummary, type NetWorth } from './budget-utils.js';
 
 const category = (name: string, budgetedCents: number | null, spentCents: number, state: CategorySummary['state']): CategorySummary =>
-  ({ categoryId: name, name, budgetedCents, spentCents, remainingCents: budgetedCents === null ? null : budgetedCents - spentCents, state });
+  ({ categoryId: name, name, archived: false, budgetedCents, spentCents, remainingCents: budgetedCents === null ? null : budgetedCents - spentCents, state });
 const summary = (categories: CategorySummary[], uncategorised = 0, loose = 0): BudgetSummary => ({
   month: '2031-03', categories,
   totals: { budgetedCents: 0, spentCents: 0, uncategorisedSpentCents: loose },
@@ -73,6 +73,12 @@ describe('action items and columns', () => {
   it('is empty when nothing is wrong', () => {
     const fine = { ...NOTHING, accounts: [{ id: 'x', source: 'manual' as const, institution: '', name: 'x', mask: null, type: 'cash' as const, side: 'asset' as const, currency: 'CAD', balanceCents: 1, asOf: '' }] };
     expect(actionItems({ summary: summary([category('A', 100, 10, 'under')]), netWorth: fine, banks: [] })).toEqual([]);
+  });
+  it('asks nothing of the owner about an archived category, and marks it where it appears', () => {
+    const gone = { ...category('Old', 100, 150, 'over'), archived: true };
+    const items = actionItems({ summary: summary([gone]), netWorth: NOTHING, banks: [] });
+    expect(items.map(i => i.key)).toEqual(['nobudget', 'nobalances']);
+    expect(categorySegments(summary([gone]))[0]!.label).toBe('Old (archived)');
   });
   it('puts the worst overspend and the closest to the limit first', () => {
     expect(columnOf(summary(cats), 'over').categories.map(c => c.name)).toEqual(['B', 'A']);

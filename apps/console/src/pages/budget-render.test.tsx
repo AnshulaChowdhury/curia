@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MoneyCard } from '../components/MoneyCard.js';
 import { ReviewList } from './BudgetOverviewPage.js';
+import { RetireActions } from './BudgetsPage.js';
 import { ActionItems, SpendingPanel, StatusColumn, Tiles, CategoryBar } from './BudgetDashboard.js';
 import type { DashboardData } from './budget-data.js';
 import { NetWorthSummary, SideCard } from './NetWorthPage.js';
@@ -32,7 +33,7 @@ describe('overview', () => {
     const html = renderToStaticMarkup(
       <ReviewList
         txns={[{ id: 't', account: 'Card', date: '2031-03-02', payee: '<b>MARKET</b>', description: '', amountCents: -2400, categoryId: null, source: null }]}
-        categories={[{ id: 'c', name: 'Groceries', monthlyCents: 100, rollover: false }]}
+        categories={[{ id: 'c', name: 'Groceries', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0 }]}
         busy={false}
         onCategorise={() => {}}
       />,
@@ -43,12 +44,36 @@ describe('overview', () => {
   });
 });
 
+describe('archived categories', () => {
+  const category = (over: Partial<{ archived: boolean; transactionCount: number }>) =>
+    ({ id: 'c', name: 'Old', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0, ...over });
+  const actions = (transactionCount: number, confirming = false) => renderToStaticMarkup(
+    <RetireActions c={category({ transactionCount })} confirming={confirming} onAsk={() => {}} onKeep={() => {}} onConfirm={() => {}} />);
+
+  it('offers delete for an empty category and archive for a used one, saying what happens', () => {
+    expect(actions(0)).toContain('aria-label="Delete Old"');
+    expect(actions(2)).toContain('aria-label="Archive Old"');
+    expect(actions(2, true)).toContain('Its 2 transactions keep it');
+  });
+  it('shows an archived guess without letting it be confirmed or chosen again', () => {
+    const html = renderToStaticMarkup(
+      <ReviewList
+        txns={[{ id: 't', account: 'Card', date: '2031-03-02', payee: 'Shop', description: '', amountCents: -100, categoryId: 'c', source: 'agent_guess' }]}
+        categories={[category({ archived: true })]} busy={false} onCategorise={() => {}}
+      />,
+    );
+    expect(html).toContain('Old (archived)');
+    expect(html).toContain('disabled=""');
+    expect(html).not.toContain('Confirm guess');
+  });
+});
+
 describe('dashboard', () => {
   const data: DashboardData = {
     categories: [], review: [], banksNeedingYou: [{ id: 'l', institution: '<i>Bank</i>', status: 'error' }],
     summary: {
       month: '2031-03',
-      categories: [{ categoryId: 'a', name: '<b>Food</b>', budgetedCents: 10000, spentCents: 12000, remainingCents: -2000, state: 'over' }],
+      categories: [{ categoryId: 'a', name: '<b>Food</b>', archived: false, budgetedCents: 10000, spentCents: 12000, remainingCents: -2000, state: 'over' }],
       totals: { budgetedCents: 10000, spentCents: 12000, uncategorisedSpentCents: 0 },
       needsYou: { uncategorised: 0, guesses: 0, overBudget: 1 },
     },

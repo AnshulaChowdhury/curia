@@ -8,6 +8,9 @@ export interface BudgetCategory {
   name: string;
   monthlyCents: number | null; // null = no budget set
   rollover: boolean;
+  /** Archived: keeps its transactions, takes no new ones. */
+  archived: boolean;
+  transactionCount: number;
 }
 
 export interface BudgetTxn {
@@ -26,6 +29,7 @@ export type BudgetStatus = 'under' | 'near' | 'over';
 export interface CategorySummary {
   categoryId: string;
   name: string;
+  archived: boolean;
   budgetedCents: number | null;
   spentCents: number;
   remainingCents: number | null;
@@ -122,6 +126,9 @@ export interface BudgetTrend {
   yearToDate: PeriodCompare;
 }
 
+/** A category's name as shown, marked when it is archived. */
+export const displayName = (c: { name: string; archived: boolean }): string => (c.archived ? `${c.name} (archived)` : c.name);
+
 /** Today in the viewer's own time zone, as YYYY-MM-DD. */
 export function today(now = new Date()): string {
   return `${currentMonth(now)}-${String(now.getDate()).padStart(2, '0')}`;
@@ -181,7 +188,7 @@ export function validateDraft(draft: CategoryDraft, existing: BudgetCategory[], 
   const name = draft.name.trim();
   if (!name) errors.name = 'Enter a name.';
   else if (name.length > 60) errors.name = 'Keep the name under 60 characters.';
-  else if (existing.some(c => c.id !== editingId && c.name.toLowerCase() === name.toLowerCase())) {
+  else if (existing.some(c => c.id !== editingId && !c.archived && c.name.toLowerCase() === name.toLowerCase())) {
     errors.name = 'A category with this name already exists.';
   }
   const cents = parseDollarsToCents(draft.amount);

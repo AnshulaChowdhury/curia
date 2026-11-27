@@ -1,9 +1,10 @@
 // budget.ts — personal budgeting, owner only.
 //
-//   GET    /api/budget/categories                   — the categories with their monthly budgets
+//   GET    /api/budget/categories[?archived=1]      — the categories with their monthly budgets, and the archived ones if asked
 //   POST   /api/budget/categories                   — add one
 //   PATCH  /api/budget/categories/:id               — rename, change the budget or rollover
-//   DELETE /api/budget/categories/:id               — archive it; its transactions go back to uncategorised
+//   POST   /api/budget/categories/:id/archive       — close it to new transactions; the ones it has keep it
+//   DELETE /api/budget/categories/:id               — remove it, only when it has no transactions (409 otherwise)
 //   GET    /api/budget/summary?month=YYYY-MM        — spent against budget per category, and what needs the owner
 //   GET    /api/budget/trend?asOf=YYYY-MM-DD        — money out and in by month, and period-on-period spending
 //   GET    /api/budget/transactions                 — filter by month, category, account, needsReview
@@ -25,7 +26,7 @@ import { ImportError, parseBankFile } from '../../../budget/import-parser.js';
 
 export interface BudgetRouteOptions {
   logger: Logger;
-  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
+  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'archiveCategory' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -52,10 +53,10 @@ export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOpt
     return false;
   };
 
-  app.get('/api/budget/categories', RATE, async (request, reply) => {
+  app.get<{ Querystring: { archived?: string } }>('/api/budget/categories', RATE, async (request, reply) => {
     if (!owner(request, reply)) return reply;
     try {
-      return noStore(reply).send({ categories: await store.listCategories() });
+      return noStore(reply).send({ categories: await store.listCategories({ includeArchived: request.query.archived === '1' }) });
     } catch (err) {
       return fail(reply, err);
     }
@@ -74,6 +75,15 @@ export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOpt
     if (!owner(request, reply) || !goodId(reply, request.params.id)) return reply;
     try {
       return noStore(reply).send({ category: await store.updateCategory(request.params.id, request.body ?? {}) });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.post<{ Params: { id: string } }>('/api/budget/categories/:id/archive', RATE, async (request, reply) => {
+    if (!owner(request, reply) || !goodId(reply, request.params.id)) return reply;
+    try {
+      return noStore(reply).send({ category: await store.archiveCategory(request.params.id) });
     } catch (err) {
       return fail(reply, err);
     }
