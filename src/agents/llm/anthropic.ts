@@ -115,12 +115,14 @@ export class AnthropicProvider implements LLMProvider {
     toolResults,
     model: modelOverride,
     options,
+    toolChoice,
   }: {
     messages: Message[];
     tools?: ToolDefinition[];
     toolResults?: ToolResult[];
     model?: string;
     options?: Record<string, unknown>;
+    toolChoice?: string;
   }, operation: 'chat' | 'stream'): {
     createParams: Anthropic.Messages.MessageCreateParamsNonStreaming;
     model: string;
@@ -309,6 +311,10 @@ export class AnthropicProvider implements LLMProvider {
     const needsThinkingRoom = willThink || (reasoningEffort === 'none'
       && this.modelRegistry.thinkingOffType(model) === 'between_tools'
       && tools !== undefined && tools.length > 0);
+    // A required tool cannot be combined with thinking, so a thinking request is left to choose for itself.
+    if (toolChoice && !willThink && tools?.some(t => t.name === toolChoice)) {
+      createParams.tool_choice = { type: 'tool', name: toolChoice };
+    }
     if (needsThinkingRoom && callerMaxTokens === undefined) {
       createParams.max_tokens = Math.max(createParams.max_tokens, THINKING_MAX_TOKENS);
     } else if (willThink && callerMaxTokens !== undefined && callerMaxTokens < MIN_THINKING_MAX_TOKENS) {
@@ -447,6 +453,7 @@ export class AnthropicProvider implements LLMProvider {
     toolResults?: ToolResult[];
     model?: string;
     options?: Record<string, unknown>;
+    toolChoice?: string;
   }): Promise<LLMResponse> {
     let model: string | undefined = params.model ?? (typeof params.options?.model === 'string' ? params.options.model : undefined);
 

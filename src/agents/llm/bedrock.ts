@@ -154,12 +154,14 @@ export class BedrockProvider implements LLMProvider {
     toolResults,
     model: modelOverride,
     options,
+    toolChoice,
   }: {
     messages: Message[];
     tools?: ToolDefinition[];
     toolResults?: ToolResult[];
     model?: string;
     options?: Record<string, unknown>;
+    toolChoice?: string;
   }): Promise<LLMResponse> {
     // Concatenate all system-role messages into Converse's dedicated `system`
     // parameter — same convention as anthropic.ts/openrouter.ts. The runtime
@@ -300,7 +302,7 @@ export class BedrockProvider implements LLMProvider {
         temperature = undefined;
       }
 
-      let toolConfig: { tools: BedrockTool[] } | undefined;
+      let toolConfig: { tools: BedrockTool[]; toolChoice?: { tool: { name: string } } } | undefined;
       if (tools && tools.length > 0) {
         toolConfig = {
           tools: tools.map((t): BedrockTool => ({
@@ -312,6 +314,7 @@ export class BedrockProvider implements LLMProvider {
               inputSchema: { json: t.input_schema as DocumentType },
             },
           })),
+          ...(toolChoice && tools.some(t => t.name === toolChoice) ? { toolChoice: { tool: { name: toolChoice } } } : {}),
         };
       }
 

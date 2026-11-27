@@ -16,6 +16,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Fixed
 
 - **Spreadsheet dates** — month and day names show in English, not Chinese.
+- **Unbacked claims** — budget chats no longer say work was delegated when nothing ran.
 
 ### Security
 
@@ -25,6 +26,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **`LLMProvider.chat` `toolChoice`** — require a named tool; Bedrock and Anthropic.
 - **Budgets by month** — income, expense and savings categories, edited month by month (migration 136).
 - **`budget-plan`** — the budget agent reads budgeted amounts month by month.
 - **Budget changes from chat** — the assistant proposes; the owner approves a card (migration 137).

@@ -188,6 +188,17 @@ describe('BedrockProvider', () => {
       });
     });
 
+    it('requires the named tool when asked, and only one that is offered', async () => {
+      mockSend.mockResolvedValue(textResponse());
+      const { provider } = makeProvider();
+      const messages: Message[] = [{ role: 'user', content: 'hi' }];
+
+      await provider.chat({ messages, tools: [lookupTool], model: MODEL, toolChoice: 'contact-lookup' });
+      expect(lastRequest().toolConfig).toMatchObject({ toolChoice: { tool: { name: 'contact-lookup' } } });
+      await provider.chat({ messages, tools: [lookupTool], model: MODEL, toolChoice: 'delegate' });
+      expect(lastRequest().toolConfig).not.toHaveProperty('toolChoice');
+    });
+
     it('sends no toolConfig when no tools are offered', async () => {
       mockSend.mockResolvedValueOnce(textResponse());
       const { provider } = makeProvider();
