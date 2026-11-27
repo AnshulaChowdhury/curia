@@ -54,6 +54,9 @@ describe('bypassesBearerAuth', () => {
     '/api/setup/status',
     '/api/connections',
     '/api/books/batches',
+    '/api/budget/categories',
+    '/api/budget/transactions/:id',
+    '/api/budget/banks/:id/sync',
     '/api/books/graph',
     '/api/books/batches/:id/rows/:rowId',
     '/api/secret-capture/:token',
@@ -68,6 +71,7 @@ describe('bypassesBearerAuth', () => {
     '/api/nonexistent',
     // Prefixes must not match on a shared leading substring (#872 review).
     '/api/chat-export',
+    '/api/budget-export',
     '/api/tasks-summary',
     '/api/contacts.csv',
     '/*',
