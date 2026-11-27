@@ -93,6 +93,16 @@ export function delegationOriginConversationId(
 }
 
 /**
+ * Channel of the conversation a delegated specialist was spawned from. budget-sheet-read
+ * requires `web`: a spreadsheet is attached only to a signed-in owner's web chat (ADR-065).
+ */
+export function delegationOriginChannelId(
+  metadata: Record<string, unknown> | undefined,
+): string | undefined {
+  return delegationOriginString(metadata, 'channelId');
+}
+
+/**
  * Coordinator `agent.task` id that spawned this specialist (#1860).
  * Reply-lock uses it so a specialist send marks only that task, not every
  * pending task in the same principal conversation.

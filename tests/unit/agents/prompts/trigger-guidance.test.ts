@@ -189,6 +189,7 @@ describe('parseTurnGuidanceKeys', () => {
       'principal-forward',
       'booking-link',
       'make-room',
+      'budget-sheet-attached',
       'non-principal-reply-shaped',
       'principal-colleague',
       'principal-correspondent',

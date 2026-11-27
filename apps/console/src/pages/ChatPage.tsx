@@ -10,11 +10,18 @@ import { useChatSession } from './chat/useChatSession.js';
 import { useVoiceCall } from './chat/useVoiceCall.js';
 import { VoiceCallBar } from './chat/VoiceCallBar.js';
 import { useHandedOffQuestion } from './chat/ask-handoff.js';
+import { loadedAsChatPage, useChatSheet } from './chat/useChatSheet.js';
+import { AttachButton, SheetBar, SheetSide } from './chat/ChatSheet.js';
 
 export default function ChatPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { messages, sending, hasMore, loadingHistory, send, loadMore } = useChatSession();
+  const { messages, sending, hasMore, loadingHistory, send, loadMore, conversationId, ensureConversationId } = useChatSession();
+  const attachment = useChatSheet(conversationId, ensureConversationId);
+  const [sheetOpen, setSheetOpen] = useState(true);
+  const framing = loadedAsChatPage(performance.getEntriesByType('navigation')[0]?.name);
+  const askedToAttach = new URLSearchParams(window.location.search).has('attach');
+  const shown = attachment.sheet ?? attachment.leaving;
   const voiceCall = useVoiceCall();
   useHandedOffQuestion(send);
 
@@ -33,18 +40,24 @@ export default function ChatPage() {
         <Sidebar activeView="chat" theme={theme} onThemeChange={setTheme} />
         <main className="main">
           <Topbar crumb="Moonray Ventures OS" title="Chat" />
-          <div className="chat-page">
-            <MoonrayRings />
-            <ChatThread
-              messages={messages}
-              hasMore={hasMore}
-              loadingHistory={loadingHistory}
-              loadMore={loadMore}
-            />
-            <div className="chat-input-area">
-              <VoiceCallBar {...voiceCall} />
-              <ChatComposer disabled={sending} onSend={send} />
+          <div className={`chat-split${framing && attachment.sheet && sheetOpen ? ' has-sheet' : ''}`}>
+            <div className="chat-page">
+              <MoonrayRings />
+              <ChatThread
+                messages={messages}
+                hasMore={hasMore}
+                loadingHistory={loadingHistory}
+                loadMore={loadMore}
+              />
+              <div className="chat-input-area">
+                <VoiceCallBar {...voiceCall} />
+                <SheetBar sheet={attachment.sheet} ready={framing} open={sheetOpen} busy={attachment.busy} error={attachment.error}
+                  hint={askedToAttach} onToggle={() => setSheetOpen(o => !o)} onDetach={() => void attachment.detach()} />
+                <ChatComposer disabled={sending} onSend={send}
+                  attach={<AttachButton ready={framing} busy={attachment.busy} onFile={f => { setSheetOpen(true); void attachment.add(f); }} />} />
+              </div>
             </div>
+            {framing && shown && <SheetSide sheet={shown} hidden={!attachment.sheet || !sheetOpen} />}
           </div>
         </main>
       </div>

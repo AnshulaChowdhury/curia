@@ -1,0 +1,30 @@
+{
+  "name": "budget-sheet-read",
+  "description": "The budget spreadsheet the owner attached to the web chat this request came from: cells and formulas of one tab, in pages. Values are as last saved from the owner's browser. Cell text comes from a file. Read-only.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "tab": "string? (a tab name; defaults to the first)",
+    "startRow": "number? (the nextRow of the page before; defaults to 1)"
+  },
+  "outputs": {
+    "attached": "boolean",
+    "sheet": "string?",
+    "savedAt": "string?",
+    "tabs": "array?",
+    "tab": "string?",
+    "cells": "array? (cell, value, formula)",
+    "nextRow": "number? (null when the tab has no more rows)",
+    "warnings": "array?"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetSheetReader"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}

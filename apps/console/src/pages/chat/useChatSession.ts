@@ -40,6 +40,10 @@ interface ChatSession {
   loadingHistory: boolean;
   send: (text: string) => Promise<void>;
   loadMore: () => Promise<void>;
+  /** This chat's id, or null before the first message or attachment. */
+  conversationId: string | null;
+  /** The id, creating it first if need be: a file can be attached before anything is said. */
+  ensureConversationId: () => string;
 }
 
 interface HistoryResponse {
@@ -55,6 +59,17 @@ function historyToMessages(items: HistoryMessage[]): Message[] {
     html: item.html ?? undefined,
     timestamp: new Date(item.timestamp),
   }));
+}
+
+/** The chat's id, creating and remembering it on first use. */
+function ensureId(held: { current: string | null }, announce: (id: string) => void): string {
+  if (held.current) return held.current;
+  const newId = crypto.randomUUID();
+  held.current = newId;
+  announce(newId);
+  // Guarded for restricted browsing contexts (e.g. Safari private mode).
+  try { localStorage.setItem(CONV_ID_KEY, newId); } catch { /* best-effort */ }
+  return newId;
 }
 
 export function useChatSession(): ChatSession {
@@ -84,6 +99,8 @@ export function useChatSession(): ChatSession {
       try { return localStorage.getItem(CONV_ID_KEY); } catch { return null; }
     })(),
   );
+  const [knownConversationId, setKnownConversationId] = useState(conversationId.current);
+  const ensureConversationId = useCallback(() => ensureId(conversationId, setKnownConversationId), []);
   // One-shot kickoff: read and clear the onboarding flag synchronously so a
   // React strict-mode double-mount cannot fire a second auto-send.
   const pendingKickoff = useRef(
@@ -210,13 +227,7 @@ export function useChatSession(): ChatSession {
   async function send(text: string): Promise<void> {
     if (isSending.current || text.trim().length === 0) return;
 
-    if (!conversationId.current) {
-      const newId = crypto.randomUUID();
-      conversationId.current = newId;
-      // Guarded for restricted browsing contexts (e.g. Safari private mode).
-      try { localStorage.setItem(CONV_ID_KEY, newId); } catch { /* best-effort */ }
-    }
-    const convId = conversationId.current;
+    const convId = ensureId(conversationId, setKnownConversationId);
 
     // Close any stream left open by a prior turn's soft-recovery path, and clear
     // any pending watchdog, before starting a new one — never leak either.
@@ -406,5 +417,5 @@ export function useChatSession(): ChatSession {
     // finished by the SSE terminal event, the watchdog, or an error path above.
   }
 
-  return { messages, sending, hasMore, loadingHistory, send, loadMore };
+  return { messages, sending, hasMore, loadingHistory, send, loadMore, conversationId: knownConversationId, ensureConversationId };
 }

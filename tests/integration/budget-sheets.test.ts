@@ -39,6 +39,26 @@ describeIf('budget sheet store', () => {
     expect((await pool.query('SELECT count(*)::int AS n FROM budget_sheets')).rows[0]).toEqual({ n: 0 });
   });
 
+  it('attaches one sheet to a chat at a time, and keeps what it detaches', async () => {
+    const first = await store.create({ name: 'first', workbook: workbook(1), conversationId: 'chat-1' });
+    expect((await store.attached('chat-1'))?.id).toBe(first.id);
+    expect(await store.attached('chat-2')).toBeNull();
+    const second = await store.create({ name: 'second', workbook: workbook(2), conversationId: 'chat-1' });
+    expect(await store.attachedInfo('chat-1')).toMatchObject({ id: second.id, name: 'second' });
+    expect(await store.list()).toHaveLength(2);
+    await store.detach('chat-1');
+    expect(await store.attached('chat-1')).toBeNull();
+    expect((await store.get(second.id)).name).toBe('second');
+  });
+
+  it('forgets an expired attachment, and refuses an id that is not one', async () => {
+    const made = await store.create({ name: 'a', workbook: workbook(1), conversationId: 'chat-3' });
+    await pool.query(`UPDATE budget_sheets SET expires_at = now() - interval '1 minute' WHERE id = $1`, [made.id]);
+    expect(await store.attached('chat-3')).toBeNull();
+    for (const bad of ['', 'a b', 'x'.repeat(201), 5]) await expect(store.attached(bad)).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(store.create({ name: 'b', workbook: workbook(1), conversationId: "'; drop" })).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
   it('holds a limited number, and deletes', async () => {
     const made = [];
     for (let i = 0; i < MAX_STORED_SHEETS; i++) made.push(await store.create({ name: `s${i}`, workbook: workbook(i) }));

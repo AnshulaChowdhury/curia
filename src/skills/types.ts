@@ -290,6 +290,9 @@ export interface ToolContext {
   /** Budget read facade — available to skills declaring 'budgetReader' in capabilities.
    *  Read-only view of the owner's personal budget for the budget specialist (ADR-062). It has no method that changes anything. */
   budgetReader?: import('../budget/budget-reader.js').BudgetReader;
+  /** Attached-spreadsheet read facade — available to skills declaring 'budgetSheetReader' in capabilities.
+   *  Reads only the sheet the owner attached to one web chat (ADR-065). It has no method that changes anything. */
+  budgetSheetReader?: import('../budget/sheet-reader.js').BudgetSheetReader;
   /** Task repo — available to skills declaring 'taskRepo' in capabilities.
    *  Provides CRUD access to the tasks table and manages linked wake-up scheduled_jobs rows.
    *  Used by task-create, task-list, task-update, task-complete. */

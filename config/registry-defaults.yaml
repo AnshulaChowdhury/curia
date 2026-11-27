@@ -84,7 +84,7 @@ tools:
   # NOTE: books skills (books-summary, books-review-queue, books-uploads) excluded — they read the
   #        principal's QuickBooks balances and bank-file queue and are the read-only books
   #        agent's toolset (ADR-060). Opt-in: enable them alongside the books agent.
-  # NOTE: budget skills (budget-summary, budget-needs-review, budget-transactions) excluded — they read the
+  # NOTE: budget skills (budget-summary, budget-needs-review, budget-transactions, budget-sheet-read) excluded — they read the
   #        principal's personal budget and are the read-only budget agent's toolset (ADR-062). Opt-in: enable
   #        them alongside the budget agent.
   # NOTE: ceo-inbox-* excluded — companion to the ceo-inbox agent; enable alongside it.

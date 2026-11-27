@@ -15,11 +15,14 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **Chat page policy** — `/chat` alone may frame Curia's own pages, for attached spreadsheets.
 - **Spreadsheet page policy** — allows three grid stylesheets and inline images; converter sandboxed.
 - **Dependency pins** — raised eight stale floors, clearing a critical Vite advisory.
 
 ### Added
 
+- **Spreadsheets in chat** — attach a budget file; the budget agent reads it (migration 135).
+- **`ToolContext.budgetSheetReader`** — **public API:** new read-only capability for the attached spreadsheet.
 - **Budget spreadsheets** — open .xlsx or .csv files and edit them in Curia (migration 134).
 
 ### Changed

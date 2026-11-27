@@ -111,6 +111,13 @@ export const SHEET_CONTENT_SECURITY_POLICY = [
 ].join('; ');
 
 /**
+ * CSP for the chat page (`/chat` only): the console policy, plus framing Curia's own pages, so an attached spreadsheet
+ * and the file converter can sit beside the conversation (owner-approved, ADR-065). Nothing else is loosened, and the
+ * chat page itself still cannot be framed.
+ */
+export const CHAT_CONTENT_SECURITY_POLICY = `${CONSOLE_CONTENT_SECURITY_POLICY}; frame-src 'self'`;
+
+/**
  * CSP for the file converter, a third-party library run in a locked-down frame: sandboxed to an opaque origin (no
  * cookies, no reach into the page that framed it), with no network at all. It can only load its own scripts and answer
  * the page that asked.
@@ -127,6 +134,7 @@ export const CONVERTER_CONTENT_SECURITY_POLICY = [
 
 const pathOf = (url: string): string => url.split('?', 1)[0]!.replace(/\/$/, '');
 const isSheetRequest = (url: string): boolean => pathOf(url) === '/budget/sheet-frame';
+const isChatRequest = (url: string): boolean => pathOf(url) === '/chat';
 const isConverterRequest = (url: string): boolean => pathOf(url) === '/budget/convert-frame' || pathOf(url) === '/convert-frame.html';
 
 function isHtmlResponse(reply: { getHeader(name: string): unknown }): boolean {
@@ -195,7 +203,9 @@ export function registerSecurityHeaders(app: FastifyInstance): void {
         ? ANTFARM_CONTENT_SECURITY_POLICY
         : isPlaidLinkRequest(request.url)
           ? PLAID_LINK_CONTENT_SECURITY_POLICY
-          : CONSOLE_CONTENT_SECURITY_POLICY);
+          : isChatRequest(request.url)
+            ? CHAT_CONTENT_SECURITY_POLICY
+            : CONSOLE_CONTENT_SECURITY_POLICY);
       reply.header('Content-Security-Policy', csp);
       // Only the two spreadsheet pages may be framed, and only by Curia itself.
       reply.header('X-Frame-Options', framed ? 'SAMEORIGIN' : 'DENY');
