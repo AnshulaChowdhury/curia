@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { createAutosave } from './autosave.js';
 import { convertFile, fileProblem } from './convert-client.js';
 import { numbersFromText } from './csv-numbers.js';
+import { trimBlanks } from './trim-blanks.js';
 import { createSheetClient, SheetError } from './sheet-client.js';
 import { loadedAsSheetPage, SheetList } from '../pages/SheetPage.js';
 
@@ -24,6 +25,15 @@ describe('csv amounts', () => {
     numbersFromText({ sheets: { s: { cellData: { '0': Object.fromEntries(cells.map((c, i) => [i, c])) } } } });
     expect(cells.map(c => c.v)).toEqual([900, -12.5, 0.5, '007', '$1,200', '2031-01-01', 42, 'x']);
     expect(numbersFromText(null)).toBeNull();
+  });
+});
+
+describe('formatted blanks', () => {
+  it('are dropped past the figures and kept among them', () => {
+    const blank = { s: { bl: 1 }, t: 1 };
+    const book = { sheets: { a: { cellData: { '0': { '0': { v: 1 }, '1': blank, '5': blank }, '1': { '1': { f: '=A1' } }, '2': { '0': blank, '1': { v: null } } } }, b: { cellData: { '0': { '0': blank } } } } };
+    expect(trimBlanks(book)).toEqual({ sheets: { a: { cellData: { '0': { '0': { v: 1 }, '1': blank }, '1': { '1': { f: '=A1' } } } }, b: { cellData: {} } } });
+    expect(trimBlanks(null)).toBeNull();
   });
 });
 

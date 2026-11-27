@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { sanitizeWorkbook, MAX_CELLS, MAX_SHEETS } from '../../../src/budget/sheet-snapshot.js';
+import { sanitizeWorkbook, MAX_BLANK_CELLS, MAX_CELLS, MAX_SHEETS } from '../../../src/budget/sheet-snapshot.js';
 
 const book = (sheet: Record<string, unknown>, over: Record<string, unknown> = {}) => ({ sheetOrder: ['s1'], sheets: { s1: { name: 'Budget', ...sheet } }, ...over });
 const first = (raw: unknown) => sanitizeWorkbook(raw).sheets['s1']!;
@@ -51,6 +51,31 @@ describe('sanitizeWorkbook', () => {
     const sheets = Object.fromEntries(Array.from({ length: MAX_SHEETS + 1 }, (_, i) => [`s${i}`, { name: 'x' }]));
     expect(() => sanitizeWorkbook({ sheets })).toThrow(/sheets/);
     expect(first(book({ cellData: { '9000': { '0': { s: 'x' } } } })).cellData).toEqual({}); // formatting far away is dropped
+  });
+
+  // What the converter writes for a formatted blank cell.
+  const blank = { s: { bl: 1, ff: 'Calibri' }, t: 1 };
+  const grid = (rows: number, columns: number, make: (r: number, c: number) => unknown) =>
+    Object.fromEntries(Array.from({ length: rows }, (_, r) => [String(r), Object.fromEntries(Array.from({ length: columns }, (_, c) => [String(c), make(r, c)]))]));
+
+  it('accepts a small budget with formatting spread over thousands of blank cells', () => {
+    const s = first(book({ cellData: grid(1000, 26, (r, c) => (r < 5 && c < 3 ? { v: r + c } : blank)) }));
+    expect(Object.keys(s.cellData)).toHaveLength(5);
+    expect(Object.keys(s.cellData['4']!)).toHaveLength(3);
+  });
+
+  it('keeps formatting on blanks among the figures, up to a limit, and none on an empty tab', () => {
+    const s = first(book({ cellData: { '0': { '0': { v: 1 }, '1': blank, '9': blank }, '1': { '0': { v: '' , ...blank } }, '2': { '1': { v: 2 } } } }));
+    expect(Object.keys(s.cellData['0']!)).toEqual(['0', '1']);
+    expect(s.cellData['1']!['0']).toBeDefined();
+    expect(first(book({ cellData: { '0': { '0': blank } } })).cellData).toEqual({});
+    const wide = first(book({ cellData: grid(300, 50, (r, c) => (r === 299 && c === 49 ? { v: 1 } : blank)) }));
+    expect(Object.values(wide.cellData).reduce((n, row) => n + Object.keys(row).length, 0)).toBe(MAX_BLANK_CELLS + 1);
+  });
+
+  it('says how many filled cells there are, and where, when there are too many', () => {
+    const raw = { sheetOrder: ['a', 'b'], sheets: { a: { name: 'Summary', cellData: grid(10, 10, () => ({ v: 1 })) }, b: { name: 'Transactions', cellData: grid(250, 100, () => ({ v: 1 })) } } };
+    expect(() => sanitizeWorkbook(raw)).toThrow('That spreadsheet has 25,100 filled cells; the limit is 20,000. The largest tab is "Transactions" with 25,000.');
   });
 
   it('refuses what is not a workbook', () => {

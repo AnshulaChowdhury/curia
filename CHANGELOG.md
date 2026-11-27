@@ -506,6 +506,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Spreadsheet size limit** — formatted blank cells no longer count toward it.
 - **Budget pages locked** — signed-in owner no longer refused by the API-token check.
 - **Setup wizard** — a fresh install can finish setup again: since v0.37, Continue on step 5 never reached the Review step. (#2146)
 - **Delegation** — overlapping calls start one specialist run and queue the rest; a specialist's refusal is final rather than reworded and re-sent; requester identity is set by the harness, not inferred from the sender; a relayed send's reply routes back to the specialist that asked. (#1858, #1871, #1893, #1972)
