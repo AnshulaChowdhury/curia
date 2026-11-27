@@ -69,6 +69,8 @@ const SELF_AUTHED_API_PREFIXES = [
   '/api/connections',
   // Books review (batches of bank rows to approve): session auth via assertSecret.
   '/api/books',
+  // Personal budget (categories, imports, bank feeds): owner session auth via assertSecret on every route.
+  '/api/budget',
   // Secret-capture routes are token-authed (the single-use token in the URL is the
   // capability), so they bypass bearer auth and self-authorize via the token (#971).
   '/api/secret-capture',
