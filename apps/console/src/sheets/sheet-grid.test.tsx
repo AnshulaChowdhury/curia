@@ -4,10 +4,11 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 
 const createWorkbook = vi.fn();
+const toggleDarkMode = vi.fn();
 vi.mock('@univerjs/presets', () => ({
   LocaleType: { EN_US: 'enUS' },
   mergeLocales: (locale: unknown) => locale,
-  createUniver: () => ({ univer: { dispose: () => {} }, univerAPI: { createWorkbook, getActiveWorkbook: () => null } }),
+  createUniver: () => ({ univer: { dispose: () => {} }, univerAPI: { createWorkbook, toggleDarkMode, getActiveWorkbook: () => null } }),
 }));
 vi.mock('@univerjs/preset-sheets-core', () => ({ UniverSheetsCorePreset: () => ({}) }));
 vi.mock('@univerjs/preset-sheets-core/locales/en-US', () => ({ default: {} }));
@@ -18,7 +19,19 @@ const { default: SheetGrid } = await import('./SheetGrid.js');
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe('SheetGrid', () => {
-  afterEach(() => createWorkbook.mockClear());
+  afterEach(() => { createWorkbook.mockClear(); toggleDarkMode.mockClear(); document.documentElement.removeAttribute('data-theme'); });
+
+  it('draws the grid in the console theme, and follows a change without reloading the sheet', async () => {
+    document.documentElement.setAttribute('data-theme', 'dark');
+    const root = createRoot(document.createElement('div'));
+    const sheet = { id: 's', name: 'Budget', version: 1, updatedAt: '', expiresAt: '', workbook: { id: 'w' } };
+    await act(async () => root.render(<SheetGrid sheet={sheet} onState={() => {}} />));
+    expect(toggleDarkMode).toHaveBeenLastCalledWith(true);
+    await act(async () => { document.documentElement.setAttribute('data-theme', 'light'); await Promise.resolve(); });
+    expect(toggleDarkMode).toHaveBeenLastCalledWith(false);
+    expect(createWorkbook).toHaveBeenCalledTimes(1);
+    await act(async () => root.unmount());
+  });
 
   it('tells the grid the workbook is in English, or it writes month names in Chinese', async () => {
     const root = createRoot(document.createElement('div'));

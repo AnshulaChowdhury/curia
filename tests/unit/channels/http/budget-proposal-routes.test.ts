@@ -11,7 +11,7 @@ const auth = { 'x-web-bootstrap-secret': SECRET };
 const ID = '11111111-1111-4111-8111-111111111111';
 
 async function app(over: Record<string, unknown> = {}) {
-  const proposals = { pending: vi.fn(async () => null), apply: vi.fn(async () => ({ created: 1, updated: 0, archived: 0 })), discard: vi.fn(async () => undefined), ...over };
+  const proposals = { pending: vi.fn(async () => null), apply: vi.fn(async () => ({ created: 1, updated: 0, archived: 0 })), discard: vi.fn(async () => undefined), setAmount: vi.fn(async () => ({ id: ID, rows: [] })), ...over };
   const a = Fastify();
   await a.register(budgetProposalRoutes, { logger, proposals: proposals as never, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
   return { a, proposals };
@@ -20,7 +20,7 @@ async function app(over: Record<string, unknown> = {}) {
 describe('/api/budget/proposals', () => {
   it('refuses every route without the owner session, before touching the store', async () => {
     const { a, proposals } = await app();
-    for (const [method, url] of [['GET', '/api/budget/proposals?conversationId=c'], ['POST', `/api/budget/proposals/${ID}/apply`], ['POST', `/api/budget/proposals/${ID}/discard`]] as const) {
+    for (const [method, url] of [['GET', '/api/budget/proposals?conversationId=c'], ['POST', `/api/budget/proposals/${ID}/apply`], ['POST', `/api/budget/proposals/${ID}/discard`], ['PATCH', `/api/budget/proposals/${ID}`]] as const) {
       expect((await a.inject({ method, url, payload: { conversationId: 'c' } })).statusCode, url).toBe(401);
     }
     for (const fn of Object.values(proposals)) expect(fn).not.toHaveBeenCalled();
@@ -35,6 +35,16 @@ describe('/api/budget/proposals', () => {
     expect(proposals.apply).toHaveBeenCalledWith(ID, 'chat-1');
     await a.inject({ method: 'POST', url: `/api/budget/proposals/${ID}/discard`, headers: auth, payload: { conversationId: 'chat-1' } });
     expect(proposals.discard).toHaveBeenCalledWith(ID, 'chat-1');
+  });
+
+  it('passes an edited amount on for the chat named', async () => {
+    const { a, proposals } = await app();
+    const url = `/api/budget/proposals/${ID}`;
+    expect((await a.inject({ method: 'PATCH', url, headers: auth, payload: { name: 'Rent' } })).statusCode).toBe(400);
+    expect(proposals.setAmount).not.toHaveBeenCalled();
+    const res = await a.inject({ method: 'PATCH', url, headers: auth, payload: { conversationId: 'chat-1', name: 'Rent', month: '2031-03', cents: null } });
+    expect(res.json()).toEqual({ proposal: { id: ID, rows: [] } });
+    expect(proposals.setAmount).toHaveBeenCalledWith(ID, 'chat-1', 'Rent', '2031-03', null);
   });
 
   it('answers 409 with the reason when nothing was applied', async () => {

@@ -59,6 +59,7 @@ export default function ChatPage() {
               <div className="chat-input-area">
                 <VoiceCallBar {...voiceCall} />
                 <ProposalCard proposal={changes.proposal} outcome={changes.outcome} error={changes.error} busy={changes.busy}
+                  invalid={changes.invalid} onEdit={changes.edit} onBad={changes.markCell}
                   onApply={() => void changes.apply()} onDiscard={() => void changes.discard()} onDismiss={changes.dismiss} />
                 <SheetBar sheet={attachment.sheet} ready={framing} open={sheetOpen} busy={attachment.busy} error={attachment.error}
                   hint={askedToAttach} onToggle={() => setSheetOpen(o => !o)} onDetach={() => void attachment.detach()} />

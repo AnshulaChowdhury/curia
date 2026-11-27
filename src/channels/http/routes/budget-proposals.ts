@@ -1,6 +1,7 @@
 // budget-proposals.ts — the owner's answer to budget changes proposed in a chat (ADR-067).
 //
 //   GET  /api/budget/proposals?conversationId=…  — the proposal waiting in that chat, or null
+//   PATCH /api/budget/proposals/:id             — {conversationId, name, month, cents}: edit one amount (null clears)
 //   POST /api/budget/proposals/:id/apply         — {conversationId}: make every change, or none
 //   POST /api/budget/proposals/:id/discard       — {conversationId}: drop it
 //
@@ -16,7 +17,7 @@ import { isUuid } from '../../../util/uuid.js';
 
 export interface BudgetProposalRouteOptions {
   logger: Logger;
-  proposals: Pick<ProposalStore, 'pending' | 'apply' | 'discard'>;
+  proposals: Pick<ProposalStore, 'pending' | 'apply' | 'discard' | 'setAmount'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -40,6 +41,17 @@ export async function budgetProposalRoutes(app: FastifyInstance, options: Budget
     if (!isConversationId(id)) return reply.status(400).send({ error: 'conversationId is required' });
     try {
       return noStore(reply).send({ proposal: await proposals.pending(id) });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.patch<{ Params: { id: string }; Body: Record<string, unknown> | undefined }>('/api/budget/proposals/:id', RATE, async (request, reply) => {
+    if (!owner(request, reply)) return reply;
+    const { conversationId, name, month, cents } = request.body ?? {};
+    if (!isUuid(request.params.id) || !isConversationId(conversationId)) return reply.status(400).send({ error: 'A proposal id and conversationId are required' });
+    try {
+      return noStore(reply).send({ proposal: await proposals.setAmount(request.params.id, conversationId, name, month, cents) });
     } catch (err) {
       return fail(reply, err);
     }

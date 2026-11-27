@@ -5,7 +5,7 @@ import { ProposalCard } from './ProposalCard.js';
 import { isApproval } from './useBudgetProposal.js';
 
 const none = () => {};
-const handlers = { onApply: none, onDiscard: none, onDismiss: none };
+const handlers = { onApply: none, onDiscard: none, onDismiss: none, onEdit: none, onBad: none, invalid: false };
 
 describe('approving by message', () => {
   it('takes only a plain yes', () => {
@@ -21,7 +21,7 @@ describe('ProposalCard', () => {
       { action: 'update', name: 'Housing', renameFrom: 'Rent', kind: 'expense', previousKind: 'savings', amounts: [{ month: '2031-04', cents: 120000, was: 100000 }] },
     ] }} />);
     expect(html).not.toContain('<i>');
-    for (const text of ['Nothing has changed yet', 'Apply', 'Discard', 'New', 'renamed from Rent', 'was savings', '$5,000.00', '$1,200.00', 'was $1,000.00']) expect(html).toContain(text);
+    for (const text of ['Nothing has changed yet', 'Apply', 'Discard', 'New', 'renamed from Rent', 'was savings', 'value="5000.00"', 'value="1200.00"', 'was $1,000.00', 'aria-label="Housing, April 2031"', 'Edit any amount']) expect(html).toContain(text);
   });
   it('is absent with nothing to say, and reports what happened', () => {
     expect(renderToStaticMarkup(<ProposalCard {...handlers} proposal={null} outcome={null} error={null} busy={false} />)).toBe('');
