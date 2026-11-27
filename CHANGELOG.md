@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency pins** — raised eight stale floors, clearing a critical Vite advisory.
+
 ### Added
 
 - **Household net worth** — assets and liabilities from connected banks and hand entries (migration 132).
