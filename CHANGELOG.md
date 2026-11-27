@@ -13,6 +13,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Spreadsheet dates** — month and day names show in English, not Chinese.
+
 ### Security
 
 - **Chat page policy** — `/chat` alone may frame Curia's own pages, for attached spreadsheets.
