@@ -40,7 +40,7 @@ describe('console API authentication', () => {
     await app.register(budgetSheetsRoutes, { ...shared, sheets: {} as never });
     await app.ready();
 
-    expect(routes.length).toBeGreaterThanOrEqual(28);
+    expect(routes.length).toBeGreaterThanOrEqual(31);
     for (const { method, url } of routes) {
       expect(bypassesBearerAuth(url), url).toBe(true);
       const res = await app.inject({

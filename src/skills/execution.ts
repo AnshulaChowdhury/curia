@@ -314,6 +314,7 @@ export class ExecutionLayer {
   private booksReader?: import('../books/books-reader.js').BooksReader;
   private budgetReader?: import('../budget/budget-reader.js').BudgetReader;
   private budgetSheetReader?: import('../budget/sheet-reader.js').BudgetSheetReader;
+  private budgetProposer?: Pick<import('../budget/proposal-store.js').ProposalStore, 'propose'>;
   private taskRepo?: import('../db/task-repo.js').TaskRepo;
   private workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
   /** Backs the 'voiceSessions' capability (#2347). */
@@ -401,6 +402,7 @@ export class ExecutionLayer {
     booksReader?: import('../books/books-reader.js').BooksReader;
     budgetReader?: import('../budget/budget-reader.js').BudgetReader;
     budgetSheetReader?: import('../budget/sheet-reader.js').BudgetSheetReader;
+    budgetProposer?: Pick<import('../budget/proposal-store.js').ProposalStore, 'propose'>;
     taskRepo?: import('../db/task-repo.js').TaskRepo;
     workingDocsRepo?: import('../db/working-docs-repo.js').WorkingDocsRepo;
     /** Backs the 'voiceSessions' capability (#2347). */
@@ -466,6 +468,7 @@ export class ExecutionLayer {
     this.booksReader = options?.booksReader;
     this.budgetReader = options?.budgetReader;
     this.budgetSheetReader = options?.budgetSheetReader;
+    this.budgetProposer = options?.budgetProposer;
     this.taskRepo = options?.taskRepo;
     this.workingDocsRepo = options?.workingDocsRepo;
     this.voiceSessions = options?.voiceSessions;
@@ -526,6 +529,7 @@ export class ExecutionLayer {
       booksReader: this.booksReader,
       budgetReader: this.budgetReader,
       budgetSheetReader: this.budgetSheetReader,
+      budgetProposer: this.budgetProposer,
       taskRepo: this.taskRepo,
       workingDocs: this.workingDocsRepo,
       voiceSessions: this.voiceSessions,

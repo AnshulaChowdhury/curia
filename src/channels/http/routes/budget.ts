@@ -2,7 +2,9 @@
 //
 //   GET    /api/budget/categories[?archived=1]      — the categories with their monthly budgets, and the archived ones if asked
 //   POST   /api/budget/categories                   — add one
-//   PATCH  /api/budget/categories/:id               — rename, change the budget or rollover
+//   PATCH  /api/budget/categories/:id               — rename, change the type, usual budget or rollover
+//   PUT    /api/budget/categories/:id/months/:month — one month's own budget ({cents}); null returns to the usual one
+//   GET    /api/budget/plan?from=YYYY-MM&months=N   — what each open category is budgeted, month by month
 //   POST   /api/budget/categories/:id/archive       — close it to new transactions; the ones it has keep it
 //   DELETE /api/budget/categories/:id               — remove it, only when it has no transactions (409 otherwise)
 //   GET    /api/budget/summary?month=YYYY-MM        — spent against budget per category, and what needs the owner
@@ -26,7 +28,7 @@ import { ImportError, parseBankFile } from '../../../budget/import-parser.js';
 
 export interface BudgetRouteOptions {
   logger: Logger;
-  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'archiveCategory' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
+  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'archiveCategory' | 'setMonthAmount' | 'plan' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -94,6 +96,28 @@ export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOpt
     try {
       await store.deleteCategory(request.params.id);
       return noStore(reply).send({ ok: true });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.put<{ Params: { id: string; month: string }; Body: Body }>('/api/budget/categories/:id/months/:month', RATE, async (request, reply) => {
+    if (!owner(request, reply) || !goodId(reply, request.params.id)) return reply;
+    const cents = request.body?.['cents'];
+    if (cents === undefined) return reply.status(400).send({ error: 'cents must be a whole number of cents, or null' });
+    try {
+      await store.setMonthAmount(request.params.id, request.params.month, cents);
+      return noStore(reply).send({ ok: true });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.get<{ Querystring: { from?: string; months?: string } }>('/api/budget/plan', RATE, async (request, reply) => {
+    if (!owner(request, reply)) return reply;
+    try {
+      const from = request.query.from ?? new Date().toISOString().slice(0, 7);
+      return noStore(reply).send(await store.plan(from, request.query.months === undefined ? undefined : Number(request.query.months)));
     } catch (err) {
       return fail(reply, err);
     }

@@ -4406,3 +4406,17 @@ table.records-table tbody tr.active td { background: transparent; }
 .sheet-grid { position: relative; flex: 1; min-height: 0; background: #fff; color: #111; }
 .sheet-host { position: absolute; inset: 0; }
 .sheet-converter { position: absolute; width: 0; height: 0; border: 0; }
+
+/* Budgets month by month */
+.bud-plan tbody th { text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--app-fg); text-align: left; padding: 4px 10px 4px 0; border-bottom: 0; }
+.bud-plan .bud-plan-group th { padding-top: 14px; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--app-fg-muted); }
+.bud-plan .bud-plan-total th, .bud-plan .bud-plan-total td { font-weight: 600; padding-top: 6px; padding-bottom: 6px; border-top: 1px solid var(--app-border); }
+.bud-plan td { padding-top: 4px; padding-bottom: 4px; }
+.bud-plan .bud-plan-input { width: 104px; text-align: right; }
+
+/* Proposed budget changes, above the message box */
+.chat-proposal { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; padding: 10px 14px; background: var(--app-card); border: 1px solid var(--app-border); border-radius: 8px; font-size: 13px; }
+.chat-proposal.is-waiting { display: flex; flex-direction: column; align-items: stretch; border-color: var(--app-primary); }
+.chat-proposal h2, .chat-proposal p { margin: 0; }
+.chat-proposal-scroll { max-height: 34vh; overflow: auto; }
+.chat-proposal td { white-space: nowrap; padding-right: 10px; }

@@ -21,12 +21,17 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Budgets by month** — income, expense and savings categories, edited month by month (migration 136).
+- **`budget-plan`** — the budget agent reads budgeted amounts month by month.
+- **Budget changes from chat** — the assistant proposes; the owner approves a card (migration 137).
+- **`ToolContext.budgetProposer`** — **public API:** new capability that writes proposals only.
 - **Spreadsheets in chat** — attach a budget file; the budget agent reads it (migration 135).
 - **`ToolContext.budgetSheetReader`** — **public API:** new read-only capability for the attached spreadsheet.
 - **Budget spreadsheets** — open .xlsx or .csv files and edit them in Curia (migration 134).
 
 ### Changed
 
+- **Budget summary** — spending categories only; income and savings stay out of totals.
 - **Attached spreadsheet reading** — reads the whole file, hidden tabs included; **public API:** new inputs, outputs.
 - **Budget categories** — used ones archive and keep history; only empty ones delete (migration 133).
 - **Budget tabs** — net worth moves into Overview; categorising moves to Budgets.

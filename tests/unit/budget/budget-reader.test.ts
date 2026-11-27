@@ -14,6 +14,10 @@ function build() {
       totals: { budgetedCents: 50000, spentCents: 12345, uncategorisedSpentCents: 0 },
       needsYou: { uncategorised: 0, guesses: 1, overBudget: 0 },
     }),
+    plan: vi.fn().mockResolvedValue({
+      months: ['2031-03', '2031-04'],
+      categories: [{ categoryId: 'c9', name: 'Pay', kind: 'income', amounts: [{ cents: 123456, own: true }, { cents: null, own: false }] }],
+    }),
     listCategories: vi.fn().mockResolvedValue([CAT]),
     listTransactions: vi.fn().mockResolvedValue([TXN]),
   };
@@ -25,6 +29,13 @@ describe('BudgetReader', () => {
     const s = await build().reader.summary('2031-03');
     expect(s.categories[0]).toEqual({ name: 'Groceries', budgeted: 500, spent: 123.45, remaining: 376.55, state: 'under' });
     expect(s.totals).toEqual({ budgeted: 500, spent: 123.45, spentOnUncategorised: 0 });
+  });
+
+  it('gives the budget month by month in dollars, and keeps the number of months in range', async () => {
+    const { reader, store } = build();
+    expect(await reader.plan('2031-03', 99)).toEqual({ currency: 'CAD', months: ['2031-03', '2031-04'], categories: [{ name: 'Pay', type: 'income', amounts: { '2031-03': 1234.56, '2031-04': null } }] });
+    expect(store.plan).toHaveBeenCalledWith('2031-03', 24);
+    await expect(reader.plan('soon')).rejects.toThrow(/YYYY-MM/);
   });
 
   it('looks a category up by name, and returns nothing for an unknown one', async () => {
@@ -57,7 +68,7 @@ describe('BudgetReader', () => {
   it('has no method that changes anything', () => {
     const methods = Object.getOwnPropertyNames(BudgetReader.prototype).filter(m => m !== 'constructor').sort();
     // Adding a method that writes means changing ADR-062: this list is the review point.
-    expect(methods).toEqual(['clamp', 'needsReview', 'shape', 'summary', 'transactions']);
+    expect(methods).toEqual(['clamp', 'needsReview', 'plan', 'shape', 'summary', 'transactions']);
   });
 });
 

@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { BudgetShell, BudgetGate } from './BudgetShell.js';
 import { ReconcileSection } from './ReconcilePanel.js';
+import { PlanGrid } from './PlanGrid.js';
 import { budgetClient, type BudgetLoad, type ReconcileData } from './budget-data.js';
 import {
-  currentMonth, isMonth, formatCents, centsToDollarInput, validateDraft,
-  type BudgetCategory, type CategoryDraft,
+  currentMonth, isMonth, formatCents, centsToDollarInput, validateDraft, KIND_LABEL,
+  type BudgetCategory, type CategoryDraft, type CategoryKind,
 } from './budget-utils.js';
 
-const EMPTY: CategoryDraft = { name: '', amount: '', rollover: false };
+const EMPTY: CategoryDraft = { name: '', kind: 'expense', amount: '', rollover: false };
 
 /** The month the overview linked here with, or this month. */
 export function monthFromSearch(search: string): string {
@@ -71,7 +72,7 @@ export default function BudgetsPage() {
 
   function startEdit(c: BudgetCategory) {
     setEditingId(c.id);
-    setDraft({ name: c.name, amount: c.monthlyCents === null ? '' : centsToDollarInput(c.monthlyCents), rollover: c.rollover });
+    setDraft({ name: c.name, kind: c.kind, amount: c.monthlyCents === null ? '' : centsToDollarInput(c.monthlyCents), rollover: c.rollover });
     setErrors({});
     setMessage(null);
   }
@@ -127,6 +128,17 @@ export default function BudgetsPage() {
     setBusy(false);
   }
 
+  async function setAmount(categoryId: string, m: string, cents: number | null) {
+    try {
+      await budgetClient.setMonthAmount(categoryId, m, cents);
+      setMessage(null);
+    } catch (err) {
+      console.error('budget month amount failed', err);
+      setMessage(`Could not save that amount. ${err instanceof Error ? err.message : ''}`);
+    }
+    await refresh();
+  }
+
   return (
     <BudgetShell active="/budget/budgets">
       <BudgetGate load={load} />
@@ -134,6 +146,10 @@ export default function BudgetsPage() {
         <>
           <ReconcileSection month={month} data={data.month === month ? data : null} busy={busy} error={reviewError}
             onMonth={setMonth} onCategorise={(id, c) => void categorise(id, c)} />
+
+          {data.month === month && <PlanGrid plan={data.plan} onSet={(id, m, cents) => void setAmount(id, m, cents)} />}
+
+          {message && <p className="bud-hint" role="status">{message}</p>}
 
           <form className="dash-card" onSubmit={e => void submit(e)} noValidate aria-labelledby="bud-form-h">
             <h2 id="bud-form-h" className="dash-card-title">{editingId ? 'Edit budget' : 'Add a budget'}</h2>
@@ -153,7 +169,15 @@ export default function BudgetsPage() {
                 {errors.name && <span id="bud-name-err" className="bud-err" role="alert">{errors.name}</span>}
               </label>
               <label className="bud-field">
-                <span>Monthly amount (CAD)</span>
+                <span>Type</span>
+                <select className="bud-input" value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value as CategoryKind })}>
+                  <option value="expense">Expense</option>
+                  <option value="income">Income</option>
+                  <option value="savings">Savings</option>
+                </select>
+              </label>
+              <label className="bud-field">
+                <span>Usual monthly amount (CAD)</span>
                 <input
                   className="bud-input"
                   type="text"
@@ -181,22 +205,21 @@ export default function BudgetsPage() {
             </label>
           </form>
 
-          {message && <p className="bud-hint" role="status">{message}</p>}
-
           <section className="dash-card" aria-labelledby="bud-list-h">
-            <h2 id="bud-list-h" className="dash-card-title">Budgets</h2>
+            <h2 id="bud-list-h" className="dash-card-title">Categories</h2>
             {categories.length === 0 ? (
               <p className="bud-hint">No budgets yet. Add your first one above.</p>
             ) : (
               <div className="bud-table-wrap"><table className="bud-table">
                 <thead>
-                  <tr><th scope="col">Category</th><th scope="col" className="bud-right">Per month</th><th scope="col">Rollover</th><th scope="col"><span className="bud-sr">Actions</span></th></tr>
+                  <tr><th scope="col">Category</th><th scope="col">Type</th><th scope="col" className="bud-right">Usual per month</th><th scope="col">Rollover</th><th scope="col"><span className="bud-sr">Actions</span></th></tr>
                 </thead>
                 <tbody>
                   {categories.map(c => (
                     <tr key={c.id}>
                       <td className="bud-name">{c.name}</td>
-                      <td className="bud-right">{c.monthlyCents === null ? 'No budget' : formatCents(c.monthlyCents)}</td>
+                      <td>{KIND_LABEL[c.kind]}</td>
+                      <td className="bud-right">{c.monthlyCents === null ? 'Set by month' : formatCents(c.monthlyCents)}</td>
                       <td>{c.rollover ? 'Yes' : 'No'}</td>
                       <td className="bud-right"><RetireActions c={c} confirming={confirmId === c.id}
                         onAsk={() => setConfirmId(c.id)} onKeep={() => setConfirmId(null)} onConfirm={() => void retire(c)}

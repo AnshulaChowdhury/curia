@@ -3,9 +3,18 @@
 // Bank text (payee, description) is untrusted: callers render it as text only.
 
 // The shapes below mirror what the server returns (src/budget/budget-store.ts).
+export type CategoryKind = 'expense' | 'income' | 'savings';
+export const KIND_LABEL: Record<CategoryKind, string> = { income: 'Income', expense: 'Expenses', savings: 'Savings' };
+
+export interface BudgetPlan {
+  months: string[];
+  categories: Array<{ categoryId: string; name: string; kind: CategoryKind; amounts: Array<{ cents: number | null; own: boolean }> }>;
+}
+
 export interface BudgetCategory {
   id: string;
   name: string;
+  kind: CategoryKind;
   monthlyCents: number | null; // null = no budget set
   rollover: boolean;
   /** Archived: keeps its transactions, takes no new ones. */
@@ -175,12 +184,12 @@ export function groupAccounts(accounts: BudgetAccount[], side: 'asset' | 'debt')
 
 // ---- Category validation (Budgets page) ----
 
-export interface CategoryDraft { name: string; amount: string; rollover: boolean }
+export interface CategoryDraft { name: string; kind: CategoryKind; amount: string; rollover: boolean }
 
 export interface DraftResult {
   ok: boolean;
   errors: { name?: string; amount?: string };
-  value?: { name: string; monthlyCents: number; rollover: boolean };
+  value?: { name: string; kind: CategoryKind; monthlyCents: number; rollover: boolean };
 }
 
 export function validateDraft(draft: CategoryDraft, existing: BudgetCategory[], editingId: string | null): DraftResult {
@@ -194,5 +203,5 @@ export function validateDraft(draft: CategoryDraft, existing: BudgetCategory[], 
   const cents = parseDollarsToCents(draft.amount);
   if (cents === null) errors.amount = 'Enter an amount like 250 or 250.00.';
   if (errors.name || errors.amount || cents === null) return { ok: false, errors };
-  return { ok: true, errors, value: { name, monthlyCents: cents, rollover: draft.rollover } };
+  return { ok: true, errors, value: { name, kind: draft.kind, monthlyCents: cents, rollover: draft.rollover } };
 }

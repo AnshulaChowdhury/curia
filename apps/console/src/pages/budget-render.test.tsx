@@ -9,6 +9,7 @@ import { monthFromSearch, RetireActions } from './BudgetsPage.js';
 import { ActionItems, SpendingPanel, StatusColumn, Tiles, CategoryBar } from './BudgetDashboard.js';
 import type { DashboardData } from './budget-data.js';
 import { NetWorthSummary, SideCard } from './NetWorthPanel.js';
+import { PlanGrid } from './PlanGrid.js';
 
 describe('MoneyCard', () => {
   const summary = {
@@ -34,7 +35,7 @@ describe('overview', () => {
     const html = renderToStaticMarkup(
       <ReviewList
         txns={[{ id: 't', account: 'Card', date: '2031-03-02', payee: '<b>MARKET</b>', description: '', amountCents: -2400, categoryId: null, source: null }]}
-        categories={[{ id: 'c', name: 'Groceries', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0 }]}
+        categories={[{ id: 'c', name: 'Groceries', kind: 'expense', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0 }]}
         busy={false}
         onCategorise={() => {}}
       />,
@@ -47,7 +48,7 @@ describe('overview', () => {
 
 describe('archived categories', () => {
   const category = (over: Partial<{ archived: boolean; transactionCount: number }>) =>
-    ({ id: 'c', name: 'Old', monthlyCents: 100, rollover: false, archived: false, transactionCount: 0, ...over });
+    ({ id: 'c', name: 'Old', kind: 'expense' as const, monthlyCents: 100, rollover: false, archived: false, transactionCount: 0, ...over });
   const actions = (transactionCount: number, confirming = false) => renderToStaticMarkup(
     <RetireActions c={category({ transactionCount })} confirming={confirming} onAsk={() => {}} onKeep={() => {}} onConfirm={() => {}} />);
 
@@ -154,5 +155,22 @@ describe('net worth', () => {
   });
   it('says when accounts are left out of the totals', () => {
     expect(renderToStaticMarkup(<NetWorthSummary totals={data.totals} />)).toContain('1 account is not in these totals');
+  });
+});
+
+describe('budget by month', () => {
+  const cell = (cents: number | null) => ({ cents, own: true });
+  it('shows income, expenses and savings by month with totals and what is left over', () => {
+    const html = renderToStaticMarkup(<PlanGrid onSet={() => {}} plan={{ months: ['2031-03', '2031-04'], categories: [
+      { categoryId: 'a', name: '<i>Pay</i>', kind: 'income', amounts: [cell(500000), cell(600000)] },
+      { categoryId: 'b', name: 'Rent', kind: 'expense', amounts: [cell(200000), cell(null)] },
+      { categoryId: 'c', name: 'Nest egg', kind: 'savings', amounts: [cell(100000), cell(100000)] },
+    ] }} />);
+    expect(html).not.toContain('<i>');
+    for (const text of ['Income', 'Expenses', 'Savings', 'Total income', 'Left over', '$2,000.00', '$5,000.00', 'value="2000.00"']) expect(html).toContain(text);
+    expect(html.indexOf('Total income')).toBeLessThan(html.indexOf('Rent'));
+  });
+  it('says how to begin when there are no categories', () => {
+    expect(renderToStaticMarkup(<PlanGrid onSet={() => {}} plan={{ months: ['2031-03'], categories: [] }} />)).toContain('No categories yet');
   });
 });

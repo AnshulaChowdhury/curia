@@ -13,7 +13,7 @@ const ID = '11111111-1111-4111-8111-111111111111';
 async function app(over: Record<string, unknown> = {}) {
   const store = {
     listCategories: vi.fn(async () => []), createCategory: vi.fn(async () => ({ id: ID })), updateCategory: vi.fn(async () => ({ id: ID })),
-    deleteCategory: vi.fn(async () => undefined), archiveCategory: vi.fn(async () => ({ id: ID })), trend: vi.fn(async (asOf: string) => ({ asOf })), summary: vi.fn(async (month: string) => ({ month })), listTransactions: vi.fn(async () => []),
+    deleteCategory: vi.fn(async () => undefined), setMonthAmount: vi.fn(async () => undefined), plan: vi.fn(async (from: string, months?: number) => ({ from, months })), archiveCategory: vi.fn(async () => ({ id: ID })), trend: vi.fn(async (asOf: string) => ({ asOf })), summary: vi.fn(async (month: string) => ({ month })), listTransactions: vi.fn(async () => []),
     categorise: vi.fn(async () => 1), getRules: vi.fn(async () => ({ yaml: '', updatedAt: null })), putRules: vi.fn(async () => ({ updatedAt: 'x' })), addTransactions: vi.fn(async (items: unknown[]) => ({ added: items.length, duplicates: 0 })), ...over,
   };
   const a = Fastify();
@@ -29,6 +29,7 @@ describe('/api/budget', () => {
       ['DELETE', `/api/budget/categories/${ID}`], ['POST', `/api/budget/categories/${ID}/archive`], ['GET', '/api/budget/summary'], ['GET', '/api/budget/trend'], ['GET', '/api/budget/transactions'],
       ['PATCH', `/api/budget/transactions/${ID}`], ['POST', '/api/budget/transactions/bulk-categorise'],
       ['GET', '/api/budget/rules'], ['PUT', '/api/budget/rules'], ['POST', '/api/budget/imports'],
+      ['GET', '/api/budget/plan'], ['PUT', `/api/budget/categories/${ID}/months/2031-03`],
     ] as const) {
       expect((await a.inject({ method, url, payload: {} })).statusCode, `${method} ${url}`).toBe(401);
     }
@@ -44,6 +45,16 @@ describe('/api/budget', () => {
     expect((await a.inject({ method: 'POST', url: `/api/budget/categories/${ID}/archive`, headers: auth })).statusCode).toBe(200);
     expect(store.archiveCategory).toHaveBeenCalledWith(ID);
     expect((await a.inject({ method: 'DELETE', url: `/api/budget/categories/${ID}`, headers: auth })).statusCode).toBe(409);
+  });
+
+  it('reads the plan and sets one month, refusing a request with no amount', async () => {
+    const { a, store } = await app();
+    expect((await a.inject({ method: 'GET', url: '/api/budget/plan?from=2031-03&months=6', headers: auth })).json()).toEqual({ from: '2031-03', months: 6 });
+    const url = `/api/budget/categories/${ID}/months/2031-04`;
+    expect((await a.inject({ method: 'PUT', url, headers: auth, payload: {} })).statusCode).toBe(400);
+    expect(store.setMonthAmount).not.toHaveBeenCalled();
+    expect((await a.inject({ method: 'PUT', url, headers: auth, payload: { cents: null } })).statusCode).toBe(200);
+    expect(store.setMonthAmount).toHaveBeenCalledWith(ID, '2031-04', null);
   });
 
   it('returns the history as of the date asked', async () => {
