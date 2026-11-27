@@ -1,6 +1,6 @@
 # Personal budget in the console: plan and proposed API
 
-Status: draft for web_dev. Front end only. Fixture data only, no backend, no migrations.
+Status: Overview, Budgets and Import read and write the real `/api/budget/*` routes. The server's summary is the only source of spending totals and states; rollover is saved but not counted yet. The sections below are the original plan.
 
 Personal finance is separate from the MowMow business books (the Books page). Owner-only.
 

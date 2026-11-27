@@ -24,7 +24,7 @@ export default function BudgetConnectBankPage() {
   }
 
   return (
-    <BudgetShell active="/budget/import" live>
+    <BudgetShell active="/budget/import">
       <section className="dash-card bud-form">
         <h3 className="dash-card-title">Connect a bank</h3>
         <p className="dash-card-quiet">Plaid opens a secure window. Your bank login goes to your bank through Plaid and never reaches this app.</p>

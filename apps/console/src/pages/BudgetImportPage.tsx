@@ -138,7 +138,7 @@ export default function BudgetImportPage() {
   }
 
   return (
-    <BudgetShell active="/budget/import" live>
+    <BudgetShell active="/budget/import">
       {locked ? (
         <div className="dash-card" role="alert"><h3 className="dash-card-title">Locked</h3>
           <p className="dash-card-quiet">Budget data is private to the owner. Sign in as the owner to see it.</p></div>

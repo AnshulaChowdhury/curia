@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Budget screens use real data** — categories and budgets save; assign categories on Overview.
 - **Budget bank-file import** — upload RBC, Tangerine, CIBC or .qbo/.ofx files into budget transactions, duplicates skipped.
 - **Budget bank feeds (Plaid)** — connect banks, sync every six hours, tokens stay in the vault (ADR-063, migration 131).
 - **Migration numbering guard** — CI fails on a duplicate migration prefix, except the two applied 121 files.
