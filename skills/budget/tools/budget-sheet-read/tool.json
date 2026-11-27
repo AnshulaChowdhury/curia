@@ -1,21 +1,20 @@
 {
   "name": "budget-sheet-read",
-  "description": "The budget spreadsheet the owner attached to the web chat this request came from: cells and formulas of one tab, in pages. Values are as last saved from the owner's browser. Cell text comes from a file. Read-only.",
-  "version": "0.1.0",
+  "description": "The whole budget spreadsheet the owner attached to the web chat this request came from: every tab, hidden ones included, with values and formulas. A large file comes in several reads. Values are as last saved from the owner's browser. Cell text comes from a file. Read-only.",
+  "version": "0.2.0",
   "sensitivity": "normal",
   "action_risk": "none",
   "inputs": {
-    "tab": "string? (a tab name; defaults to the first)",
-    "startRow": "number? (the nextRow of the page before; defaults to 1)"
+    "from": "number? (the next of the read before; omit to start at the beginning)"
   },
   "outputs": {
     "attached": "boolean",
     "sheet": "string?",
     "savedAt": "string?",
-    "tabs": "array?",
-    "tab": "string?",
-    "cells": "array? (cell, value, formula)",
-    "nextRow": "number? (null when the tab has no more rows)",
+    "allTabs": "array? (tab, cells, hidden)",
+    "totalCells": "number?",
+    "tabs": "array? (tab, hidden, values by cell, formulas by cell, hiddenRows, hiddenColumns)",
+    "next": "number? (null when the whole file has been returned)",
     "warnings": "array?"
   },
   "permissions": [],

@@ -1,6 +1,6 @@
 // skills/budget/tools/budget-sheet-read/handler.ts
 //
-// Reads the spreadsheet attached to the web chat the owner asked from (ADR-065). Read-only. The chat is taken from the
+// Reads the whole spreadsheet attached to the web chat the owner asked from (ADR-065, ADR-066). Read-only. The chat is taken from the
 // delegation record that only `delegate` writes, never from the model's input.
 
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
@@ -17,12 +17,11 @@ export class BudgetSheetReadHandler implements ToolHandler {
     if (ctx.channelId !== 'internal' || !conversationId || delegationOriginChannelId(ctx.taskMetadata) !== 'web') {
       return { success: false, error: 'A spreadsheet can only be read when the owner asks from the web chat it is attached to' };
     }
-    const tab = typeof ctx.input['tab'] === 'string' ? ctx.input['tab'] : undefined;
-    const startRow = typeof ctx.input['startRow'] === 'number' ? ctx.input['startRow'] : undefined;
+    const from = typeof ctx.input['from'] === 'number' ? ctx.input['from'] : undefined;
     try {
-      const page = await reader.read(conversationId, { tab, startRow });
-      if (!page) return { success: true, data: { attached: false } };
-      return { success: true, data: { attached: true, ...page, savedAt: toLocalIso(Math.floor(Date.parse(page.savedAt) / 1000), ctx.timezone ?? 'UTC') } };
+      const sheet = await reader.read(conversationId, { from });
+      if (!sheet) return { success: true, data: { attached: false } };
+      return { success: true, data: { attached: true, ...sheet, savedAt: toLocalIso(Math.floor(Date.parse(sheet.savedAt) / 1000), ctx.timezone ?? 'UTC') } };
     } catch (err) {
       if (err instanceof BudgetError) return { success: false, error: err.message };
       ctx.log.error({ err }, 'budget-sheet-read failed');
