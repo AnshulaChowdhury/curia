@@ -266,8 +266,8 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
     item('contacts', 'Contacts', <IconPerson />, true),
     item('tasks', 'Tasks', <IconChecklist />, true),
     item('jobs', 'Scheduled Jobs', <IconClock />, true),
-    item('books', 'Books', <IconDocument />, true),
-    item('budget', 'Budget', <IconChecklist />, true),
+    item('books', 'Company Books', <IconDocument />, true),
+    item('budget', 'Household Budget', <IconChecklist />, true),
   ];
   const settingsItems = [
     item('tools', 'Tools', <IconWand />, true),

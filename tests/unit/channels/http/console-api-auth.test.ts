@@ -7,6 +7,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { bypassesBearerAuth } from '../../../../src/channels/http/auth.js';
 import { budgetRoutes } from '../../../../src/channels/http/routes/budget.js';
 import { budgetBanksRoutes } from '../../../../src/channels/http/routes/budget-banks.js';
+import { budgetAccountsRoutes } from '../../../../src/channels/http/routes/budget-accounts.js';
 import type { Logger } from '../../../../src/logger.js';
 import type { SessionStore } from '../../../../src/channels/http/session-auth.js';
 
@@ -34,9 +35,10 @@ describe('console API authentication', () => {
     const shared = { logger, webAppBootstrapSecret: 'a-long-bootstrap-secret-for-tests-0123456789', sessions: new Map() as SessionStore };
     await app.register(budgetRoutes, { ...shared, store: {} as never });
     await app.register(budgetBanksRoutes, { ...shared, sync: {} as never, plaid: {} as never });
+    await app.register(budgetAccountsRoutes, { ...shared, accounts: {} as never });
     await app.ready();
 
-    expect(routes.length).toBeGreaterThanOrEqual(17);
+    expect(routes.length).toBeGreaterThanOrEqual(21);
     for (const { method, url } of routes) {
       expect(bypassesBearerAuth(url), url).toBe(true);
       const res = await app.inject({

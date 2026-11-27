@@ -271,6 +271,7 @@ import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.j
 import { BooksReader } from './books/books-reader.js';
 import { BudgetReader } from './budget/budget-reader.js';
 import { BudgetStore } from './budget/budget-store.js';
+import { AccountStore } from './budget/accounts-store.js';
 import { BooksRunner } from './books/books-runner.js';
 import { BankSync, BankSyncRunner } from './budget/bank-sync.js';
 import { PlaidClient, plaidCredentialsFrom } from './budget/plaid-client.js';
@@ -3299,7 +3300,7 @@ async function main(): Promise<void> {
 
   // Bank feeds for the personal budget (Plaid). Idle until plaid_client_id and plaid_secret are in the vault.
   const plaidClient = new PlaidClient({ credentials: () => plaidCredentialsFrom(secretsService) });
-  const bankSync = new BankSync({ pool, plaid: plaidClient, secrets: secretsService, budget: new BudgetStore(pool), logger });
+  const bankSync = new BankSync({ pool, plaid: plaidClient, secrets: secretsService, budget: new BudgetStore(pool), balances: new AccountStore(pool), logger });
   const bankSyncRunner = new BankSyncRunner(bankSync, plaidClient, logger);
   bankSyncRunner.start();
 

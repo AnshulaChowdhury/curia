@@ -121,6 +121,45 @@ export interface MoneySummary {
   needsYouCount: number;
 }
 
+// ---- Assets and debts (Net worth page) ----
+
+export const ASSET_LABELS = { cash: 'Cash', investment: 'Investments', property: 'Property', vehicle: 'Vehicles', other_asset: 'Other assets' } as const;
+export const DEBT_LABELS = { credit_card: 'Credit cards', line_of_credit: 'Lines of credit', mortgage: 'Mortgages', loan: 'Loans', other_debt: 'Other debts' } as const;
+export type AccountType = keyof typeof ASSET_LABELS | keyof typeof DEBT_LABELS;
+
+export interface BudgetAccount {
+  id: string;
+  source: 'bank' | 'manual';
+  institution: string;
+  name: string;
+  mask: string | null;
+  type: AccountType;
+  side: 'asset' | 'debt';
+  currency: string;
+  balanceCents: number | null;
+  asOf: string;
+}
+
+export interface NetWorth {
+  accounts: BudgetAccount[];
+  totals: { assetsCents: number; debtsCents: number; netCents: number; leftOut: number };
+}
+
+export interface AccountGroup { type: AccountType; label: string; totalCents: number; accounts: BudgetAccount[] }
+
+/** Whether a balance is part of the totals: the server adds up only Canadian-dollar rows that have one. */
+export const counted = (a: BudgetAccount): boolean => a.balanceCents !== null && a.currency === 'CAD';
+
+/** One side of the sheet, grouped by kind in a fixed order, largest balance first within a kind. */
+export function groupAccounts(accounts: BudgetAccount[], side: 'asset' | 'debt'): AccountGroup[] {
+  const labels: Record<string, string> = side === 'asset' ? ASSET_LABELS : DEBT_LABELS;
+  return (Object.keys(labels) as AccountType[]).flatMap(type => {
+    const rows = accounts.filter(a => a.side === side && a.type === type).sort((a, b) => (b.balanceCents ?? 0) - (a.balanceCents ?? 0));
+    if (rows.length === 0) return [];
+    return [{ type, label: labels[type]!, totalCents: rows.filter(counted).reduce((n, a) => n + a.balanceCents!, 0), accounts: rows }];
+  });
+}
+
 // ---- Category validation (Budgets page) ----
 
 export interface CategoryDraft { name: string; amount: string; rollover: boolean }

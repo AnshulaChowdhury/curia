@@ -39,6 +39,7 @@ const JobsPage = lazy(() => import('./pages/JobsPage'));
 const BooksReviewPage = lazy(() => import('./pages/BooksReviewPage'));
 const BudgetOverviewPage = lazy(() => import('./pages/BudgetOverviewPage'));
 const BudgetsPage = lazy(() => import('./pages/BudgetsPage'));
+const NetWorthPage = lazy(() => import('./pages/NetWorthPage'));
 const BudgetConnectBankPage = lazy(() => import('./pages/BudgetConnectBankPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const KgPage = lazy(() => import('./pages/KgPage'));
@@ -231,6 +232,12 @@ const budgetBudgetsRoute = createRoute({
   component: BudgetsPage,
 });
 
+const budgetNetWorthRoute = createRoute({
+  getParentRoute: () => authedRoute,
+  path: '/budget/net-worth',
+  component: NetWorthPage,
+});
+
 const budgetImportRoute = createRoute({
   getParentRoute: () => authedRoute,
   path: '/budget/import',
@@ -323,6 +330,7 @@ const routeTree = rootRoute.addChildren([
     budgetRoute,
     budgetBudgetsRoute,
     budgetImportRoute,
+    budgetNetWorthRoute,
     budgetConnectBankRoute,
     jobDetailRoute,
     tasksRoute,

@@ -111,6 +111,8 @@ import { booksBatchRoutes } from './routes/books-batches.js';
 import { booksRunRoutes } from './routes/books-run.js';
 import { budgetRoutes } from './routes/budget.js';
 import { budgetBanksRoutes } from './routes/budget-banks.js';
+import { budgetAccountsRoutes } from './routes/budget-accounts.js';
+import { AccountStore } from '../../budget/accounts-store.js';
 import { BudgetStore } from '../../budget/budget-store.js';
 import { booksGraphRoutes } from './routes/books-graph.js';
 import { GraphSnapshotStore } from '../../books/graph-store.js';
@@ -840,6 +842,7 @@ export class HttpAdapter implements Channel {
         });
       }
       await this.app.register(budgetRoutes, { logger, store: new BudgetStore(pool), webAppBootstrapSecret, sessions });
+      await this.app.register(budgetAccountsRoutes, { logger, accounts: new AccountStore(pool), webAppBootstrapSecret, sessions });
       if (this.config.budgetBanks) {
         await this.app.register(budgetBanksRoutes, { logger, ...this.config.budgetBanks, webAppBootstrapSecret, sessions });
       }

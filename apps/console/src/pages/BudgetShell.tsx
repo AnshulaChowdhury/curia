@@ -6,9 +6,10 @@ import { Topbar } from '../components/Topbar.js';
 import { useTheme } from '../hooks/useTheme.js';
 import type { BudgetLoad } from './budget-data.js';
 
-const TABS: Array<{ to: '/budget' | '/budget/budgets'; label: string }> = [
+const TABS: Array<{ to: '/budget' | '/budget/budgets' | '/budget/net-worth'; label: string }> = [
   { to: '/budget', label: 'Overview' },
   { to: '/budget/budgets', label: 'Budgets' },
+  { to: '/budget/net-worth', label: 'Net worth' },
 ];
 
 /** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions and Rules join the tabs later; importing lives on the overview. */

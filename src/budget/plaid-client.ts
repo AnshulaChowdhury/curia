@@ -4,7 +4,12 @@
 // restart. Errors carry Plaid's error code and a short message only, never the request body (it holds the secret).
 
 export interface PlaidCredentials { clientId: string; secret: string; env: 'sandbox' | 'production' }
-export interface PlaidAccount { account_id: string; name: string; official_name?: string | null; mask?: string | null }
+export interface PlaidAccount {
+  account_id: string; name: string; official_name?: string | null; mask?: string | null;
+  type?: string; subtype?: string | null;
+  /** current: money held for a deposit account, money owed for a card or loan. */
+  balances?: { current: number | null; available?: number | null; iso_currency_code?: string | null };
+}
 export interface PlaidTransaction {
   transaction_id: string; account_id: string; date: string; amount: number; pending: boolean;
   name: string; merchant_name?: string | null; iso_currency_code?: string | null;
@@ -60,6 +65,11 @@ export class PlaidClient {
 
   async sync(accessToken: string, cursor: string | null): Promise<SyncPage> {
     return this.call<SyncPage>('/transactions/sync', { access_token: accessToken, ...(cursor ? { cursor } : {}), count: 500 });
+  }
+
+  /** Every account on the connection with the balances Plaid last saw (no paid real-time lookup). */
+  async accounts(accessToken: string): Promise<PlaidAccount[]> {
+    return (await this.call<{ accounts: PlaidAccount[] }>('/accounts/get', { access_token: accessToken })).accounts;
   }
 
   async removeItem(accessToken: string): Promise<void> {
