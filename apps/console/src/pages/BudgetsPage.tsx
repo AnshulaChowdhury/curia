@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { BudgetShell, BudgetGate } from './BudgetShell.js';
-import { budgetSource, type BudgetLoad } from './budget-data.js';
+import { budgetClient, type BudgetLoad } from './budget-data.js';
 import {
   formatCents, centsToDollarInput, validateDraft,
   type BudgetCategory, type CategoryDraft,
@@ -9,7 +9,7 @@ import {
 const EMPTY: CategoryDraft = { name: '', amount: '', rollover: false };
 
 export default function BudgetsPage() {
-  const [load, setLoad] = useState<BudgetLoad | null>(null);
+  const [load, setLoad] = useState<BudgetLoad<BudgetCategory[]> | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<CategoryDraft>(EMPTY);
   const [errors, setErrors] = useState<{ name?: string; amount?: string }>({});
@@ -17,20 +17,15 @@ export default function BudgetsPage() {
   const [message, setMessage] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    try {
-      setLoad(await budgetSource.load());
-    } catch (e) {
-      console.error('budget load failed', e);
-      setLoad({ state: 'error', message: 'Could not load the budget.' });
-    }
+    setLoad(await budgetClient.loadCategories());
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
 
-  const categories: BudgetCategory[] = load?.state === 'ok' ? load.categories : [];
+  const categories: BudgetCategory[] = load?.state === 'ok' ? load.data : [];
 
   function startEdit(c: BudgetCategory) {
     setEditingId(c.id);
-    setDraft({ name: c.name, amount: centsToDollarInput(c.monthlyCents), rollover: c.rollover });
+    setDraft({ name: c.name, amount: c.monthlyCents === null ? '' : centsToDollarInput(c.monthlyCents), rollover: c.rollover });
     setErrors({});
     setMessage(null);
   }
@@ -47,19 +42,19 @@ export default function BudgetsPage() {
     setErrors(result.errors);
     if (!result.ok || !result.value) return;
     try {
-      await budgetSource.saveCategory({ id: editingId, ...result.value });
+      await budgetClient.saveCategory({ id: editingId, ...result.value });
       setMessage(editingId ? `Saved ${result.value.name}.` : `Added ${result.value.name}.`);
       reset();
       await refresh();
     } catch (err) {
       console.error('budget save failed', err);
-      setMessage('Could not save the category.');
+      setMessage(`Could not save the category. ${err instanceof Error ? err.message : ''}`);
     }
   }
 
   async function remove(c: BudgetCategory) {
     try {
-      await budgetSource.deleteCategory(c.id);
+      await budgetClient.deleteCategory(c.id);
       setMessage(`Deleted ${c.name}. Its transactions are now uncategorised.`);
       setConfirmId(null);
       if (editingId === c.id) reset();
@@ -108,7 +103,7 @@ export default function BudgetsPage() {
                   checked={draft.rollover}
                   onChange={e => setDraft({ ...draft, rollover: e.target.checked })}
                 />
-                <span>Carry unspent money into next month</span>
+                <span>Carry unspent money into next month (saved, not counted in totals yet)</span>
               </label>
             </div>
             <div className="bud-actions">
@@ -132,7 +127,7 @@ export default function BudgetsPage() {
                   {categories.map(c => (
                     <tr key={c.id}>
                       <td>{c.name}</td>
-                      <td style={{ textAlign: 'right' }}>{formatCents(c.monthlyCents)}</td>
+                      <td style={{ textAlign: 'right' }}>{c.monthlyCents === null ? 'No budget' : formatCents(c.monthlyCents)}</td>
                       <td>{c.rollover ? 'Yes' : 'No'}</td>
                       <td className="bud-row-actions">
                         {confirmId === c.id ? (

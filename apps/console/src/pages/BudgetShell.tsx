@@ -12,8 +12,8 @@ const TABS: Array<{ to: '/budget' | '/budget/budgets' | '/budget/import'; label:
   { to: '/budget/import', label: 'Import' },
 ];
 
-/** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions, Import and Rules join the tabs later. */
-export function BudgetShell({ active, children, live = false }: { active: string; children: ReactNode; live?: boolean }) {
+/** Layout shared by the budget pages: sidebar, topbar, and a tab bar. Transactions and Rules join the tabs later. */
+export function BudgetShell({ active, children }: { active: string; children: ReactNode }) {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -41,11 +41,6 @@ export function BudgetShell({ active, children, live = false }: { active: string
             ))}
           </nav>
           <div className="bud-body">
-            {!live && (
-              <p className="bud-fixture-note" role="note">
-                Sample data only. Nothing here is real, and nothing is saved when you reload.
-              </p>
-            )}
             {children}
           </div>
         </main>
@@ -55,7 +50,7 @@ export function BudgetShell({ active, children, live = false }: { active: string
 }
 
 /** Shown when the server answers 401 or 403, or fails. Never renders partial data. */
-export function BudgetGate({ load }: { load: BudgetLoad | null }) {
+export function BudgetGate({ load }: { load: BudgetLoad<unknown> | null }) {
   if (!load) return <p className="dash-card-quiet" role="status">Loading…</p>;
   if (load.state === 'locked') {
     return (

@@ -4149,7 +4149,6 @@ table.records-table tbody tr.active td { background: transparent; }
 .bud-tab:focus-visible { outline: 2px solid var(--app-primary); outline-offset: -2px; }
 .bud-tab.is-active { color: var(--app-fg); border-bottom-color: var(--app-primary); font-weight: 600; }
 .bud-body { display: flex; flex-direction: column; gap: 16px; padding: 16px; max-width: 880px; width: 100%; box-sizing: border-box; }
-.bud-fixture-note { margin: 0; font-size: 12px; color: var(--app-fg-muted); }
 .bud-month { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .bud-month-label input, .bud-field input[type="text"] {
   padding: 6px 8px; font: inherit; font-size: 13px; color: var(--app-fg);

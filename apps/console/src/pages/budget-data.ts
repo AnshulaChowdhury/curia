@@ -1,14 +1,25 @@
-// Thin data-access layer for the budget pages. Pages never fetch directly, so swapping the fixture
-// source for the real /api/budget/* routes (owned by web_dev) is a change to this file only.
+// Data access for the budget pages: the owner-only /api/budget/* routes. Pages never fetch directly.
 //
-// Owner-only: a 401 or 403 from the server means "locked". The pages show a locked state and never partial data.
-import { FIXTURE_CATEGORIES, FIXTURE_TXNS } from './budget-fixtures.js';
-import type { BudgetCategory, BudgetTxn } from './budget-utils.js';
+// The server computes the month's summary, so the console, the morning brief and the budget specialist show the same
+// numbers; nothing here recalculates spending. A 401 or 403 means "locked": the pages never show partial data.
+import { apiFetch } from '../api.js';
+import type { BudgetCategory, BudgetSummary, BudgetTxn } from './budget-utils.js';
 
-export type BudgetLoad =
-  | { state: 'ok'; categories: BudgetCategory[]; txns: BudgetTxn[] }
+type Fetcher = (path: string, init?: RequestInit) => Promise<Response>;
+
+export type BudgetLoad<T> =
+  | { state: 'ok'; data: T }
   | { state: 'locked' }
   | { state: 'error'; message: string };
+
+export interface MonthData {
+  categories: BudgetCategory[];
+  summary: BudgetSummary;
+  /** This month's transactions with no category, or a guess the owner has not confirmed. */
+  review: BudgetTxn[];
+}
+
+export interface CategoryInput { id: string | null; name: string; monthlyCents: number; rollover: boolean }
 
 /** Map an HTTP status to a load state. 401 and 403 are treated the same: locked. */
 export function stateForStatus(status: number): 'ok' | 'locked' | 'error' {
@@ -16,41 +27,57 @@ export function stateForStatus(status: number): 'ok' | 'locked' | 'error' {
   return status >= 200 && status < 300 ? 'ok' : 'error';
 }
 
-export interface BudgetSource {
-  load(): Promise<BudgetLoad>;
-  saveCategory(input: { id: string | null; name: string; monthlyCents: number; rollover: boolean }): Promise<BudgetCategory>;
-  deleteCategory(id: string): Promise<void>;
+class RequestFailed extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
 }
 
-/** In-memory fixture source. Resets on reload; nothing is persisted or sent anywhere. */
-export function createFixtureSource(): BudgetSource {
-  let categories = FIXTURE_CATEGORIES.map(c => ({ ...c }));
-  const txns = FIXTURE_TXNS.map(t => ({ ...t }));
-  let seq = 0;
+export function createBudgetClient(f: Fetcher = apiFetch) {
+  async function call<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+    const res = await f(path, {
+      method,
+      ...(body === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    });
+    if (!res.ok) {
+      const reply = (await res.json().catch(() => null)) as { error?: unknown } | null;
+      throw new RequestFailed(typeof reply?.error === 'string' ? reply.error : 'Something went wrong.', res.status);
+    }
+    return (await res.json()) as T;
+  }
+
+  async function load<T>(read: () => Promise<T>): Promise<BudgetLoad<T>> {
+    try {
+      return { state: 'ok', data: await read() };
+    } catch (e) {
+      if (e instanceof RequestFailed && stateForStatus(e.status) === 'locked') return { state: 'locked' };
+      console.error('budget load failed', e);
+      return { state: 'error', message: 'Could not load the budget.' };
+    }
+  }
+
+  const categories = async () => (await call<{ categories: BudgetCategory[] }>('/api/budget/categories')).categories;
+
   return {
-    async load() {
-      return { state: 'ok', categories: categories.map(c => ({ ...c })), txns: txns.map(t => ({ ...t })) };
+    loadCategories: () => load(categories),
+    loadMonth: (month: string) => load<MonthData>(async () => {
+      const m = encodeURIComponent(month);
+      const [cats, summary, review] = await Promise.all([
+        categories(),
+        call<BudgetSummary>(`/api/budget/summary?month=${m}`),
+        call<{ transactions: BudgetTxn[] }>(`/api/budget/transactions?month=${m}&needsReview=true&limit=500`),
+      ]);
+      return { categories: cats, summary, review: review.transactions };
+    }),
+    async saveCategory({ id, ...fields }: CategoryInput): Promise<void> {
+      if (id) await call(`/api/budget/categories/${encodeURIComponent(id)}`, 'PATCH', fields);
+      else await call('/api/budget/categories', 'POST', fields);
     },
-    async saveCategory({ id, name, monthlyCents, rollover }) {
-      if (id) {
-        categories = categories.map(c => (c.id === id ? { ...c, name, monthlyCents, rollover } : c));
-        const found = categories.find(c => c.id === id);
-        if (!found) throw new Error('Category not found');
-        return { ...found };
-      }
-      seq += 1;
-      const created: BudgetCategory = { id: `cat-new-${seq}`, name, monthlyCents, rollover };
-      categories = [...categories, created];
-      return { ...created };
+    async deleteCategory(id: string): Promise<void> {
+      await call(`/api/budget/categories/${encodeURIComponent(id)}`, 'DELETE');
     },
-    async deleteCategory(id) {
-      categories = categories.filter(c => c.id !== id);
-      for (const t of txns) {
-        if (t.categoryId === id) { t.categoryId = null; t.source = 'none'; t.ruleId = null; }
-      }
+    async categorise(transactionId: string, categoryId: string | null): Promise<void> {
+      await call(`/api/budget/transactions/${encodeURIComponent(transactionId)}`, 'PATCH', { categoryId });
     },
   };
 }
 
-/** Module-level source so the Overview and Budgets pages share state during a session. */
-export const budgetSource: BudgetSource = createFixtureSource();
+export const budgetClient = createBudgetClient();

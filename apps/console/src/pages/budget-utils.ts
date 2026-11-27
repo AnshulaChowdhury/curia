@@ -2,56 +2,47 @@
 // Money is integer cents (CAD by default); negative = money out. Dates are YYYY-MM-DD.
 // Bank text (payee, description) is untrusted: callers render it as text only.
 
+// The shapes below mirror what the server returns (src/budget/budget-store.ts).
 export interface BudgetCategory {
   id: string;
   name: string;
-  monthlyCents: number;
+  monthlyCents: number | null; // null = no budget set
   rollover: boolean;
 }
 
-export type CategorySource = 'rule' | 'agent_guess' | 'you' | 'none';
-
 export interface BudgetTxn {
   id: string;
+  account: string;
   date: string; // YYYY-MM-DD
   payee: string;
+  description: string;
   amountCents: number; // negative = money out
   categoryId: string | null;
-  accountId: string;
-  source: CategorySource;
-  ruleId: string | null;
+  source: 'rule' | 'agent_guess' | 'you' | null; // null = not categorised yet
 }
 
 export type BudgetStatus = 'under' | 'near' | 'over';
 
-export interface CategoryRowModel {
-  id: string;
+export interface CategorySummary {
+  categoryId: string;
   name: string;
-  budgetCents: number; // monthly amount plus any rollover carried in
-  spentCents: number; // positive number of cents spent this month
-  rolloverInCents: number;
-  remainingCents: number;
-  ratio: number; // spent / budget, 0 when budget is 0 and nothing spent
-  status: BudgetStatus;
+  budgetedCents: number | null;
+  spentCents: number;
+  remainingCents: number | null;
+  state: 'no_budget' | BudgetStatus;
 }
 
-export interface NeedsYouItem {
-  kind: 'uncategorised' | 'guess' | 'over_budget';
-  id: string;
-  label: string;
+export interface BudgetSummary {
+  month: string;
+  categories: CategorySummary[];
+  totals: { budgetedCents: number; spentCents: number; uncategorisedSpentCents: number };
+  needsYou: { uncategorised: number; guesses: number; overBudget: number };
 }
-
-/** A category counts as "near" its limit from this share of the budget. */
-export const NEAR_RATIO = 0.8;
 
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
 export function isMonth(s: string): boolean {
   return MONTH_RE.test(s);
-}
-
-export function monthOf(date: string): string {
-  return date.slice(0, 7);
 }
 
 export function shiftMonth(month: string, delta: number): string {
@@ -94,12 +85,9 @@ export function centsToDollarInput(cents: number): string {
   return `${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
 }
 
-export function statusFor(spentCents: number, budgetCents: number): BudgetStatus {
-  if (budgetCents <= 0) return spentCents > 0 ? 'over' : 'under';
-  const ratio = spentCents / budgetCents;
-  if (ratio > 1) return 'over';
-  if (ratio >= NEAR_RATIO) return 'near';
-  return 'under';
+/** The month a date falls in, in the viewer's own time zone. */
+export function currentMonth(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 }
 
 export const STATUS_LABEL: Record<BudgetStatus, string> = {
@@ -108,52 +96,16 @@ export const STATUS_LABEL: Record<BudgetStatus, string> = {
   over: 'Over budget',
 };
 
-/** Money out in a category for a month, as a positive number of cents. Refunds (money in) reduce it. */
-export function spentIn(txns: BudgetTxn[], categoryId: string, month: string): number {
-  let out = 0;
-  for (const t of txns) {
-    if (t.categoryId === categoryId && monthOf(t.date) === month) out -= t.amountCents;
+/** Plain sentences for what the owner has to look at this month. */
+export function needsYouLines(summary: BudgetSummary): string[] {
+  const { uncategorised, guesses } = summary.needsYou;
+  const lines: string[] = [];
+  if (uncategorised > 0) lines.push(`${uncategorised} transaction${uncategorised === 1 ? '' : 's'} without a category`);
+  if (guesses > 0) lines.push(`${guesses} agent guess${guesses === 1 ? '' : 'es'} to confirm`);
+  for (const c of summary.categories) {
+    if (c.state === 'over' && c.remainingCents !== null) lines.push(`${c.name} is over budget by ${formatCents(-c.remainingCents)}`);
   }
-  return Math.max(out, 0);
-}
-
-/**
- * Rollover: unspent budget from the previous month carries into this one for categories that opt in.
- * Only one month back is counted, which keeps the first pass simple and explainable. Overspend does not carry.
- */
-export function rolloverInto(cat: BudgetCategory, txns: BudgetTxn[], month: string): number {
-  if (!cat.rollover) return 0;
-  const prev = shiftMonth(month, -1);
-  const unspent = cat.monthlyCents - spentIn(txns, cat.id, prev);
-  return Math.max(unspent, 0);
-}
-
-export function buildRows(categories: BudgetCategory[], txns: BudgetTxn[], month: string): CategoryRowModel[] {
-  return categories.map(cat => {
-    const rolloverInCents = rolloverInto(cat, txns, month);
-    const budgetCents = cat.monthlyCents + rolloverInCents;
-    const spentCents = spentIn(txns, cat.id, month);
-    const ratio = budgetCents > 0 ? spentCents / budgetCents : spentCents > 0 ? Infinity : 0;
-    return {
-      id: cat.id,
-      name: cat.name,
-      budgetCents,
-      spentCents,
-      rolloverInCents,
-      remainingCents: budgetCents - spentCents,
-      ratio,
-      status: statusFor(spentCents, budgetCents),
-    };
-  });
-}
-
-export interface Totals { spentCents: number; budgetCents: number }
-
-export function totalsOf(rows: CategoryRowModel[]): Totals {
-  return rows.reduce<Totals>(
-    (acc, r) => ({ spentCents: acc.spentCents + r.spentCents, budgetCents: acc.budgetCents + r.budgetCents }),
-    { spentCents: 0, budgetCents: 0 },
-  );
+  return lines;
 }
 
 /** Bar fill percent, clamped for display. The real ratio stays available for text. */
@@ -162,48 +114,11 @@ export function barPercent(ratio: number): number {
   return Math.min(Math.max(Math.round(ratio * 100), 0), 100);
 }
 
-/** Money-out transactions in a month that have no category, plus guesses that the owner has not confirmed. */
-export function needsYou(rows: CategoryRowModel[], txns: BudgetTxn[], month: string): NeedsYouItem[] {
-  const items: NeedsYouItem[] = [];
-  const inMonth = txns.filter(t => monthOf(t.date) === month);
-  const uncategorised = inMonth.filter(t => t.categoryId === null);
-  if (uncategorised.length > 0) {
-    items.push({
-      kind: 'uncategorised',
-      id: 'uncategorised',
-      label: `${uncategorised.length} transaction${uncategorised.length === 1 ? '' : 's'} without a category`,
-    });
-  }
-  const guesses = inMonth.filter(t => t.source === 'agent_guess');
-  if (guesses.length > 0) {
-    items.push({
-      kind: 'guess',
-      id: 'guesses',
-      label: `${guesses.length} agent guess${guesses.length === 1 ? '' : 'es'} to confirm`,
-    });
-  }
-  for (const r of rows) {
-    if (r.status === 'over') {
-      items.push({ kind: 'over_budget', id: r.id, label: `${r.name} is over budget by ${formatCents(r.spentCents - r.budgetCents)}` });
-    }
-  }
-  return items;
-}
-
 /** Summary for the morning-brief Money card (and, later, the phone app). Props in, nothing fetched. */
 export interface MoneySummary {
   month: string;
   top: Array<{ id: string; name: string; spentCents: number; budgetCents: number; status: BudgetStatus }>;
   needsYouCount: number;
-}
-
-export function buildMoneySummary(categories: BudgetCategory[], txns: BudgetTxn[], month: string, topN = 3): MoneySummary {
-  const rows = buildRows(categories, txns, month);
-  const top = [...rows]
-    .sort((a, b) => b.spentCents - a.spentCents)
-    .slice(0, topN)
-    .map(r => ({ id: r.id, name: r.name, spentCents: r.spentCents, budgetCents: r.budgetCents, status: r.status }));
-  return { month, top, needsYouCount: needsYou(rows, txns, month).length };
 }
 
 // ---- Category validation (Budgets page) ----

@@ -1,16 +1,20 @@
 import { describe, it, expect } from 'vitest';
 import {
-  shiftMonth, isMonth, formatCents, parseDollarsToCents, centsToDollarInput, statusFor, spentIn,
-  rolloverInto, buildRows, totalsOf, needsYou, barPercent, buildMoneySummary, validateDraft,
+  shiftMonth, isMonth, currentMonth, formatCents, parseDollarsToCents, centsToDollarInput, barPercent, needsYouLines, validateDraft,
+  type BudgetCategory, type BudgetSummary,
 } from './budget-utils.js';
-import { FIXTURE_CATEGORIES, FIXTURE_TXNS, FIXTURE_MONTH } from './budget-fixtures.js';
-import { stateForStatus } from './budget-data.js';
+import { createBudgetClient, stateForStatus } from './budget-data.js';
+
+const CATEGORIES: BudgetCategory[] = [{ id: 'cat-groceries', name: 'Groceries', monthlyCents: 60000, rollover: false }];
 
 describe('months', () => {
   it('shifts across year boundaries', () => {
     expect(shiftMonth('2026-12', 1)).toBe('2027-01');
     expect(shiftMonth('2026-01', -1)).toBe('2025-12');
     expect(shiftMonth('2026-11', -12)).toBe('2025-11');
+  });
+  it('reads the current month from the local date', () => {
+    expect(currentMonth(new Date(2027, 0, 31, 23, 59))).toBe('2027-01');
   });
   it('validates month strings', () => {
     expect(isMonth('2026-11')).toBe(true);
@@ -39,17 +43,7 @@ describe('money', () => {
   });
 });
 
-describe('status', () => {
-  it('splits under, near and over', () => {
-    expect(statusFor(7900, 10000)).toBe('under');
-    expect(statusFor(8000, 10000)).toBe('near');
-    expect(statusFor(10000, 10000)).toBe('near');
-    expect(statusFor(10001, 10000)).toBe('over');
-  });
-  it('treats spending against a zero budget as over', () => {
-    expect(statusFor(1, 0)).toBe('over');
-    expect(statusFor(0, 0)).toBe('under');
-  });
+describe('bar', () => {
   it('clamps the bar and handles infinity', () => {
     expect(barPercent(0.5)).toBe(50);
     expect(barPercent(3)).toBe(100);
@@ -57,52 +51,71 @@ describe('status', () => {
   });
 });
 
-describe('fixture month', () => {
-  const rows = buildRows(FIXTURE_CATEGORIES, FIXTURE_TXNS, FIXTURE_MONTH);
-  const byId = Object.fromEntries(rows.map(r => [r.id, r]));
+const SUMMARY: BudgetSummary = {
+  month: '2031-03',
+  categories: [{ categoryId: 'cat-groceries', name: 'Groceries', budgetedCents: 60000, spentCents: 61000, remainingCents: -1000, state: 'over' }],
+  totals: { budgetedCents: 60000, spentCents: 63000, uncategorisedSpentCents: 2000 },
+  needsYou: { uncategorised: 2, guesses: 1, overBudget: 1 },
+};
 
-  it('sums money out per category and ignores other months', () => {
-    expect(spentIn(FIXTURE_TXNS, 'cat-groceries', FIXTURE_MONTH)).toBe(61000);
-    expect(spentIn(FIXTURE_TXNS, 'cat-groceries', '2026-10')).toBe(48000);
+describe('needs you', () => {
+  it('words the server counts and over-budget categories', () => {
+    expect(needsYouLines(SUMMARY)).toEqual([
+      '2 transactions without a category',
+      '1 agent guess to confirm',
+      expect.stringContaining('Groceries is over budget by'),
+    ]);
+    expect(needsYouLines({ ...SUMMARY, categories: [], needsYou: { uncategorised: 0, guesses: 0, overBudget: 0 } })).toEqual([]);
   });
-  it('flags groceries over and transport near', () => {
-    expect(byId['cat-groceries']!.status).toBe('over');
-    expect(byId['cat-transport']!.status).toBe('near');
-    expect(byId['cat-home']!.status).toBe('under');
+});
+
+describe('budget client', () => {
+  type Seen = { path: string; method?: string; body?: unknown };
+  const fake = (seen: Seen[], reply: (path: string) => Response) => createBudgetClient(async (path, init) => {
+    seen.push({ path, method: init?.method, body: init?.body === undefined ? undefined : JSON.parse(init.body as string) });
+    return reply(path);
   });
-  it('carries unspent rollover only for opted-in categories', () => {
-    const dining = FIXTURE_CATEGORIES.find(c => c.id === 'cat-dining')!;
-    const groceries = FIXTURE_CATEGORIES.find(c => c.id === 'cat-groceries')!;
-    expect(rolloverInto(dining, FIXTURE_TXNS, FIXTURE_MONTH)).toBe(10000);
-    expect(rolloverInto(groceries, FIXTURE_TXNS, FIXTURE_MONTH)).toBe(0);
-    expect(byId['cat-dining']!.budgetCents).toBe(35000);
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+
+  it('loads a month from the server routes', async () => {
+    const seen: Seen[] = [];
+    const client = fake(seen, path => json(path.includes('summary') ? SUMMARY : path.includes('transactions') ? { transactions: [] } : { categories: CATEGORIES }));
+    expect(await client.loadMonth('2031-03')).toEqual({ state: 'ok', data: { categories: CATEGORIES, summary: SUMMARY, review: [] } });
+    expect(seen.map(s => s.path)).toEqual([
+      '/api/budget/categories',
+      '/api/budget/summary?month=2031-03',
+      '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
+    ]);
   });
-  it('totals the rows', () => {
-    const t = totalsOf(rows);
-    expect(t.spentCents).toBe(rows.reduce((a, r) => a + r.spentCents, 0));
+  it('creates, edits, deletes and categorises', async () => {
+    const seen: Seen[] = [];
+    const client = fake(seen, () => json({ ok: true }));
+    await client.saveCategory({ id: null, name: 'Home', monthlyCents: 100, rollover: false });
+    await client.saveCategory({ id: 'c1', name: 'Home', monthlyCents: 200, rollover: true });
+    await client.deleteCategory('c1');
+    await client.categorise('t1', 'c1');
+    expect(seen).toEqual([
+      { path: '/api/budget/categories', method: 'POST', body: { name: 'Home', monthlyCents: 100, rollover: false } },
+      { path: '/api/budget/categories/c1', method: 'PATCH', body: { name: 'Home', monthlyCents: 200, rollover: true } },
+      { path: '/api/budget/categories/c1', method: 'DELETE', body: undefined },
+      { path: '/api/budget/transactions/t1', method: 'PATCH', body: { categoryId: 'c1' } },
+    ]);
   });
-  it('lists what needs the owner', () => {
-    const labels = needsYou(rows, FIXTURE_TXNS, FIXTURE_MONTH).map(n => n.kind);
-    expect(labels).toContain('uncategorised');
-    expect(labels).toContain('guess');
-    expect(labels).toContain('over_budget');
-  });
-  it('builds a compact summary of the top three', () => {
-    const s = buildMoneySummary(FIXTURE_CATEGORIES, FIXTURE_TXNS, FIXTURE_MONTH);
-    expect(s.top).toHaveLength(3);
-    expect(s.top[0]!.id).toBe('cat-groceries');
-    expect(s.needsYouCount).toBeGreaterThan(0);
+  it('shows locked for 401, and the server message when a save fails', async () => {
+    expect(await fake([], () => json({ error: 'no' }, 401)).loadCategories()).toEqual({ state: 'locked' });
+    await expect(fake([], () => json({ error: 'A category with that name already exists' }, 409))
+      .saveCategory({ id: null, name: 'Home', monthlyCents: 1, rollover: false })).rejects.toThrow('already exists');
   });
 });
 
 describe('validateDraft', () => {
   it('rejects blank, duplicate and bad amounts', () => {
-    expect(validateDraft({ name: ' ', amount: '10', rollover: false }, FIXTURE_CATEGORIES, null).errors.name).toBeTruthy();
-    expect(validateDraft({ name: 'groceries', amount: '10', rollover: false }, FIXTURE_CATEGORIES, null).errors.name).toBeTruthy();
-    expect(validateDraft({ name: 'New', amount: 'x', rollover: false }, FIXTURE_CATEGORIES, null).errors.amount).toBeTruthy();
+    expect(validateDraft({ name: ' ', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
+    expect(validateDraft({ name: 'groceries', amount: '10', rollover: false }, CATEGORIES, null).errors.name).toBeTruthy();
+    expect(validateDraft({ name: 'New', amount: 'x', rollover: false }, CATEGORIES, null).errors.amount).toBeTruthy();
   });
   it('allows keeping the same name while editing', () => {
-    const r = validateDraft({ name: 'Groceries', amount: '650', rollover: true }, FIXTURE_CATEGORIES, 'cat-groceries');
+    const r = validateDraft({ name: 'Groceries', amount: '650', rollover: true }, CATEGORIES, 'cat-groceries');
     expect(r.ok).toBe(true);
     expect(r.value).toEqual({ name: 'Groceries', monthlyCents: 65000, rollover: true });
   });
