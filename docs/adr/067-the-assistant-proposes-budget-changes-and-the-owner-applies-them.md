@@ -17,6 +17,7 @@ when no tool has run.
   stood at that moment. One waits per conversation, for 24 hours; a new one replaces it.
 - The chat shows it as a **card drawn from storage**. The owner approves with the card's button or by replying "yes",
   which the console handles itself. **Only the signed-in owner's routes apply a proposal. No agent or tool can.**
+- The owner may **edit amounts on the card** first; edits are saved to the proposal through the owner's routes.
 - Applying is one transaction; if any category differs from when it was proposed, nothing is applied.
 - Not covered: moving transactions between categories, deleting categories, editing spreadsheets.
 

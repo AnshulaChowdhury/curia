@@ -82,6 +82,38 @@ describeIf('budget proposals', () => {
     expect(await mine()).toEqual([]);
   });
 
+  it('takes the owner\'s edits before applying, still changing nothing until then', async () => {
+    const rent = await budget.createCategory({ name: 'P-Rent', monthlyCents: 100000 });
+    const made = await proposals.propose(CHAT, [{ name: 'P-New', amounts: [10, 20] }, { name: 'P-Rent', amounts: [1500, 1000] }], ['2031-03', '2031-04']);
+    await proposals.setAmount(made.id, CHAT, 'P-New', '2031-03', 1250);
+    await proposals.setAmount(made.id, CHAT, 'P-New', '2031-04', null);
+    // A month the proposal left alone records what it holds now, so a later change is still noticed.
+    const edited = await proposals.setAmount(made.id, CHAT, 'P-Rent', '2031-04', 130000);
+    expect(edited.rows[1]!.amounts).toEqual([{ month: '2031-03', cents: 150000, was: 100000 }, { month: '2031-04', cents: 130000, was: 100000 }]);
+    expect((await mine()).map(c => c.name)).toEqual(['P-Rent']);
+    expect((await proposals.pending(CHAT))!.rows).toEqual(edited.rows);
+
+    // Clearing an amount leaves the month as it is, even if the budget moved there meanwhile.
+    await proposals.setAmount(made.id, CHAT, 'P-Rent', '2031-03', null);
+    await budget.setMonthAmount(rent.id, '2031-03', 99);
+    await proposals.apply(made.id, CHAT);
+    const after = await mine();
+    expect(after.find(c => c.name === 'P-New')!.amounts.map(a => a.cents)).toEqual([1250, null]);
+    expect(after.find(c => c.name === 'P-Rent')!.amounts.map(a => a.cents)).toEqual([99, 130000]);
+    await expect(proposals.setAmount(made.id, CHAT, 'P-New', '2031-03', 1)).rejects.toMatchObject({ kind: 'conflict' });
+  });
+
+  it('refuses an edit that names nothing in the waiting proposal', async () => {
+    await budget.createCategory({ name: 'P-Old' });
+    const made = await proposals.propose(CHAT, [{ name: 'P-Old', archive: true }, { name: 'P-A' }]);
+    for (const [chat, name, month, cents, kind] of [
+      [CHAT, 'P-A', 'March', 1, 'invalid'], [CHAT, 'P-A', '2031-03', -1, 'invalid'], [CHAT, 'P-A', '2031-03', 1.5, 'invalid'],
+      [CHAT, 'P-Nope', '2031-03', 1, 'not_found'], [CHAT, 'P-Old', '2031-03', 1, 'not_found'], ['proposal-test-other', 'P-A', '2031-03', 1, 'conflict'],
+    ] as const) {
+      await expect(proposals.setAmount(made.id, chat, name, month, cents), `${name} ${month} ${cents}`).rejects.toMatchObject({ kind });
+    }
+  });
+
   it('leaves out a month with no amount', async () => {
     const made = await proposals.propose(CHAT, [{ name: 'P-Gap', amounts: [null, 2] }], ['2031-03', '2031-04']);
     expect(made.rows[0]!.amounts).toEqual([{ month: '2031-04', cents: 200, was: null }]);

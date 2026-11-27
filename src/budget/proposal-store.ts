@@ -1,8 +1,8 @@
 // proposal-store.ts — budget changes proposed in a chat and applied only when the owner approves them (ADR-067).
 //
 // The assistant can do one thing here: write a proposal. Applying one is called only by the owner's signed-in console,
-// so no agent can change the budget. A proposal records how each category stood when it was made; if any of them has
-// changed since, nothing is applied.
+// so no agent can change the budget. The owner may edit a waiting proposal's amounts before applying it. A proposal
+// records how each category stood; if any of them has changed since, nothing is applied.
 
 import type { DbPool } from '../db/connection.js';
 import { BudgetError, CATEGORY_KINDS, type CategoryKind } from './budget-store.js';
@@ -20,8 +20,8 @@ export interface ProposedRow {
   kind: CategoryKind;
   categoryId: string | null;
   previousKind?: CategoryKind;
-  /** `was` is what the month had when the proposal was made. */
-  amounts: Array<{ month: string; cents: number; was: number | null }>;
+  /** `cents` null: set nothing for that month (the owner cleared it). `was` is what the month had when proposed. */
+  amounts: Array<{ month: string; cents: number | null; was: number | null }>;
 }
 
 export interface Proposal { id: string; rows: ProposedRow[]; createdAt: string; expiresAt: string }
@@ -140,6 +140,46 @@ export class ProposalStore {
     return r ? { id: r.id, rows: r.changes, createdAt: r.created_at.toISOString(), expiresAt: r.expires_at.toISOString() } : null;
   }
 
+  /** The owner's edit of one amount in the waiting proposal; null clears it. Changes no budget. */
+  async setAmount(id: string, conversationId: string, name: unknown, month: unknown, cents: unknown): Promise<Proposal> {
+    if (typeof name !== 'string' || typeof month !== 'string' || !MONTH.test(month)) throw new BudgetError('Name a category and a month (YYYY-MM)');
+    if (cents !== null && !(typeof cents === 'number' && Number.isInteger(cents) && cents >= 0 && cents <= MAX_CENTS)) {
+      throw new BudgetError('cents must be a whole number of cents, zero or more, or null');
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const found = await client.query<{ changes: ProposedRow[]; created_at: Date; expires_at: Date }>(
+        `SELECT changes, created_at, expires_at FROM budget_proposals
+         WHERE id = $1 AND conversation_id = $2 AND status = 'pending' AND expires_at > now() FOR UPDATE`, [id, conversationId]);
+      const proposal = found.rows[0];
+      if (!proposal) throw new BudgetError('That proposal is no longer waiting', 'conflict');
+      const row = proposal.changes.find(r => r.name === name);
+      if (!row || row.action === 'archive') throw new BudgetError('That proposal has no amounts for that category', 'not_found');
+      const entry = row.amounts.find(a => a.month === month);
+      if (entry) entry.cents = cents;
+      else if (cents !== null) {
+        if (row.amounts.length >= MAX_PROPOSED_MONTHS) throw new BudgetError(`At most ${MAX_PROPOSED_MONTHS} months for one category`);
+        let was: number | null = null;
+        if (row.categoryId) {
+          const now = (await openCategories(client)).get((row.renameFrom ?? row.name).toLowerCase());
+          if (!now || now.id !== row.categoryId) throw new BudgetError(`"${row.name}" has changed since this was proposed. Ask for a new proposal.`, 'conflict');
+          was = (await amountsNow(client, now, [month])).get(month) ?? null;
+        }
+        row.amounts.push({ month, cents, was });
+        row.amounts.sort((a, b) => a.month.localeCompare(b.month));
+      }
+      await client.query('UPDATE budget_proposals SET changes = $2 WHERE id = $1', [id, JSON.stringify(proposal.changes)]);
+      await client.query('COMMIT');
+      return { id, rows: proposal.changes, createdAt: proposal.created_at.toISOString(), expiresAt: proposal.expires_at.toISOString() };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async discard(id: string, conversationId: string): Promise<void> {
     const done = await this.pool.query(
       `UPDATE budget_proposals SET status = 'discarded', decided_at = now() WHERE id = $1 AND conversation_id = $2 AND status = 'pending'`, [id, conversationId]);
@@ -160,6 +200,8 @@ export class ProposalStore {
       const done = { created: 0, updated: 0, archived: 0 };
       for (const row of rows) {
         let categoryId = row.categoryId;
+        // A cleared amount sets nothing, so what that month holds now does not matter.
+        const set = row.amounts.filter((a): a is typeof a & { cents: number } => a.cents !== null);
         if (row.action === 'create') {
           if (current.has(row.name.toLowerCase())) throw stale(row.name);
           const made = await client.query<{ id: string }>(
@@ -170,8 +212,8 @@ export class ProposalStore {
         } else {
           const now = current.get((row.renameFrom ?? row.name).toLowerCase());
           if (!now || now.id !== row.categoryId || now.kind !== row.previousKind) throw stale(row.renameFrom ?? row.name);
-          const amounts = await amountsNow(client, now, row.amounts.map(a => a.month));
-          if (row.amounts.some(a => (amounts.get(a.month) ?? null) !== a.was)) throw stale(now.name);
+          const amounts = await amountsNow(client, now, set.map(a => a.month));
+          if (set.some(a => (amounts.get(a.month) ?? null) !== a.was)) throw stale(now.name);
           if (row.action === 'archive') {
             await client.query('UPDATE budget_categories SET archived_at = now(), updated_at = now() WHERE id = $1', [now.id]);
             done.archived += 1;
@@ -180,7 +222,7 @@ export class ProposalStore {
           await client.query('UPDATE budget_categories SET name = $2, kind = $3, updated_at = now() WHERE id = $1', [now.id, row.name, row.kind]);
           done.updated += 1;
         }
-        for (const a of row.amounts) {
+        for (const a of set) {
           await client.query(
             `INSERT INTO budget_month_amounts (category_id, month, cents) VALUES ($1, $2, $3)
              ON CONFLICT (category_id, month) DO UPDATE SET cents = EXCLUDED.cents`, [categoryId, a.month, a.cents]);

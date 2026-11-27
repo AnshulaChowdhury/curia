@@ -26,6 +26,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Editable proposal card** — change any proposed amount before approving it.
+- **Spreadsheet dark mode** — the grid follows the console theme.
 - **Chat working status** — Moonray loader with live steps, including a specialist's, and elapsed time.
 - **`tool.invoke` `originConversationId`** — **public API:** bus event names the chat that delegated.
 - **`LLMProvider.chat` `toolChoice`** — require a named tool; Bedrock and Anthropic.
