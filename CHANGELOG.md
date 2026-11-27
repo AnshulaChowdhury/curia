@@ -16,6 +16,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 ### Security
 
 - **Spreadsheet page policy** — allows three grid stylesheets and inline images; converter sandboxed.
+- **Dependency pins** — raised eight stale floors, clearing a critical Vite advisory.
 
 ### Added
 

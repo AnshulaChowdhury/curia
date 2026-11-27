@@ -6,9 +6,6 @@ import LuckyExcel from '@zwight/luckyexcel';
 import type { FromConverter, ToConverter } from './protocol.js';
 import { numbersFromText } from './csv-numbers.js';
 
-// A sandboxed frame has an opaque origin, so '*' is the only target that can reach the page that created it.
-const reply = (message: FromConverter) => window.parent.postMessage(message, '*');
-
 function convert(name: string, bytes: ArrayBuffer): Promise<unknown> {
   const file = new File([bytes], name);
   const csv = name.toLowerCase().endsWith('.csv');
@@ -20,14 +17,23 @@ function convert(name: string, bytes: ArrayBuffer): Promise<unknown> {
   });
 }
 
-window.addEventListener('message', event => {
-  if (event.source !== window.parent || window.parent === window) return;
-  const message = event.data as ToConverter;
-  if (message?.kind !== 'convert' || typeof message.name !== 'string' || !(message.bytes instanceof ArrayBuffer)) return;
-  convert(message.name, message.bytes).then(
-    workbook => reply({ kind: 'done', workbook: JSON.parse(JSON.stringify(workbook)) as unknown }),
-    (error: Error) => reply({ kind: 'failed', message: String(error.message).slice(0, 200) }),
-  );
-});
+function serve(port: MessagePort): void {
+  const reply = (message: FromConverter) => port.postMessage(message);
+  port.onmessage = event => {
+    const message = event.data as ToConverter;
+    if (message?.kind !== 'convert' || typeof message.name !== 'string' || !(message.bytes instanceof ArrayBuffer)) return;
+    convert(message.name, message.bytes).then(
+      workbook => reply({ kind: 'done', workbook: JSON.parse(JSON.stringify(workbook)) as unknown }),
+      (error: Error) => reply({ kind: 'failed', message: String(error.message).slice(0, 200) }),
+    );
+  };
+}
 
-if (window.parent !== window) reply({ kind: 'ready' });
+if (window.parent !== window) {
+  const channel = new MessageChannel();
+  serve(channel.port1);
+  const ready: FromConverter = { kind: 'ready' };
+  // The other end of the channel goes only to a page of this site. (This frame is sandboxed and has no origin of its
+  // own, but location.origin still names the site it was loaded from.)
+  window.parent.postMessage(ready, window.location.origin, [channel.port2]);
+}

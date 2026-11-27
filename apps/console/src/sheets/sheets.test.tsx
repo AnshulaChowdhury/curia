@@ -32,23 +32,37 @@ describe('converter frame', () => {
     const result = convertFile(new File(['a,b'], 'b.csv'), document, timeout);
     return { result, frame: () => document.querySelector('iframe')! };
   };
-  const from = (source: unknown, data: unknown) => window.dispatchEvent(new MessageEvent('message', { data, source: source as Window }));
+  const announce = (source: unknown, ports: MessagePort[], origin = 'null') =>
+    window.dispatchEvent(new MessageEvent('message', { data: { kind: 'ready' }, source: source as Window, origin, ports }));
+  /** Stands in for the frame: hands over a channel and answers the file with the given reply. */
+  const converter = (source: unknown, answer: unknown) => {
+    const channel = new MessageChannel();
+    const received = vi.fn();
+    channel.port1.onmessage = event => { received(event.data); channel.port1.postMessage(answer); };
+    announce(source, [channel.port2]);
+    return received;
+  };
 
-  it('runs sandboxed, listens only to its own frame, and removes it afterwards', async () => {
+  it('runs sandboxed, hands the file only to its own frame over a private channel, and removes it', async () => {
     const { result, frame } = start();
     await vi.waitFor(() => expect(frame()).not.toBeNull());
     expect(frame().getAttribute('sandbox')).toBe('allow-scripts');
     const inner = frame().contentWindow;
-    from(window, { kind: 'done', workbook: 'forged' });          // someone else's message is ignored
-    from(inner, { kind: 'done', workbook: { sheets: {} } });
+    const stranger = new MessageChannel();
+    const leaked = vi.spyOn(stranger.port2, 'postMessage');
+    announce(window, [stranger.port2]);                          // not our frame
+    announce(inner, [stranger.port2], window.location.origin);   // our frame without its sandbox
+    const received = converter(inner, { kind: 'done', workbook: { sheets: {} } });
     await expect(result).resolves.toEqual({ sheets: {} });
+    expect(received).toHaveBeenCalledWith(expect.objectContaining({ kind: 'convert', name: 'b.csv' }));
+    expect(leaked).not.toHaveBeenCalled();
     expect(document.querySelector('iframe')).toBeNull();
   });
 
   it('reports a failure, and gives up after a time limit', async () => {
     const failing = start();
     await vi.waitFor(() => expect(failing.frame()).not.toBeNull());
-    from(failing.frame().contentWindow, { kind: 'failed', message: 'broken zip' });
+    converter(failing.frame().contentWindow, { kind: 'failed', message: 'broken zip' });
     await expect(failing.result).rejects.toThrow('could not be read');
     await expect(start(20).result).rejects.toThrow('too long');
     expect(document.querySelector('iframe')).toBeNull();
