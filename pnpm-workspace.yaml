@@ -122,7 +122,7 @@ fetchTimeout: 90000
 overrides:
   # The spreadsheet converter (@zwight/luckyexcel) brings an old @univerjs/core that pins nanoid 5.1.5 exactly:
   # CVE-2026-73086 (HIGH, <5.1.11), CVE-2026-67213 (<5.1.6) and CVE-2026-67214 (<5.1.16). Stays on 5.x.
-  'nanoid@>=5.0.0 <5.1.16': '>=5.1.16 <6'
+  '@univerjs/core>nanoid': '>=5.1.16 <6'
   # Raised off >=4.13.5, the follow-up 792fbabe deferred (Refs #1934): that floor admitted
   # 4.13.5-4.13.10, which carry two more MED advisories:
   #   - GHSA-5r4p-p66f-jhc7 (>=4.12.4 <4.13.11): serveStatic decodes the request path a
