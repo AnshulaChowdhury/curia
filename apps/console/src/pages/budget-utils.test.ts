@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  shiftMonth, isMonth, currentMonth, formatCents, parseDollarsToCents, centsToDollarInput, barPercent, needsYouLines, validateDraft,
-  type BudgetCategory, type BudgetSummary,
+  shiftMonth, isMonth, currentMonth, formatCents, parseDollarsToCents, centsToDollarInput, barPercent, needsYouLines, validateDraft, groupAccounts,
+  type AccountType, type BudgetCategory, type BudgetSummary,
 } from './budget-utils.js';
 import { createBudgetClient, stateForStatus } from './budget-data.js';
 
@@ -66,6 +66,19 @@ describe('needs you', () => {
       expect.stringContaining('Groceries is over budget by'),
     ]);
     expect(needsYouLines({ ...SUMMARY, categories: [], needsYou: { uncategorised: 0, guesses: 0, overBudget: 0 } })).toEqual([]);
+  });
+});
+
+describe('assets and liabilities', () => {
+  const row = (id: string, type: AccountType, side: 'asset' | 'debt', balanceCents: number | null, currency = 'CAD') =>
+    ({ id, source: 'manual' as const, institution: '', name: id, mask: null, type, side, currency, balanceCents, asOf: '2031-01-01T00:00:00Z' });
+  it('groups one side by kind, largest first, summing only what the totals count', () => {
+    const groups = groupAccounts([
+      row('small', 'cash', 'asset', 10), row('car', 'vehicle', 'asset', 500), row('big', 'cash', 'asset', 90),
+      row('foreign', 'cash', 'asset', 1000, 'USD'), row('card', 'credit_card', 'debt', 40),
+    ], 'asset');
+    expect(groups.map(g => [g.label, g.totalCents])).toEqual([['Cash', 100], ['Vehicles', 500]]);
+    expect(groups[0]!.accounts.map(a => a.id)).toEqual(['foreign', 'big', 'small']);
   });
 });
 

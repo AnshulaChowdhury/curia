@@ -10,6 +10,7 @@ Personal finance is separate from the MowMow business books (the Books page). Ow
 |---|---|---|
 | `/budget` | Overview | built |
 | `/budget/budgets` | Budgets | built |
+| `/budget/net-worth` | Assets, liabilities and net worth: bank balances plus hand entries. Owner-only; no agent can read it | built |
 | `/budget/transactions` | Transactions | next PR |
 | `/budget/import` | Redirects to Overview, which holds file upload and bank connections | built |
 | `/budget/rules` | Rules | next PR |

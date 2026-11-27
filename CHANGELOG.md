@@ -15,6 +15,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Household net worth** — assets and liabilities from connected banks and hand entries (migration 132).
 - **Budget screens use real data** — categories and budgets save; assign categories on Overview.
 - **Budget bank-file import** — upload RBC, Tangerine, CIBC or .qbo/.ofx files into budget transactions, duplicates skipped.
 - **Budget bank feeds (Plaid)** — bank sync every six hours, tokens in the vault, Plaid Link on one page (ADR-063).
@@ -191,6 +192,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Navigation names** — Budget is now Household Budget; Books is now Company Books.
 - **Budget pages redesigned** — bank import now lives on Overview; the Import tab is gone.
 - **agent.task / llm.call / llm.error / LLMStreamEvent** — **public API:** `turnDeadlineAt`, `reasoningWatchdog`, `request_started`, `reasoning_delta` and `output_started` added. (#2371)
 - **LLM calls** — agent and infra calls on Anthropic and OpenRouter now stream internally. (#2371)

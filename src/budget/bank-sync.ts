@@ -7,7 +7,7 @@
 import type { Logger } from '../logger.js';
 import type { DbPool } from '../db/connection.js';
 import type { NewTransaction } from './budget-store.js';
-import { PlaidError, type PlaidClient, type PlaidTransaction } from './plaid-client.js';
+import { PlaidError, type PlaidAccount, type PlaidClient, type PlaidTransaction } from './plaid-client.js';
 import { toCents } from './import-parser.js';
 
 export interface BankLink {
@@ -17,6 +17,7 @@ export interface BankLink {
 
 interface Secrets { get(name: string): Promise<string | null>; set(name: string, value: string): Promise<void>; delete(name: string): Promise<void> }
 interface Ingest { addTransactions(items: NewTransaction[]): Promise<{ added: number; duplicates: number }> }
+interface Balances { saveBankAccounts(linkId: string, institution: string, accounts: PlaidAccount[]): Promise<void> }
 interface Row { id: string; institution: string; plaid_item_id: string; cursor: string | null; accounts: Record<string, string>; status: BankLink['status']; last_error: string | null; last_synced_at: Date | null }
 
 const TOKEN = (id: string) => `plaid_access_${id}`;
@@ -30,7 +31,7 @@ export function toNewTransaction(t: PlaidTransaction, account: string): NewTrans
 }
 
 export class BankSync {
-  constructor(private readonly deps: { pool: DbPool; plaid: PlaidClient; secrets: Secrets; budget: Ingest; logger: Logger }) {}
+  constructor(private readonly deps: { pool: DbPool; plaid: PlaidClient; secrets: Secrets; budget: Ingest; balances: Balances; logger: Logger }) {}
 
   private shape(r: Row): BankLink {
     return { id: r.id, institution: r.institution, status: r.status, lastError: r.last_error, lastSyncedAt: r.last_synced_at?.toISOString() ?? null, accounts: Object.values(r.accounts) };
@@ -73,6 +74,12 @@ export class BankSync {
         // The cursor is saved after each page's rows are stored, so a failure resumes without losing or repeating pages.
         await pool.query('UPDATE budget_bank_links SET cursor = $2, accounts = $3 WHERE id = $1', [id, cursor, JSON.stringify(labels)]);
         if (!res.has_more) break;
+      }
+      // Balances are a separate call. Its failure is logged and leaves the last ones in place: the transactions are in.
+      try {
+        await this.deps.balances.saveBankAccounts(id, row.institution, await plaid.accounts(token));
+      } catch (err) {
+        logger.warn({ linkId: id, code: err instanceof PlaidError ? err.code : undefined, err: err instanceof PlaidError ? undefined : err }, 'budget: balance refresh failed');
       }
       await pool.query(`UPDATE budget_bank_links SET status = 'active', last_error = NULL, last_synced_at = now() WHERE id = $1`, [id]);
       return added;

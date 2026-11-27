@@ -3,7 +3,7 @@
 // The server computes the month's summary, so the console, the morning brief and the budget specialist show the same
 // numbers; nothing here recalculates spending. A 401 or 403 means "locked": the pages never show partial data.
 import { apiFetch } from '../api.js';
-import type { BudgetCategory, BudgetSummary, BudgetTxn } from './budget-utils.js';
+import type { AccountType, BudgetCategory, BudgetSummary, BudgetTxn, NetWorth } from './budget-utils.js';
 
 type Fetcher = (path: string, init?: RequestInit) => Promise<Response>;
 
@@ -18,6 +18,8 @@ export interface MonthData {
   /** This month's transactions with no category, or a guess the owner has not confirmed. */
   review: BudgetTxn[];
 }
+
+export interface AccountInput { id: string | null; name: string; type: AccountType; balanceCents: number }
 
 export interface CategoryInput { id: string | null; name: string; monthlyCents: number; rollover: boolean }
 
@@ -58,6 +60,18 @@ export function createBudgetClient(f: Fetcher = apiFetch) {
 
   return {
     loadCategories: () => load(categories),
+    loadNetWorth: () => load(() => call<NetWorth>('/api/budget/accounts')),
+    async saveAccount({ id, ...fields }: AccountInput): Promise<void> {
+      if (id) await call(`/api/budget/accounts/${encodeURIComponent(id)}`, 'PUT', fields);
+      else await call('/api/budget/accounts', 'POST', fields);
+    },
+    async deleteAccount(id: string): Promise<void> {
+      await call(`/api/budget/accounts/${encodeURIComponent(id)}`, 'DELETE');
+    },
+    /** Syncs every connected bank, which also brings the latest balances. */
+    async refreshBanks(): Promise<void> {
+      await call('/api/budget/banks/sync', 'POST');
+    },
     loadMonth: (month: string) => load<MonthData>(async () => {
       const m = encodeURIComponent(month);
       const [cats, summary, review] = await Promise.all([
