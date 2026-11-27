@@ -191,6 +191,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Budget pages redesigned** — bank import now lives on Overview; the Import tab is gone.
 - **agent.task / llm.call / llm.error / LLMStreamEvent** — **public API:** `turnDeadlineAt`, `reasoningWatchdog`, `request_started`, `reasoning_delta` and `output_started` added. (#2371)
 - **LLM calls** — agent and infra calls on Anthropic and OpenRouter now stream internally. (#2371)
 - **Console API paths** — tasks, contacts, chat and grants move to `/api/*`; old tabs work for one release. (#872)

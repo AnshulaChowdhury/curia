@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { BudgetShell } from './BudgetShell.js';
 import { runPlaidLink, BudgetApiError } from './budget-banks.js';
 
-const RETURN_PATH = '/budget/import';
+const RETURN_PATH = '/budget';
 
 /**
  * Connect a bank with Plaid Link. The server gives only this exact path a CSP that allows cdn.plaid.com, and a CSP is fixed
@@ -24,14 +24,14 @@ export default function BudgetConnectBankPage() {
   }
 
   return (
-    <BudgetShell active="/budget/import">
-      <section className="dash-card bud-form">
+    <BudgetShell active="/budget">
+      <section className="dash-card bud-narrow">
         <h3 className="dash-card-title">Connect a bank</h3>
-        <p className="dash-card-quiet">Plaid opens a secure window. Your bank login goes to your bank through Plaid and never reaches this app.</p>
+        <p className="bud-hint">Plaid opens a secure window. Your bank login goes to your bank through Plaid and never reaches this app.</p>
         {error && <p className="bud-error" role="alert">{error}</p>}
         <div className="bud-row">
-          <button type="button" className="bud-btn" disabled={busy} onClick={() => void start()}>{busy ? 'Opening…' : 'Open Plaid'}</button>
-          <a className="bud-btn" href={RETURN_PATH}>Back</a>
+          <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void start()}>{busy ? 'Opening…' : 'Open Plaid'}</button>
+          <a className="btn btn-secondary btn-sm" href={RETURN_PATH}>Back</a>
         </div>
       </section>
     </BudgetShell>

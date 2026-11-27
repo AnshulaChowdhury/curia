@@ -11,12 +11,12 @@ export function StatusMark({ status }: { status: BudgetStatus }) {
   );
 }
 
-export function BudgetBar({ spentCents, budgetCents, label }: { spentCents: number; budgetCents: number; label: string }) {
+export function BudgetBar({ spentCents, budgetCents, label, status = 'under' }: { spentCents: number; budgetCents: number; label: string; status?: BudgetStatus }) {
   const ratio = budgetCents > 0 ? spentCents / budgetCents : spentCents > 0 ? Infinity : 0;
   const pct = barPercent(ratio);
   return (
     <div
-      className="bud-bar"
+      className={`bud-bar bud-bar-${status}`}
       role="progressbar"
       aria-label={`${label}: ${formatCents(spentCents)} of ${formatCents(budgetCents)} spent`}
       aria-valuemin={0}
@@ -51,7 +51,7 @@ export function MoneyCard({ summary }: { summary: MoneySummary }) {
                 <span className="bud-name">{c.name}</span>
                 <span className="bud-num">{formatCents(c.spentCents)} / {formatCents(c.budgetCents)}</span>
               </div>
-              <BudgetBar spentCents={c.spentCents} budgetCents={c.budgetCents} label={c.name} />
+              <BudgetBar spentCents={c.spentCents} budgetCents={c.budgetCents} label={c.name} status={c.status} />
               <StatusMark status={c.status} />
             </li>
           ))}

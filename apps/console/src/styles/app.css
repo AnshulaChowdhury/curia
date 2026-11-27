@@ -4143,44 +4143,98 @@ table.records-table tbody tr.active td { background: transparent; }
 .run-step-empty { padding: 0 10px 10px; font-size: 12px; color: var(--app-fg-muted); }
 
 /* ---- Personal budget (apps/console/src/pages/Budget*.tsx) ---- */
-.bud-tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--app-border); overflow-x: auto; }
+.bud-tabs { display: flex; gap: 4px; padding: 0 18px; border-bottom: 1px solid var(--app-border); overflow-x: auto; flex-shrink: 0; }
 .bud-tab { padding: 10px 12px; font-size: 13px; color: var(--app-fg-muted); text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; }
 .bud-tab:hover { color: var(--app-fg); }
 .bud-tab:focus-visible { outline: 2px solid var(--app-primary); outline-offset: -2px; }
 .bud-tab.is-active { color: var(--app-fg); border-bottom-color: var(--app-primary); font-weight: 600; }
-.bud-body { display: flex; flex-direction: column; gap: 16px; padding: 16px; max-width: 880px; width: 100%; box-sizing: border-box; }
-.bud-month { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.bud-month-label input, .bud-field input[type="text"] {
-  padding: 6px 8px; font: inherit; font-size: 13px; color: var(--app-fg);
-  background: var(--app-card); border: 1px solid var(--app-input-bd); border-radius: 6px;
-}
+/* .main clips its children, so the page body scrolls itself. */
+.bud-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 18px 28px; }
+.bud-body { display: flex; flex-direction: column; gap: 14px; width: 100%; max-width: 1080px; margin: 0 auto; }
+.bud-body .dash-card { padding: 16px 18px; gap: 14px; border-radius: 12px; }
+.bud-body .dash-card-title { margin: 0; }
+.bud-narrow { max-width: 520px; }
+.bud-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; align-items: start; }
+.bud-grid > * { min-width: 0; }
+@media (max-width: 900px) { .bud-grid { grid-template-columns: minmax(0, 1fr); } }
+
+.bud-hint { margin: 0; font-size: 12px; line-height: 1.5; color: var(--app-fg-muted); }
+.bud-ok { margin: 0; font-size: 13px; color: var(--app-green); }
+.bud-error { margin: 0; font-size: 13px; color: var(--app-destructive); }
+.bud-err { font-size: 12px; color: var(--app-destructive); }
 .bud-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-.bud-total-num { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.bud-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; font-size: 13px; }
-.bud-cat, .bud-mini { display: flex; flex-direction: column; gap: 6px; }
+
+.bud-input { width: 100%; box-sizing: border-box; height: 34px; padding: 0 10px; font: inherit; font-size: 13px; color: var(--app-fg); background: var(--app-bg-sunken); border: 1px solid var(--app-input-bd); border-radius: 6px; }
+.bud-input:focus-visible { outline: 2px solid var(--app-primary); outline-offset: 1px; }
+.bud-input[aria-invalid="true"] { border-color: var(--app-destructive); }
+[data-theme="dark"] .bud-input { color-scheme: dark; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .bud-input { color-scheme: dark; } }
+.bud-field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--app-fg-muted); }
+
+.bud-month { display: flex; align-items: center; gap: 6px; }
+.bud-month .bud-input { width: 180px; background: var(--app-card); }
+.bud-month .btn { height: 34px; min-width: 34px; justify-content: center; font-size: 16px; }
+
+.bud-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 0; }
+.bud-stats dt { font-size: 12px; color: var(--app-fg-muted); }
+.bud-stats dd { margin: 4px 0 0; font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--app-fg); overflow-wrap: anywhere; }
+.bud-stats .is-over dd { color: var(--app-destructive); }
+@media (max-width: 520px) { .bud-stats dd { font-size: 20px; } }
+
+.bud-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; font-size: 13px; }
+.bud-list > li + li { border-top: 1px solid var(--app-border-soft); }
+.bud-list > li { padding: 12px 0; }
+.bud-list > li:first-child { padding-top: 0; }
+.bud-list > li:last-child { padding-bottom: 0; }
+.bud-cat, .bud-mini { display: flex; flex-direction: column; gap: 8px; }
 .bud-mini-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .bud-name { font-weight: 600; }
 .bud-num { font-variant-numeric: tabular-nums; color: var(--app-fg-muted); font-size: 12px; }
-.bud-bar { height: 8px; border-radius: 999px; background: var(--app-muted); overflow: hidden; }
-.bud-bar-fill { height: 100%; background: var(--app-teal); }
+.bud-bar { height: 6px; border-radius: 999px; background: var(--app-muted); overflow: hidden; }
+.bud-bar-fill { height: 100%; border-radius: 999px; background: var(--app-teal); }
+.bud-bar-near .bud-bar-fill { background: var(--app-amber); }
+.bud-bar-over .bud-bar-fill { background: var(--app-destructive); }
 .bud-status { font-size: 12px; font-weight: 600; }
 .bud-status.bud-under { color: var(--app-green); }
 .bud-status.bud-near { color: var(--app-amber); }
 .bud-status.bud-over { color: var(--app-destructive); }
-.bud-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
-.bud-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--app-fg-muted); }
-.bud-check { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 32px; align-self: flex-end; }
-.bud-err { color: var(--app-destructive); font-size: 12px; }
-.bud-actions, .bud-row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.bud-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
 
-/* Budget: import and bank connections */
-.bud-form { display: grid; gap: 12px; max-width: 520px; }
-.bud-field { display: grid; gap: 4px; font-size: 13px; }
-.bud-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
-.bud-ok { color: var(--text); margin: 0; }
-.bud-error { color: var(--danger, #b3261e); margin: 0; font-size: 13px; }
-.bud-banks { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
-.bud-bank { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--border, rgba(128,128,128,.25)); }
-.bud-bank-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
-.bud-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; }
-.bud-chip-needs_login, .bud-chip-error { font-weight: 600; }
+.bud-chips { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.bud-chips li { padding: 4px 10px; font-size: 12px; border-radius: 999px; background: var(--app-accent-bg); color: var(--app-fg); }
+.bud-table-wrap { overflow-x: auto; }
+.bud-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.bud-table th { padding: 0 10px 8px; text-align: left; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--app-fg-muted); border-bottom: 1px solid var(--app-border); white-space: nowrap; }
+.bud-table td { padding: 10px; vertical-align: middle; border-bottom: 1px solid var(--app-border-soft); color: var(--app-fg); }
+.bud-table tr:last-child td { border-bottom: 0; }
+.bud-table th:first-child, .bud-table td:first-child { padding-left: 0; }
+.bud-table th:last-child, .bud-table td:last-child { padding-right: 0; }
+.bud-table .bud-right { text-align: right; font-variant-numeric: tabular-nums; }
+.bud-pick { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.bud-pick select.bud-input { flex: 1; min-width: 150px; }
+.bud-row-actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+
+/* Budgets page: the add/edit form sits on one line when there is room. */
+.bud-form { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+.bud-actions { display: flex; gap: 8px; align-items: center; height: 34px; margin-top: 24px; }
+.bud-actions .btn { height: 34px; }
+.bud-check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--app-fg-muted); }
+@media (max-width: 640px) { .bud-form { grid-template-columns: minmax(0, 1fr); } .bud-actions { margin-top: 0; } }
+
+/* Overview: adding transactions by file or bank connection. */
+.bud-section { display: flex; flex-direction: column; gap: 10px; }
+.bud-section + .bud-section { border-top: 1px solid var(--app-border); padding-top: 14px; }
+.bud-subtitle { margin: 0; font-size: 14px; font-weight: 600; color: var(--app-fg); }
+.bud-file { position: relative; display: flex; align-items: center; gap: 10px; min-width: 0; cursor: pointer; border-radius: 6px; }
+.bud-file:focus-within { outline: 2px solid var(--app-primary); outline-offset: 2px; }
+.bud-file-name { font-size: 12px; color: var(--app-fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.bud-submit { align-self: flex-start; }
+.bud-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.bud-row .btn, a.btn { text-decoration: none; }
+.bud-banks { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.bud-bank { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--app-border); border-radius: 8px; font-size: 13px; }
+.bud-bank-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.bud-chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid currentColor; }
+.bud-chip-active { color: var(--app-green); }
+.bud-chip-needs_login { color: var(--app-amber); }
+.bud-chip-error { color: var(--app-destructive); }
