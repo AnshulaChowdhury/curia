@@ -209,6 +209,8 @@ const SECRET_PATTERNS: RegExp[] = [
   /Bearer\s+[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]*/g,
   // Generic long hex tokens (32+ hex chars, word-boundary anchored)
   /(?<![a-zA-Z0-9])[a-f0-9]{32,}(?![a-zA-Z0-9])/g,
+  // A secret already removed on its way through the bus (ADR-070): the draft still tried to carry one.
+  /\[secret removed\]/g,
 ];
 
 // Matches any RFC 5321-ish email address in a string.

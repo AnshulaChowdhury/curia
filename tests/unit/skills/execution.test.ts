@@ -256,19 +256,19 @@ describe('ExecutionLayer', () => {
   it('provides secret access scoped to manifest declarations', async () => {
     process.env.TEST_SECRET_KEY = 'secret-value-123';
 
+    let received: string | undefined;
     const handler: ToolHandler = {
       execute: async (ctx: ToolContext) => {
-        const secret = ctx.secret('TEST_SECRET_KEY');
-        return { success: true, data: `secret=${secret}` };
+        received = ctx.secret('TEST_SECRET_KEY');
+        return { success: true, data: `secret=${received}` };
       },
     };
     registry.register(makeManifest({ secrets: ['TEST_SECRET_KEY'] }), handler);
 
     const result = await execution.invoke('test-skill', { query: 'need-secret' });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data).toBe('secret=secret-value-123');
-    }
+    expect(received).toBe('secret-value-123');
+    // The tool may use the value, but repeating it back never reaches the model (ADR-070).
+    expect(result).toEqual({ success: true, data: 'secret=[secret removed]' });
 
     delete process.env.TEST_SECRET_KEY;
   });

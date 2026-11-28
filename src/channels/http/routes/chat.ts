@@ -14,6 +14,7 @@ import type { EventRouter } from '../event-router.js';
 import { assertSecret, CONSOLE_RATE, type SessionStore } from '../session-auth.js';
 import { markdownToHtml } from '../../../format/markdown-to-html.js';
 import { fetchChatHistoryPage } from '../chat-history-page.js';
+import { redactSecrets } from '../../../security/redact-secrets.js';
 
 export interface ChatRouteOptions {
   pool: Pool;
@@ -53,7 +54,7 @@ export async function chatRoutes(
    * POST /api/chat/messages — publish a chat message and ack immediately.
    *
    * Body: { message: string, conversationId?: string }
-   * Response: 202 { conversationId }
+   * Response: 202 { conversationId, keptMessage? } — keptMessage is present when a secret was removed.
    *
    * Ack-and-stream (#985): the handler publishes the inbound message and returns
    * 202 without waiting for the agent's reply. The final reply and intermediate
@@ -75,12 +76,15 @@ export async function chatRoutes(
         ? body.conversationId
         : `kg-web-${randomUUID()}`;
 
+    // Removed here, before anything records or reads it, and sent back so the screen can show what was kept (ADR-070).
+    const message = redactSecrets(body.message);
+
     try {
       await bus.publish('channel', createInboundMessage({
         conversationId,
         channelId: WEB_CHANNEL_ID,
         senderId: WEB_SENDER_ID,
-        content: body.message,
+        content: message,
         // Tag with structural channel trust level — session-cookie auth earns medium trust,
         // same as bearer token auth on the API channel. Required for messageTrustScore computation.
         metadata: { trustLevel: 'medium' },
@@ -93,7 +97,7 @@ export async function chatRoutes(
     }
 
     // Ack: the reply is delivered over the SSE stream, not this response.
-    return reply.status(202).send({ conversationId });
+    return reply.status(202).send(message === body.message ? { conversationId } : { conversationId, keptMessage: message });
   });
 
   /**

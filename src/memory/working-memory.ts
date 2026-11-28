@@ -8,6 +8,7 @@ import {
   withDbRetry,
 } from '../db/resilience.js';
 import { rewriteLlmFailureTurns } from './llm-failure-turn.js';
+import { redactSecrets } from '../security/redact-secrets.js';
 import { isUuid } from '../util/uuid.js';
 import {
   CONTACT_RECENT_HISTORY_MAX_TURNS,
@@ -120,6 +121,11 @@ interface StorageBackend {
   drainSummarization(timeoutMs: number): Promise<void>;
 }
 
+function withoutSecrets<T extends { content: string }>(turn: T): T {
+  const content = redactSecrets(turn.content);
+  return content === turn.content ? turn : { ...turn, content };
+}
+
 /**
  * Working memory stores conversation turns per conversation + agent pair.
  * This is Tier 1 memory — short-lived, scoped to a conversation, survives restarts.
@@ -163,7 +169,8 @@ export class WorkingMemory {
     turn: ConversationTurn,
     meta?: AddTurnAttribution,
   ): Promise<void> {
-    await this.backend.add(conversationId, agentId, turn, meta);
+    // Nothing secret is stored (ADR-070).
+    await this.backend.add(conversationId, agentId, withoutSecrets(turn), meta);
   }
 
   async getHistory(
@@ -171,7 +178,8 @@ export class WorkingMemory {
     agentId: string,
     options?: GetHistoryOptions,
   ): Promise<ConversationTurn[]> {
-    const turns = await this.backend.get(conversationId, agentId, options?.maxTurns);
+    // Rows stored before secrets were removed on the way in are cleaned on the way out.
+    const turns = (await this.backend.get(conversationId, agentId, options?.maxTurns)).map(withoutSecrets);
     // Default: rewrite `_curia_protocol: llm_failure` envelopes so LLM context,
     // summarization, and new readers never see the raw marker (#1775). Callers
     // that must inspect storage (persist pairing, diagnostics, tests) pass `{ raw: true }`.
@@ -196,7 +204,7 @@ export class WorkingMemory {
       maxTurns: Math.min(50, Math.floor(requested)),
       excludeConversationId: query.excludeConversationId ?? '',
     };
-    const turns = await this.backend.getContactRecent(normalized);
+    const turns = (await this.backend.getContactRecent(normalized)).map(withoutSecrets);
     if (query.raw) return turns;
     return rewriteLlmFailureTurns(turns);
   }
@@ -223,7 +231,7 @@ export class WorkingMemory {
    * are included; llm-failure markers are left as stored (#2322).
    */
   async getTranscriptRows(conversationId: string, agentId: string): Promise<TranscriptSourceRow[]> {
-    return this.backend.getTranscriptRows(conversationId, agentId);
+    return (await this.backend.getTranscriptRows(conversationId, agentId)).map(withoutSecrets);
   }
 
   /**
@@ -815,7 +823,7 @@ class PostgresBackend implements StorageBackend {
     // This path reads the archive window via raw SQL (oldest N, not getHistory),
     // so it must apply the sanitizer explicitly — same rewrite getHistory does
     // by default (#1775). Protocol JSON is never condensed; the question is kept.
-    const forSummary = rewriteLlmFailureTurns(turnsToArchive);
+    const forSummary = rewriteLlmFailureTurns(turnsToArchive.map(withoutSecrets));
     const transcript = forSummary
       .map((t) => {
         const label = t.role === 'system' ? 'PRIOR SUMMARY' : t.role.toUpperCase();
@@ -939,7 +947,7 @@ class PostgresBackend implements StorageBackend {
       await client.query(
         `INSERT INTO working_memory (conversation_id, agent_id, role, content, created_at, expires_at)
          VALUES ($1, $2, 'system', $3, $4, $5)`,
-        [conversationId, agentId, `[Conversation summary]\n${summaryContent}`, summaryTimestamp, summaryExpiresAt],
+        [conversationId, agentId, redactSecrets(`[Conversation summary]\n${summaryContent}`), summaryTimestamp, summaryExpiresAt],
       );
 
       await client.query('COMMIT');

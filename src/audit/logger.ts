@@ -16,6 +16,7 @@ import {
 } from './hash-chain.js';
 import { writeLlmCallArchive } from './llm-call-archive.js';
 import { stripNullBytes } from './strip-null-bytes.js';
+import { redactSecretsDeep } from '../security/redact-secrets.js';
 import {
   INBOUND_REPLAY_AGED_OUT_WARN_HOURS,
   INBOUND_REPLAY_LIMIT,
@@ -161,7 +162,8 @@ export class AuditLogger {
     let sanitizedPayload: unknown;
     let serializedPayload: string;
     try {
-      sanitizedPayload = stripNullBytes(event.payload);
+      // The bus already removed secrets; this covers anything that writes here directly (ADR-070).
+      sanitizedPayload = redactSecretsDeep(stripNullBytes(event.payload));
       serializedPayload = JSON.stringify(sanitizedPayload);
     } catch (err) {
       this.logger.error({ err, eventId: event.id, eventType: event.type }, 'Audit log payload sanitization failed — event not written');

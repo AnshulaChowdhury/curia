@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSseEvent, makeMessage, formatTimestamp, linkifyText, pickRecoveredReply } from './chat-utils.js';
+import { parseSseEvent, makeMessage, formatTimestamp, linkifyText, pickRecoveredReply, keptInPlaceOf } from './chat-utils.js';
 
 describe('parseSseEvent', () => {
   it('starts a step on tool.invoke, naming who a delegation goes to', () => {
@@ -199,5 +199,13 @@ describe('linkifyText', () => {
   it('preserves balanced parentheses inside URLs', () => {
     const result = linkifyText('See https://en.wikipedia.org/wiki/Function_(mathematics) here');
     expect(result).toContain('<a href="https://en.wikipedia.org/wiki/Function_(mathematics)"');
+  });
+});
+
+describe('keptInPlaceOf', () => {
+  it('replaces the sent message with what was kept and adds the note after it', () => {
+    const thread = [makeMessage('agent', 'hi'), makeMessage('user', 'typed'), makeMessage('status', 'later')];
+    const note = makeMessage('status', 'removed');
+    expect(keptInPlaceOf(thread, thread[1]!.id, 'kept', note).map(m => m.text)).toEqual(['hi', 'kept', 'removed', 'later']);
   });
 });

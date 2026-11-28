@@ -8,6 +8,7 @@
 import type { DbPool } from '../db/connection.js';
 import type { Logger } from '../logger.js';
 import { encrypt, decrypt } from './crypto.js';
+import { rememberVaultSecret } from '../security/redact-secrets.js';
 import type { UserSecretDetails } from './user-secret-details.js';
 
 export type ValueFormat = 'string' | 'json';
@@ -30,7 +31,26 @@ export class SecretsService {
     const row = result.rows[0];
     if (!row) return null;
     // A decrypt failure (wrong key / corrupt row) is a real, loud problem — let it propagate.
-    return decrypt(row.encrypted_value, row.iv, this.key);
+    return this.open(name, row, 'string');
+  }
+
+  /** Decrypt a row, remembering the value so it is removed from anything Curia records or shows (ADR-070). */
+  private open(name: string, row: { encrypted_value: string; iv: string }, format: ValueFormat): string {
+    const value = decrypt(row.encrypted_value, row.iv, this.key);
+    rememberVaultSecret(name, value, format);
+    return value;
+  }
+
+  /** Read every entry once, so values nothing has asked for yet are known too. Returns the names that failed. */
+  async rememberAll(): Promise<string[]> {
+    const result = await this.pool.query<{ name: string; encrypted_value: string; iv: string; value_format: ValueFormat }>(
+      'SELECT name, encrypted_value, iv, value_format FROM secrets',
+    );
+    const failed: string[] = [];
+    for (const row of result.rows) {
+      try { this.open(row.name, row, row.value_format); } catch { failed.push(row.name); }
+    }
+    return failed;
   }
 
   /** Decrypt + JSON.parse a 'json' secret. Throws if the row is not 'json'. Null if missing. */
@@ -47,18 +67,21 @@ export class SecretsService {
     // T is trusted by the caller — no runtime validation is performed here.
     // Callers storing structured secrets must validate the shape after retrieval
     // (e.g. with Zod or an explicit type guard) if they need a runtime guarantee.
-    return JSON.parse(decrypt(row.encrypted_value, row.iv, this.key)) as T;
+    return JSON.parse(this.open(name, row, 'json')) as T;
   }
 
   /** Encrypt and upsert a string secret. */
   async set(name: string, value: string): Promise<void> {
+    rememberVaultSecret(name, value, 'string');
     const { ciphertext, iv } = encrypt(value, this.key);
     await this.upsert(name, 'string', ciphertext, iv);
   }
 
   /** JSON-serialize, encrypt, and upsert a structured secret. */
   async setJSON(name: string, obj: unknown): Promise<void> {
-    const { ciphertext, iv } = encrypt(JSON.stringify(obj), this.key);
+    const text = JSON.stringify(obj);
+    rememberVaultSecret(name, text, 'json');
+    const { ciphertext, iv } = encrypt(text, this.key);
     await this.upsert(name, 'json', ciphertext, iv);
   }
 

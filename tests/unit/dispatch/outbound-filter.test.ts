@@ -306,6 +306,11 @@ describe('OutboundContentFilter', () => {
   });
 
   describe('secret-pattern rule', () => {
+    it('blocks a draft whose secret was already removed on the way here', async () => {
+      const result = await createTestFilter().check({ ...BASE_INPUT, content: 'Here you go: [secret removed]' });
+      expect(result.findings.some((f) => f.rule === 'secret-pattern')).toBe(true);
+    });
+
     it('blocks Anthropic API keys', async () => {
       const filter = createTestFilter();
       const result = await filter.check({

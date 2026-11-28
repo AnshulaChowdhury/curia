@@ -1,7 +1,7 @@
 // apps/console/src/pages/chat/useChatSession.ts
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { apiFetch } from '../../api.js';
-import { makeMessage, parseSseEvent, pickRecoveredReply } from './chat-utils.js';
+import { keptInPlaceOf, makeMessage, parseSseEvent, pickRecoveredReply } from './chat-utils.js';
 import { endStep, startStep, trace, type Work } from './activity.js';
 import type { Message, HistoryMessage } from './types.js';
 
@@ -28,6 +28,9 @@ const SSE_OPEN_TIMEOUT_MS = 3_000;
 // produces no chat reply at all) — so we don't promise a reply that may never come.
 const STILL_WORKING_TEXT =
   'This is taking longer than usual. The reply will appear here if it arrives — you can also resend.';
+// Shown when the server removed a password or key from what was just sent.
+const SECRET_REMOVED_TEXT =
+  'A password or key was removed from your message and not saved. To give Curia one, ask for a secure entry link.';
 // Shown when recovery itself failed (the /history fetch errored or returned non-ok,
 // e.g. an expired session or a server error). We have no basis to claim progress,
 // so we tell the user the status is unknown rather than implying a reply is coming.
@@ -242,10 +245,8 @@ export function useChatSession(): ChatSession {
     if (watchdogRef.current) { clearTimeout(watchdogRef.current); watchdogRef.current = null; }
 
     // Optimistic append so the user sees their message immediately.
-    setMessages((prev) => [
-      ...prev,
-      makeMessage('user', text, { timestamp: new Date() }),
-    ]);
+    const sent = makeMessage('user', text, { timestamp: new Date() });
+    setMessages((prev) => [...prev, sent]);
     isSending.current = true;
     setSending(true);
     const showWork = (next: Work | null) => { workRef.current = next; setWork(next); };
@@ -415,6 +416,16 @@ export function useChatSession(): ChatSession {
         setMessages((prev) => [...prev, makeMessage('error', errMsg)]);
         finalize();
         return;
+      }
+
+      // If a secret was removed, the thread must show what was kept, not what was typed.
+      try {
+        const { keptMessage } = await res.json() as { keptMessage?: string };
+        if (typeof keptMessage === 'string') {
+          setMessages((prev) => keptInPlaceOf(prev, sent.id, keptMessage, makeMessage('status', SECRET_REMOVED_TEXT)));
+        }
+      } catch (ackErr) {
+        console.error('[useChatSession] failed to read the send acknowledgement:', ackErr);
       }
 
       // 202 ack received. The reply arrives over SSE; arm the watchdog in case it
