@@ -30,3 +30,20 @@ Curia calls Plaid's REST API directly (`src/budget/plaid-client.ts`, no SDK) and
 - Plaid is a third party that sees which banks are linked and returns transaction data. It needs the owner's Plaid account, and production access for Canadian banks needs Plaid's approval, which this change does not assume.
 - Categorisation of imported rows is a separate step; until it exists they arrive uncategorised and show under "needs you".
 - Disconnecting revokes the item at Plaid and deletes the stored token; if Plaid refuses, the link and token are still removed locally.
+
+## Amendment (2026-11-28): logging in again, and the same account twice
+
+- **Reconnect uses Plaid's update mode.** The link keeps its access token, item and sync cursor. Connecting the bank
+  afresh instead gave every transaction a new Plaid id, so history was imported again.
+- **An account is imported through one connection only.** Plaid issues a new account id on every connection, so an
+  account is recognised by institution, kind, subtype and last digits (`budget_bank_account_history`, migration 139).
+  A second login to a joint account has that account left out and the owner told why; if every account on it is already
+  connected, the new item is removed at Plaid. If the accounts cannot be read, nothing is added.
+- **A disconnected account that is added again** imports only transactions after those already stored. On the last
+  stored day, each amount already there is skipped once. A transaction dated earlier that settled after the
+  disconnection is missed.
+- **Limits.** Holders of a joint card with different numbers are not recognised, nor is an account without last digits.
+  Two different accounts sharing all four details would be wrongly left out. Accounts disconnected before this change
+  have no history. An account left out stays out of that connection; if the other one is removed, disconnect this one
+  and add it again.
+

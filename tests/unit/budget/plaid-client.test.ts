@@ -16,6 +16,14 @@ describe('PlaidClient', () => {
     expect(body).toMatchObject({ client_id: 'cid', secret: 'sec', country_codes: ['CA'], products: ['transactions'] });
   });
 
+  it('asks for update mode with the access token and no products, which Plaid refuses there', async () => {
+    const f = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => ok({ link_token: 'link-sandbox-2' }));
+    await new PlaidClient({ credentials: async () => creds, fetchImpl: f as unknown as typeof fetch }).createLinkToken('owner', 'access-sandbox-1');
+    const body = JSON.parse(String(f.mock.calls[0]![1]!.body));
+    expect(body).toMatchObject({ access_token: 'access-sandbox-1', user: { client_user_id: 'owner' }, country_codes: ['CA'] });
+    expect(body).not.toHaveProperty('products');
+  });
+
   it('uses the production host when told to', async () => {
     const f = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => ok({ added: [], modified: [], removed: [], next_cursor: 'c', has_more: false, accounts: [] }));
     await new PlaidClient({ credentials: async () => ({ ...creds, env: 'production' }), fetchImpl: f as unknown as typeof fetch }).sync('tok', null);

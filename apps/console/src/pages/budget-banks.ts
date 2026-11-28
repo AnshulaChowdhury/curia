@@ -65,7 +65,12 @@ export function createBankClient(f: Fetcher = apiFetch) {
     },
     banks: () => json<BanksState>('/api/budget/banks'),
     async linkToken(): Promise<string> { return (await post('/api/budget/banks/link-token'))['linkToken'] as string; },
-    connect: (publicToken: string, institution: string) => post('/api/budget/banks', { publicToken, institution }),
+    async reconnectToken(id: string): Promise<string> { return (await post(`/api/budget/banks/${encodeURIComponent(id)}/link-token`))['linkToken'] as string; },
+    /** `notice` says which accounts were left out as already connected, when any were. */
+    async connect(publicToken: string, institution: string): Promise<{ notice: string | null }> {
+      const body = await post('/api/budget/banks', { publicToken, institution });
+      return { notice: typeof body['notice'] === 'string' ? body['notice'] : null };
+    },
     syncAll: () => post('/api/budget/banks/sync'),
     async syncOne(id: string): Promise<number> { return (await post(`/api/budget/banks/${encodeURIComponent(id)}/sync`))['added'] as number; },
     async disconnect(id: string): Promise<void> { await ensure(await f(`/api/budget/banks/${encodeURIComponent(id)}`, { method: 'DELETE' })); },
@@ -99,17 +104,30 @@ export function loadPlaid(): Promise<PlaidGlobal> {
   return plaidLoading;
 }
 
-/** Opens Plaid Link; resolves true when a bank was connected, false when the person closed it. */
-export async function runPlaidLink(client = bankClient): Promise<boolean> {
-  const [token, Plaid] = await Promise.all([client.linkToken(), loadPlaid()]);
-  return new Promise<boolean>((resolve, reject) => {
+/** Opens Plaid Link with a token and runs `done` on success. Resolves null when the person closed it. */
+async function openPlaidLink<T>(linkToken: Promise<string>, done: (publicToken: string, institution: string) => Promise<T>): Promise<T | null> {
+  const [token, Plaid] = await Promise.all([linkToken, loadPlaid()]);
+  return new Promise<T | null>((resolve, reject) => {
     const handler = Plaid.create({
       token,
       onSuccess: (publicToken, metadata) => {
-        client.connect(publicToken, metadata.institution?.name ?? '').then(() => resolve(true), reject).finally(() => handler.destroy());
+        done(publicToken, metadata.institution?.name ?? '').then(resolve, reject).finally(() => handler.destroy());
       },
-      onExit: err => { handler.destroy(); if (err?.display_message) reject(new Error(err.display_message)); else resolve(false); },
+      onExit: err => { handler.destroy(); if (err?.display_message) reject(new Error(err.display_message)); else resolve(null); },
     });
     handler.open();
   });
+}
+
+/** Connects a bank. Resolves null when the person closed Plaid. */
+export function runPlaidLink(client = bankClient): Promise<{ notice: string | null } | null> {
+  return openPlaidLink(client.linkToken(), (publicToken, institution) => client.connect(publicToken, institution));
+}
+
+/**
+ * Logs in to an existing connection's bank again (Plaid's update mode). The connection keeps its access token, so the
+ * public token is not exchanged: the link is only synced. Resolves false when the person closed Plaid.
+ */
+export async function runPlaidReconnect(id: string, client = bankClient): Promise<boolean> {
+  return (await openPlaidLink(client.reconnectToken(id), async () => { await client.syncOne(id); return true; })) ?? false;
 }

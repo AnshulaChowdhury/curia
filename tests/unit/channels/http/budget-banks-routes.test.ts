@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import Fastify from 'fastify';
 import { budgetBanksRoutes } from '../../../../src/channels/http/routes/budget-banks.js';
 import { PlaidError } from '../../../../src/budget/plaid-client.js';
+import { DuplicateAccountsError } from '../../../../src/budget/bank-sync.js';
 import type { Logger } from '../../../../src/logger.js';
 import type { SessionStore } from '../../../../src/channels/http/session-auth.js';
 
@@ -12,7 +13,7 @@ const ID = '11111111-1111-4111-8111-111111111111';
 
 async function app(over: Record<string, unknown> = {}) {
   const link = { id: ID, institution: 'Invented Bank', status: 'active', lastError: null, lastSyncedAt: null, accounts: [] };
-  const sync = { list: vi.fn(async () => [link]), connect: vi.fn(async () => link), syncOne: vi.fn(async () => 3), syncAll: vi.fn(async () => undefined), remove: vi.fn(async () => true), ...over };
+  const sync = { list: vi.fn(async () => [link]), connect: vi.fn(async () => ({ link, notice: null })), reconnectToken: vi.fn(async () => 'link-sandbox-update'), syncOne: vi.fn(async () => 3), syncAll: vi.fn(async () => undefined), remove: vi.fn(async () => true), ...over };
   const plaid = { configured: vi.fn(async () => true), createLinkToken: vi.fn(async () => 'link-sandbox-1') };
   const a = Fastify();
   await a.register(budgetBanksRoutes, { logger, sync: sync as never, plaid, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
@@ -24,7 +25,7 @@ describe('/api/budget/banks', () => {
     const { a, sync, plaid } = await app();
     for (const [method, url] of [
       ['GET', '/api/budget/banks'], ['POST', '/api/budget/banks/link-token'], ['POST', '/api/budget/banks'],
-      ['POST', '/api/budget/banks/sync'], ['POST', `/api/budget/banks/${ID}/sync`], ['DELETE', `/api/budget/banks/${ID}`],
+      ['POST', `/api/budget/banks/${ID}/link-token`], ['POST', '/api/budget/banks/sync'], ['POST', `/api/budget/banks/${ID}/sync`], ['DELETE', `/api/budget/banks/${ID}`],
     ] as const) {
       expect((await a.inject({ method, url, payload: {} })).statusCode, `${method} ${url}`).toBe(401);
     }
@@ -54,6 +55,25 @@ describe('/api/budget/banks', () => {
     expect(res.statusCode).toBe(400);
     expect(res.json()).toMatchObject({ code: 'NOT_CONFIGURED' });
     expect(JSON.stringify(res.json())).not.toMatch(/access/i);
+  });
+
+  it('passes on which accounts were left out, and answers 409 when that was all of them', async () => {
+    const payload = { publicToken: 'public-sandbox-abc123', institution: 'Invented Bank' };
+    const some = await app({ connect: vi.fn(async () => ({ link: {}, notice: 'One account is already connected.' })) });
+    expect((await some.a.inject({ method: 'POST', url: '/api/budget/banks', headers: auth, payload })).json()).toMatchObject({ ok: true, notice: 'One account is already connected.' });
+    const all = await app({ connect: vi.fn(async () => { throw new DuplicateAccountsError('Nothing was added.'); }) });
+    const res = await all.a.inject({ method: 'POST', url: '/api/budget/banks', headers: auth, payload });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: 'Nothing was added.', code: 'DUPLICATE_ACCOUNTS' });
+  });
+
+  it('returns a token to log in to an existing link again', async () => {
+    const { a, sync } = await app();
+    const res = await a.inject({ method: 'POST', url: `/api/budget/banks/${ID}/link-token`, headers: auth });
+    expect(res.json()).toEqual({ linkToken: 'link-sandbox-update' });
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(sync.reconnectToken).toHaveBeenCalledWith(ID);
+    expect((await a.inject({ method: 'POST', url: '/api/budget/banks/nope/link-token', headers: auth })).statusCode).toBe(400);
   });
 
   it('syncs one link, disconnects one, and rejects a bad id', async () => {
