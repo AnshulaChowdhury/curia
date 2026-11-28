@@ -61,7 +61,13 @@ export async function historyRoutes(app: FastifyInstance, options: HistoryRouteO
     if (typeof window === 'string') return reply.status(400).send({ error: window });
     if (query.before !== undefined && !/^\d{1,18}$/.test(query.before)) return reply.status(400).send({ error: 'Invalid before' });
     try {
-      return reply.send(await history.steps({ ...window, conversationId: query.conversation || null, before: query.before }));
+      const page = await history.steps({ ...window, conversationId: query.conversation || null, before: query.before });
+      // Semgrep direct-response-write flags a query value reaching reply.send as XSS. Not applicable: this sends an
+      // object, which Fastify serializes as application/json, never HTML, with nosniff set app-wide (both pinned by
+      // tests/unit/channels/http/history-routes.test.ts), and the console draws the text as text. The route is
+      // session-authed. resp.render() is for HTML templates. Same pattern as the other console JSON routes.
+      // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write
+      return reply.send(page);
     } catch (err) {
       logger.error({ err, conversationId: query.conversation }, 'history steps query failed');
       return reply.status(500).send({ error: 'Failed to load history' });
