@@ -50,10 +50,14 @@ export class PlaidClient {
     return json as T;
   }
 
-  /** A short-lived token the browser hands to Plaid Link to start connecting a bank. */
-  async createLinkToken(userId: string): Promise<string> {
+  /**
+   * A short-lived token the browser hands to Plaid Link. With an access token, Link opens in update mode to renew that
+   * connection (Plaid refuses `products` there); without one, it connects a bank.
+   */
+  async createLinkToken(userId: string, accessToken?: string): Promise<string> {
     const r = await this.call<{ link_token: string }>('/link/token/create', {
-      client_name: 'Curia budget', language: 'en', country_codes: ['CA'], user: { client_user_id: userId }, products: ['transactions'],
+      client_name: 'Curia budget', language: 'en', country_codes: ['CA'], user: { client_user_id: userId },
+      ...(accessToken ? { access_token: accessToken } : { products: ['transactions'] }),
     });
     return r.link_token;
   }

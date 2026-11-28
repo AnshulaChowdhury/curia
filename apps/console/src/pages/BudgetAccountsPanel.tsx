@@ -75,7 +75,7 @@ export function BankLinkRow({ link, busy, onSync, onDisconnect }: {
         {link.lastError && link.status !== 'active' && <div className="bud-error">{link.lastError}</div>}
       </div>
       <div className="bud-bank-actions">
-        {link.status === 'needs_login' && <a className="btn btn-primary btn-sm" href={CONNECT_PATH}>Reconnect</a>}
+        {link.status === 'needs_login' && <a className="btn btn-primary btn-sm" href={`${CONNECT_PATH}?link=${encodeURIComponent(link.id)}`}>Reconnect</a>}
         <button type="button" className="btn btn-secondary btn-sm" disabled={busy} onClick={onSync}>Sync now</button>
         {confirming ? (
           <span role="group" aria-label={`Disconnect ${link.institution}?`}>

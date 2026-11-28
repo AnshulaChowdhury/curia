@@ -15,6 +15,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Fixed
 
+- **Bank reconnect** — renews the existing connection instead of adding a second one.
+- **Duplicate bank accounts** — blocked with an explanation; re-added accounts import only newer transactions.
 - **Proposal card** — later months were cut off; now scrolls, with a visible scrollbar.
 - **Spreadsheet dates** — month and day names show in English, not Chinese.
 - **Unbacked claims** — budget chats no longer say work was delegated when nothing ran.
