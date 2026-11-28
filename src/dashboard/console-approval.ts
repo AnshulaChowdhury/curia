@@ -235,6 +235,7 @@ export async function approveFromConsole(
       conversationId: row.conversationId ?? undefined,
       taskEventId: row.taskId,
       taskMetadata: { originator },
+      record: { by: 'system:approval', conversationId: row.conversationId ?? undefined },
     },
   );
 

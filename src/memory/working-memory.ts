@@ -91,6 +91,8 @@ export interface SummarizationConfig {
   keepWindow: number;
   /** LLM provider used for the condensation call — same provider the agent uses. */
   provider: LLMProvider;
+  /** The provider to use for one conversation, so the call is recorded against it (ADR-072). */
+  providerFor?: (conversationId: string) => LLMProvider;
   /** Model identifier to pass explicitly to provider.chat() for the summarization call. */
   model: string;
 }
@@ -859,7 +861,7 @@ class PostgresBackend implements StorageBackend {
       transcript,
     ].join('\n');
 
-    const response = await provider.chat({
+    const response = await (config.providerFor?.(conversationId) ?? provider).chat({
       messages: [{ role: 'user', content: summaryPrompt }],
       model,
       // Summarization is infrastructure, not an agent turn (ADR-048 §3).

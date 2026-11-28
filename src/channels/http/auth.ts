@@ -58,6 +58,8 @@ const SELF_AUTHED_API_PREFIXES = [
   '/api/jobs',
   '/api/antfarm',
   '/api/activity',
+  // Settings → History (what every agent did): session auth via assertSecret on every route.
+  '/api/history',
   '/api/dashboard',
   '/api/autonomy',
   '/api/memory',

@@ -125,6 +125,7 @@ export class ConversationCheckpointProcessor {
             ? { text: transcript, source, subject_contact_id: subjectContactId }
             : { text: transcript, source },
           callerContext,
+          { record: { by: 'system:memory-extraction', conversationId } },
         ),
       ),
     );

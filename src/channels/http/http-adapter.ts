@@ -46,6 +46,8 @@ import { documentsRoutes } from './routes/documents.js';
 import { identityRoutes } from './routes/identity.js';
 import { executiveRoutes } from './routes/executive.js';
 import { autonomyRoutes } from './routes/autonomy.js';
+import { historyRoutes } from './routes/history.js';
+import { HistoryRepo } from '../../audit/history-repo.js';
 import {
   memoryRetentionRoutes,
   type MemoryRetentionSnapshot,
@@ -554,6 +556,16 @@ export class HttpAdapter implements Channel {
         autonomyService: this.config.autonomyService,
         webAppBootstrapSecret,
         sessions,
+      });
+    }
+
+    // Everything agents did, for Settings → History (ADR-072).
+    if (webAppBootstrapSecret) {
+      await this.app.register(historyRoutes, {
+        history: new HistoryRepo(pool),
+        webAppBootstrapSecret,
+        sessions,
+        logger,
       });
     }
 

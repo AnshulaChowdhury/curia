@@ -705,6 +705,10 @@ async function main(): Promise<void> {
           // an OpenRouter model routes summarization through OpenRouterProvider, not
           // the hardwired Anthropic singleton. (#646)
           provider: resolveProviderForModel(summarizationModel, 'WorkingMemory summarization'),
+          providerFor: (conversationId: string) => new TelemetryLlmProvider(
+            resolveProviderForModel(summarizationModel, 'WorkingMemory summarization'),
+            bus, logger, 'working-memory-summarizer', modelRegistry, conversationId,
+          ),
           model: summarizationModel,
         }
       : undefined,

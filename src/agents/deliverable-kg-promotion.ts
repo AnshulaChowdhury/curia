@@ -144,6 +144,7 @@ export async function promoteDeliverableToKg(
         conversationId,
         parentEventId: opts.parentEventId,
         taskEventId: task.id,
+        record: { by: 'system:memory-extraction', conversationId },
       };
       const callerContext = {
         contactId: 'system',

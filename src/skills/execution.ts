@@ -120,7 +120,7 @@ import {
   formatDestination,
   maxItemSensitivity,
 } from '../security/export-controls.js';
-import { createExportDelivered } from '../bus/events.js';
+import { createExportDelivered, createToolRecorded } from '../bus/events.js';
 import { isDbUnavailableError } from '../db/resilience.js';
 import { USER_SECRET_PREFIX } from '../secrets/user-secret-name.js';
 import { splitCommaSeparatedAddresses } from '../contacts/principal-carveout-parse.js';
@@ -229,6 +229,12 @@ export interface InvokeOptions {
    * The delegate handler ends its wait; it does not cancel the specialist.
    */
   inputSignal?: AbortSignal;
+  /**
+   * Set by callers outside an agent turn, so the call is recorded with its input and output (ADR-072). The agent
+   * runtime and voice publish tool.invoke and tool.result themselves and leave this unset. It describes the record
+   * only: nothing about how the tool runs or what it may do depends on it.
+   */
+  record?: { by: string; conversationId?: string };
 }
 
 /** Cap on the input rendering passed to the escalation judge — keeps full email bodies and
@@ -1770,6 +1776,39 @@ export class ExecutionLayer {
    * Never throws — always returns a ToolResult.
    */
   async invoke(
+    toolName: string,
+    input: Record<string, unknown>,
+    caller?: CallerContext,
+    options?: InvokeOptions,
+  ): Promise<ToolResult> {
+    const record = options?.record;
+    if (!record) return this.run(toolName, input, caller, options);
+    // Copied before the run, which may rewrite the input it is given.
+    const given = { ...input };
+    const startedAt = Date.now();
+    let result: ToolResult = { success: false, error: 'The tool did not return' };
+    try {
+      result = await this.run(toolName, input, caller, options);
+      return result;
+    } finally {
+      try {
+        await this.bus?.publish('execution', createToolRecorded({
+          agentId: record.by,
+          ...(record.conversationId !== undefined && { conversationId: record.conversationId }),
+          toolName,
+          input: given,
+          result,
+          durationMs: Date.now() - startedAt,
+          ...(options.parentEventId !== undefined && { parentEventId: options.parentEventId }),
+        }));
+      } catch (err) {
+        // The tool has already run; failing the call now would report that it had not.
+        this.logger.error({ err, toolName, by: record.by }, 'Failed to record a tool call');
+      }
+    }
+  }
+
+  private async run(
     toolName: string,
     input: Record<string, unknown>,
     caller?: CallerContext,

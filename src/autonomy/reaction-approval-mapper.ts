@@ -392,6 +392,7 @@ export class ReactionApprovalMapper {
         taskMetadata: {
           originator: { contactId: deciderId, channel: channelId },
         },
+        record: { by: 'system:approval', conversationId: row.conversationId ?? undefined },
       },
     );
 

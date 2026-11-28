@@ -216,6 +216,7 @@ const EXTRACTORS: Readonly<Record<string, Extractor>> = {
   'skill.invoke': extractToolInvoke,
 
   'tool.result': extractToolResult,
+  'tool.recorded': extractToolResult,
   'skill.result': extractToolResult,
 
   'memory.store': (p, fail) => ({

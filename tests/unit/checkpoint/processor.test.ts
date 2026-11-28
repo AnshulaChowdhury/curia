@@ -180,6 +180,8 @@ describe('ConversationCheckpointProcessor', () => {
         source: expect.stringContaining('email:thread-abc'),
       }),
       expect.anything(),
+      // Runs outside an agent turn, so it asks to be recorded (ADR-072).
+      { record: { by: 'system:memory-extraction', conversationId: 'email:thread-abc' } },
     );
   });
 

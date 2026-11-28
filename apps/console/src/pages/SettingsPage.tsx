@@ -275,7 +275,7 @@ function AutonomySection() {
 // ── Settings layout ───────────────────────────────────────────────────────────
 
 // In-page settings nav (#1376). Order: Personality → Ghostwriting → Posture →
-// Autonomy → Memory. System lives as a standalone sidebar page outside this
+// Autonomy → Memory → History. System lives as a standalone sidebar page outside this
 // shell (#1765), same as Skills / Agents / Channels.
 const SETTINGS_SECTIONS = [
   { id: 'personality',  label: 'Personality',  href: '/settings/personality' },
@@ -283,6 +283,7 @@ const SETTINGS_SECTIONS = [
   { id: 'posture',      label: 'Standing preferences', href: '/settings/posture' },
   { id: 'autonomy',     label: 'Autonomy',     href: '/settings/autonomy' },
   { id: 'memory',       label: 'Memory',       href: '/settings/memory' },
+  { id: 'history',      label: 'History',      href: '/settings/history' },
 ] as const;
 
 interface SettingsLayoutProps {
@@ -303,7 +304,7 @@ export function SettingsLayout({ activeSection, children }: SettingsLayoutProps)
   return (
     <MobileMenuContext.Provider value={{ open: mobileOpen, setOpen: setMobileOpen }}>
       <div className="app-root">
-        <Sidebar activeView="settings" theme={theme} onThemeChange={setTheme} />
+        <Sidebar activeView={activeSection === 'history' ? 'history' : 'settings'} theme={theme} onThemeChange={setTheme} />
         <main className="main">
           <Topbar crumb="Settings" title={activeLabel} />
           <div className="settings-shell">

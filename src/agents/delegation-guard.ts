@@ -441,7 +441,7 @@ export async function escalateDelegationFailure(
         escalation_json: JSON.stringify(escalation),
       },
       caller,
-      options,
+      { ...options, record: { by: 'system:delegation-escalation', conversationId: options.conversationId } },
     );
     if (!result.success) {
       logger.error(
@@ -520,7 +520,7 @@ export async function addPrincipalNoteToReviewTask(
       'task-update',
       { task_id: reviewTask.id, progress_note: progressNote },
       caller,
-      options,
+      { ...options, record: { by: 'system:delegation-escalation', conversationId: options.conversationId } },
     );
     if (!result.success) {
       logger.error(
