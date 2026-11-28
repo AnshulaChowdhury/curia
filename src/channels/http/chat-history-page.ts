@@ -1,6 +1,7 @@
 import { isVoiceGreetingCueContent } from '../voice/greeting.js';
 import { stripOutboundContextPreamble } from '../../dispatch/outbound-context.js';
 import { rewriteLlmFailureTurns } from '../../memory/llm-failure-turn.js';
+import { redactSecrets } from '../../security/redact-secrets.js';
 
 /** Hard cap on raw rows scanned in one HTTP request. */
 export const CHAT_HISTORY_MAX_ROWS_SCANNED = 500;
@@ -58,9 +59,10 @@ export function toChatHistoryMessage(
   if (row.role === 'user' && isVoiceGreetingCueContent(row.content)) return null;
 
   const rewritten = rewriteLlmFailureTurns([row])[0]!;
-  const content = rewritten.role === 'user'
+  // Also covers rows stored before secrets were removed on the way in (ADR-070).
+  const content = redactSecrets(rewritten.role === 'user'
     ? stripOutboundContextPreamble(rewritten.content)
-    : rewritten.content;
+    : rewritten.content);
 
   let html: string | null = null;
   if (rewritten.role === 'assistant') {

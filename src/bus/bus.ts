@@ -1,6 +1,7 @@
 import type { BusEvent, EventType, Layer } from './events.js';
 import { canPublish, canSubscribe } from './permissions.js';
 import type { Logger } from '../logger.js';
+import { redactSecretsDeep } from '../security/redact-secrets.js';
 
 /**
  * An `agent.task` whose target id is not in the agent registry.
@@ -49,6 +50,15 @@ export interface StagedDelivery {
   deliver(): Promise<void>;
 }
 
+/**
+ * The event as everything downstream may see it: the audit log, every subscriber, and so every channel and screen
+ * (ADR-070). The publisher's own object is left alone, and is passed on unchanged when it holds no secret.
+ */
+function withoutSecrets(event: BusEvent): BusEvent {
+  const payload = redactSecretsDeep(event.payload);
+  return payload === event.payload ? event : { ...event, payload } as BusEvent;
+}
+
 export class EventBus {
   // Keyed by EventType so dispatch is O(1) lookup rather than scanning all subscribers.
   private subscribers = new Map<EventType, EventHandler[]>();
@@ -90,8 +100,9 @@ export class EventBus {
   }
 
   async publish(layer: Layer, event: BusEvent): Promise<void> {
-    await this.writeAhead(layer, event);
-    await this.deliver(event);
+    const safe = withoutSecrets(event);
+    await this.writeAhead(layer, safe);
+    await this.deliver(safe);
   }
 
   /**
@@ -106,8 +117,9 @@ export class EventBus {
    * coordinator's whole task (#2265).
    */
   async publishDetached(layer: Layer, event: BusEvent): Promise<void> {
-    await this.writeAhead(layer, event);
-    void this.deliver(event).catch((err: unknown) => {
+    const safe = withoutSecrets(event);
+    await this.writeAhead(layer, safe);
+    void this.deliver(safe).catch((err: unknown) => {
       this.logger.error(
         { err, eventType: event.type, eventId: event.id },
         'Detached subscriber delivery failed',
@@ -130,11 +142,12 @@ export class EventBus {
    * the agent turn stays detached and ordered (#2254).
    */
   async stagePublish(layer: Layer, event: BusEvent): Promise<StagedDelivery> {
-    await this.writeAhead(layer, event);
+    const safe = withoutSecrets(event);
+    await this.writeAhead(layer, safe);
     let started: Promise<void> | undefined;
     return {
       deliver: () => {
-        started ??= this.deliver(event);
+        started ??= this.deliver(safe);
         return started;
       },
     };
@@ -203,7 +216,8 @@ export class EventBus {
       { layer: event.sourceLayer, eventType: event.type, eventId: event.id },
       'Delivering persisted event',
     );
-    await this.deliver(event);
+    // Rows written before secrets were removed at publish time are cleaned on the way back out.
+    await this.deliver(withoutSecrets(event));
   }
 
   /**

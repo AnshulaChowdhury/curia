@@ -183,6 +183,7 @@ import { BrowserService } from './browser/browser-service.js';
 import { OfficeIdentityService } from './identity/service.js';
 import { ExecutiveProfileService } from './executive/service.js';
 import { loadEncryptionKey } from './secrets/crypto.js';
+import { rememberEnvironmentSecrets } from './security/redact-secrets.js';
 import { SecretsService } from './secrets/secrets-service.js';
 import { SecretCaptureService } from './secrets/secret-capture-service.js';
 import { SecretCaptureResumeSubscriber } from './secrets/secret-capture-resume-subscriber.js';
@@ -463,6 +464,18 @@ async function main(): Promise<void> {
     await applyChannelVaultSecrets(config, secretsService, process.env, logger);
   } catch (err) {
     logger.fatal({ err }, 'Failed to resolve bootstrap secrets from vault');
+    process.exit(1);
+  }
+
+  // Learn the exact values Curia holds, so none of them is ever recorded or shown (ADR-070).
+  rememberEnvironmentSecrets(process.env);
+  try {
+    const unreadable = await secretsService.rememberAll();
+    if (unreadable.length > 0) {
+      logger.warn({ names: unreadable }, 'Some vault entries could not be read; their values are only caught by shape');
+    }
+  } catch (err) {
+    logger.fatal({ err }, 'Failed to load vault values for redaction');
     process.exit(1);
   }
 

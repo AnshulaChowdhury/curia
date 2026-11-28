@@ -12,6 +12,7 @@ import type { LlmCallArchiveContent } from '../bus/events.js';
 import type { Logger } from '../logger.js';
 import { scrubPii } from '../pii/scrubber.js';
 import { createSecretPatterns } from '../security/secret-patterns.js';
+import { isSecretField, redactKnownSecrets, redactSecrets } from '../security/redact-secrets.js';
 import { stripNullBytes } from './strip-null-bytes.js';
 import { markReasoningBlocksForArchive } from '../agents/llm/reasoning-blocks.js';
 
@@ -50,7 +51,7 @@ function walkRedact(node: unknown, secretPatterns: RegExp[]): unknown {
     }
     const out: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
-      if (SENSITIVE_KEY_RE.test(key)) {
+      if (SENSITIVE_KEY_RE.test(key) || (typeof val === 'string' && isSecretField(key, true))) {
         out[key] = '[REDACTED]';
       } else {
         out[key] = walkRedact(val, secretPatterns);
@@ -63,12 +64,12 @@ function walkRedact(node: unknown, secretPatterns: RegExp[]): unknown {
 }
 
 function redactString(text: string, secretPatterns: RegExp[]): string {
-  let result = text;
+  let result = redactKnownSecrets(text);
   for (const pattern of secretPatterns) {
     pattern.lastIndex = 0;
     result = result.replace(pattern, '[REDACTED]');
   }
-  return scrubPii(result);
+  return scrubPii(redactSecrets(result));
 }
 
 export interface WriteLlmCallArchiveOptions {

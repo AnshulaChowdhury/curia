@@ -109,6 +109,11 @@ export function makeMessage(
   return { id: crypto.randomUUID(), kind, text, ...opts };
 }
 
+/** The thread with one sent message replaced by what the server kept of it, followed by a note saying why. */
+export function keptInPlaceOf(messages: Message[], sentId: string, kept: string, note: Message): Message[] {
+  return messages.flatMap(m => m.id === sentId ? [{ ...m, text: kept }, note] : [m]);
+}
+
 /**
  * Format a Date for display in the chat thread.
  * Shows "Today · 9:24 AM" for messages from today, "May 28 · 9:24 AM" otherwise.

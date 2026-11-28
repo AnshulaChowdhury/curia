@@ -9,6 +9,7 @@
 
 import sanitizeHtml from 'sanitize-html';
 import { createSecretPatterns } from '../security/secret-patterns.js';
+import { isSecretField, redactKnownSecrets, redactSecrets } from '../security/redact-secrets.js';
 
 export interface SanitizeOptions {
   /** Max output length in characters. Default: Infinity (no truncation). */
@@ -138,9 +139,12 @@ export function sanitizeOutput(
   // Fresh RegExp instances each call — /g lastIndex must not be shared across concurrent scans.
   const builtInPatterns = createSecretPatterns({ skipGenericLongHex: skipSecretRedaction });
   const allPatterns = [...builtInPatterns, ...extraRedactPatterns];
+  text = redactKnownSecrets(text);
   for (const pattern of allPatterns) {
     text = text.replace(pattern, '[REDACTED]');
   }
+  // Labelled passwords, more key formats, and the exact values Curia holds (ADR-070).
+  text = redactSecrets(text);
 
   // 4. Truncate if exceeding length limit
   if (text.length > maxLength) {
@@ -319,7 +323,10 @@ export function sanitizeObjectOutput(
           skipSecretRedaction: options.skipSecretRedaction,
           extraRedactPatterns: options.extraRedactPatterns,
         });
-        result[sanitizedKey] = walk(value);
+        // A password or key under its own field name has nothing in the string itself to give it away.
+        result[sanitizedKey] = typeof value === 'string' && value !== '' && isSecretField(key, false)
+          ? '[REDACTED]'
+          : walk(value);
       }
       return result;
     }

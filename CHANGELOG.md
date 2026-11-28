@@ -21,6 +21,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Security
 
+- **Secrets** — passwords, keys and tokens are removed before anything is stored or shown.
 - **Chat page policy** — `/chat` alone may frame Curia's own pages, for attached spreadsheets.
 - **Spreadsheet page policy** — allows three grid stylesheets and inline images; converter sandboxed.
 - **Dependency pins** — raised eight stale floors, clearing a critical Vite advisory.
