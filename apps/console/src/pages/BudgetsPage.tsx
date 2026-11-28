@@ -173,7 +173,7 @@ export default function BudgetsPage() {
                 <select className="bud-input" value={draft.kind} onChange={e => setDraft({ ...draft, kind: e.target.value as CategoryKind })}>
                   <option value="expense">Expense</option>
                   <option value="income">Income</option>
-                  <option value="savings">Savings</option>
+                  <option value="savings">Savings &amp; debt paydown</option>
                 </select>
               </label>
               <label className="bud-field">

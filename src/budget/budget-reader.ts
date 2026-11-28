@@ -6,6 +6,7 @@
 // are returned as data only.
 
 import type { BudgetStore, BudgetTransaction, CategoryKind } from './budget-store.js';
+import type { NetWorthProjector, Projection } from './projection.js';
 
 type Store = Pick<BudgetStore, 'summary' | 'plan' | 'listTransactions' | 'listCategories'>;
 
@@ -38,8 +39,39 @@ export interface BudgetTransactionForAgent {
   categorisedBy: 'rule' | 'agent_guess' | 'you' | null;
 }
 
+export interface ProjectionForAgent {
+  currency: 'CAD';
+  /** From the account balances on the Overview; null when there are none. */
+  today: { netWorth: number; assets: number; debts: number } | null;
+  accountsLeftOut: number;
+  months: Array<{ month: string; income: number; expenses: number; changeFromToday: number; netWorthAtMonthEnd: number | null; nothingBudgeted?: true }>;
+  assumptions: string;
+}
+
+export const PROJECTION_ASSUMPTIONS =
+  'Today\'s balances plus income minus expenses, from next month. Savings and debt repayment are money kept. No interest, investment growth or change in property value.';
+
+export function projectionForAgent(p: Projection): ProjectionForAgent {
+  return {
+    currency: 'CAD',
+    today: p.today && { netWorth: dollars(p.today.netWorthCents), assets: dollars(p.today.assetsCents), debts: dollars(p.today.debtsCents) },
+    accountsLeftOut: p.leftOut,
+    months: p.months.map(m => ({
+      month: m.month, income: dollars(m.incomeCents), expenses: dollars(m.expenseCents), changeFromToday: dollars(m.changeCents),
+      netWorthAtMonthEnd: m.netWorthCents === null ? null : dollars(m.netWorthCents), ...(m.empty ? { nothingBudgeted: true as const } : {}),
+    })),
+    assumptions: PROJECTION_ASSUMPTIONS,
+  };
+}
+
 export class BudgetReader {
-  constructor(private readonly store: Store) {}
+  constructor(private readonly store: Store, private readonly projector?: Pick<NetWorthProjector, 'current'>) {}
+
+  /** Net worth today and where the budget as it stands takes it. Totals only: no account is named. */
+  async netWorth(months = 6): Promise<ProjectionForAgent> {
+    if (!this.projector) throw new Error('Net worth is not available');
+    return projectionForAgent(await this.projector.current(months));
+  }
 
   async summary(month: string): Promise<BudgetSummaryForAgent> {
     if (!MONTH.test(month)) throw new Error('month must be YYYY-MM');

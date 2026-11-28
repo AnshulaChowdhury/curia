@@ -271,7 +271,8 @@ import { QboConnection, qboSettingsFromEnv } from './quickbooks/qbo-connection.j
 import { BooksReader } from './books/books-reader.js';
 import { BudgetReader } from './budget/budget-reader.js';
 import { BudgetSheetReader } from './budget/sheet-reader.js';
-import { ProposalStore } from './budget/proposal-store.js';
+import { ProposalStore, type BudgetProposer } from './budget/proposal-store.js';
+import { NetWorthProjector } from './budget/projection.js';
 import { SheetStore, isConversationId } from './budget/sheet-store.js';
 import { BudgetStore } from './budget/budget-store.js';
 import { AccountStore } from './budget/accounts-store.js';
@@ -1698,7 +1699,8 @@ async function main(): Promise<void> {
   });
 
   // The budget specialist's read-only view of the owner's personal budget (ADR-062).
-  const budgetReader = new BudgetReader(new BudgetStore(pool));
+  const budgetProjector = new NetWorthProjector(new BudgetStore(pool), new AccountStore(pool), config.timezone);
+  const budgetReader = new BudgetReader(new BudgetStore(pool), budgetProjector);
 
   // Layer 1 inbound injection scanner — extra patterns come from the already-merged
   // config (default.yaml + local.yaml, see loadYamlConfig()) so operator overrides in
@@ -1712,7 +1714,15 @@ async function main(): Promise<void> {
   const budgetSheetReader = new BudgetSheetReader(budgetSheets, injectionScanner);
   // The assistant gets `propose` alone: applying a proposal belongs to the owner's console (ADR-067).
   const budgetProposals = new ProposalStore(pool);
-  const budgetProposer = { propose: budgetProposals.propose.bind(budgetProposals) };
+  const budgetProposer: BudgetProposer = {
+    propose: async (conversationId, categories, months) => {
+      const proposal = await budgetProposals.propose(conversationId, categories, months);
+      // The proposal is saved either way; without the figures the specialist simply reports none.
+      const projection = await budgetProjector.forRows(proposal.rows)
+        .catch((err: unknown) => { logger.error({ err }, 'budget proposal: projection failed'); return undefined; });
+      return { ...proposal, ...(projection ? { projection } : {}) };
+    },
+  };
 
   // TaskRepo — used by task-create, task-list, task-update, task-complete skills.
   const workingDocsRepo = new WorkingDocsRepo(pool, logger);
@@ -3527,6 +3537,7 @@ async function main(): Promise<void> {
   });
 
   const httpAdapter = new HttpAdapter({
+    timezone: config.timezone,
     qboConnection,
     bus,
     logger,

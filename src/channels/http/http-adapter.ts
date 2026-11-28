@@ -117,6 +117,7 @@ import { budgetSheetsRoutes } from './routes/budget-sheets.js';
 import { SheetStore } from '../../budget/sheet-store.js';
 import { budgetProposalRoutes } from './routes/budget-proposals.js';
 import { ProposalStore } from '../../budget/proposal-store.js';
+import { NetWorthProjector } from '../../budget/projection.js';
 import { BudgetStore } from '../../budget/budget-store.js';
 import { booksGraphRoutes } from './routes/books-graph.js';
 import { GraphSnapshotStore } from '../../books/graph-store.js';
@@ -156,6 +157,8 @@ function createFallbackHealthService(pool: Pool, logger: Logger): HealthService 
 }
 
 export interface HttpAdapterConfig {
+  /** The owner's IANA timezone: which month is next, for the budget's net-worth projection. */
+  timezone?: string;
   bus: EventBus;
   logger: Logger;
   pool: Pool;
@@ -848,7 +851,8 @@ export class HttpAdapter implements Channel {
       await this.app.register(budgetRoutes, { logger, store: new BudgetStore(pool), webAppBootstrapSecret, sessions });
       await this.app.register(budgetAccountsRoutes, { logger, accounts: new AccountStore(pool), webAppBootstrapSecret, sessions });
       await this.app.register(budgetSheetsRoutes, { logger, sheets: new SheetStore(pool), webAppBootstrapSecret, sessions });
-      await this.app.register(budgetProposalRoutes, { logger, proposals: new ProposalStore(pool), webAppBootstrapSecret, sessions });
+      const projector = new NetWorthProjector(new BudgetStore(pool), new AccountStore(pool), this.config.timezone ?? 'UTC');
+      await this.app.register(budgetProposalRoutes, { logger, proposals: new ProposalStore(pool), projector, webAppBootstrapSecret, sessions });
       if (this.config.budgetBanks) {
         await this.app.register(budgetBanksRoutes, { logger, ...this.config.budgetBanks, webAppBootstrapSecret, sessions });
       }

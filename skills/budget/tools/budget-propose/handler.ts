@@ -7,6 +7,7 @@
 import type { ToolHandler, ToolContext, ToolResult } from '../../../../src/skills/types.js';
 import { delegationOriginChannelId, delegationOriginConversationId } from '../../../../src/agents/delegated-task-context.js';
 import { BudgetError } from '../../../../src/budget/budget-store.js';
+import { projectionForAgent } from '../../../../src/budget/budget-reader.js';
 
 export const AWAITING = 'NOTHING HAS CHANGED YET. A card in the chat shows these changes. They happen only if the owner replies "yes" or presses Apply there.';
 
@@ -23,7 +24,11 @@ export class BudgetProposeHandler implements ToolHandler {
       const count = (action: string) => proposal.rows.filter(r => r.action === action).length;
       return {
         success: true,
-        data: { proposed: true, status: AWAITING, toCreate: count('create'), toUpdate: count('update'), toArchive: count('archive') },
+        data: {
+          proposed: true, status: AWAITING, toCreate: count('create'), toUpdate: count('update'), toArchive: count('archive'),
+          // Where net worth would head if the owner approved this as it is. The card shows it, updated as they edit.
+          ...(proposal.projection ? { netWorthIfApproved: projectionForAgent(proposal.projection) } : {}),
+        },
       };
     } catch (err) {
       if (err instanceof BudgetError) return { success: false, error: err.message };
