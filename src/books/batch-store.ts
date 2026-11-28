@@ -11,6 +11,8 @@ export const EDITABLE_FIELDS = ['category', 'tax_code', 'location', 'class', 'pa
 export type EditableField = (typeof EDITABLE_FIELDS)[number];
 export type Decision = 'pending' | 'approved' | 'skipped';
 export type ResultStatus = 'posted' | 'manual' | 'failed' | 'skipped';
+/** 'complete' once no row is waiting on anyone: each is posted to QuickBooks or skipped. */
+export type BatchStatus = 'open' | 'complete';
 
 /** Flags that stop a row being approved until a category is chosen. */
 export const BLOCKING_FLAG_KINDS = ['needs_category', 'row_error', 'unpaired_transfer', 'amount_differs', 'date_differs'] as const;
@@ -64,7 +66,7 @@ export interface ReviewCard {
 export interface BatchSummary {
   batch_id: string;
   created_at: string;
-  status: string;
+  status: BatchStatus;
   rows: number;
   pending: number;
   approved: number;
@@ -166,6 +168,9 @@ const toBatchRow = (r: RowRecord): BatchRow => ({
 });
 
 const isPosted = (r: { result: RowResult | null }): boolean => r.result?.status === 'posted';
+/** Nothing left to do for this row. Waiting for review, or approved and not yet posted, is still to do. */
+const isDone = (r: { decision: Decision; result: RowResult | null }): boolean => r.decision === 'skipped' || isPosted(r);
+const statusOf = (done: boolean): BatchStatus => (done ? 'complete' : 'open');
 
 const REVIEW_WHERE_COUNT = `SELECT count(*) AS n FROM books_batch_rows r
   WHERE r.decision = 'pending' AND (r.result IS NULL OR r.result->>'status' IN ('failed', 'manual'))`;
@@ -233,24 +238,26 @@ export class BatchStore {
     return rows.length;
   }
 
+  /** Every batch, newest first. */
   async listBatches(): Promise<BatchSummary[]> {
     const { rows } = await this.pool.query<{
-      batch_id: string; created_at: Date; status: string; report: Record<string, unknown>;
-      total: string; pending: string; approved: string; skipped: string; posted: string; failed: string; manual: string;
+      batch_id: string; created_at: Date; report: Record<string, unknown>;
+      total: string; pending: string; approved: string; skipped: string; posted: string; failed: string; manual: string; outstanding: string;
     }>(
-      `SELECT b.batch_id, b.created_at, b.status, b.report,
+      `SELECT b.batch_id, b.created_at, b.report,
               count(r.row_id) AS total,
               count(*) FILTER (WHERE r.decision = 'pending') AS pending,
               count(*) FILTER (WHERE r.decision = 'approved') AS approved,
               count(*) FILTER (WHERE r.decision = 'skipped') AS skipped,
               count(*) FILTER (WHERE r.result->>'status' = 'posted') AS posted,
               count(*) FILTER (WHERE r.result->>'status' = 'failed') AS failed,
-              count(*) FILTER (WHERE r.result->>'status' = 'manual') AS manual
+              count(*) FILTER (WHERE r.result->>'status' = 'manual') AS manual,
+              count(*) FILTER (WHERE r.decision <> 'skipped' AND COALESCE(r.result->>'status', '') <> 'posted') AS outstanding
          FROM books_batches b LEFT JOIN books_batch_rows r USING (batch_id)
-        GROUP BY b.batch_id ORDER BY b.created_at DESC LIMIT 100`,
+        GROUP BY b.batch_id ORDER BY b.created_at DESC`,
     );
     return rows.map(r => ({
-      batch_id: r.batch_id, created_at: r.created_at.toISOString(), status: r.status, report: r.report,
+      batch_id: r.batch_id, created_at: r.created_at.toISOString(), status: statusOf(Number(r.outstanding) === 0), report: r.report,
       rows: Number(r.total), pending: Number(r.pending), approved: Number(r.approved), skipped: Number(r.skipped),
       posted: Number(r.posted), failed: Number(r.failed), manual: Number(r.manual),
     }));
@@ -288,9 +295,10 @@ export class BatchStore {
     return rows.map(r => toReviewCard(r.batch_id, r.row_id, { ...r.data, ...r.edits }, r.result));
   }
 
-  async getBatch(batchId: string): Promise<{ batch_id: string; created_at: string; status: string; report: Record<string, unknown>; rows: BatchRow[] }> {
-    const b = await this.pool.query<{ batch_id: string; created_at: Date; status: string; report: Record<string, unknown> }>(
-      'SELECT batch_id, created_at, status, report FROM books_batches WHERE batch_id = $1',
+  async getBatch(batchId: string): Promise<{ batch_id: string; created_at: string; status: BatchStatus; report: Record<string, unknown>; rows: BatchRow[] }> {
+    // The stored status column is not read: the status follows the rows, so undoing a skip reopens the batch.
+    const b = await this.pool.query<{ batch_id: string; created_at: Date; report: Record<string, unknown> }>(
+      'SELECT batch_id, created_at, report FROM books_batches WHERE batch_id = $1',
       [batchId],
     );
     const batch = b.rows[0];
@@ -300,7 +308,10 @@ export class BatchStore {
         WHERE batch_id = $1 ORDER BY data->>'date', data->>'account', row_id`,
       [batchId],
     );
-    return { batch_id: batch.batch_id, created_at: batch.created_at.toISOString(), status: batch.status, report: batch.report, rows: r.rows.map(toBatchRow) };
+    return {
+      batch_id: batch.batch_id, created_at: batch.created_at.toISOString(), status: statusOf(r.rows.every(isDone)), report: batch.report,
+      rows: r.rows.map(toBatchRow),
+    };
   }
 
   private async loadRow(batchId: string, rowId: string): Promise<RowRecord> {

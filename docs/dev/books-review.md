@@ -15,6 +15,7 @@ Mac mini ── POST /books/batches/:id/results ▶ Curia (posted / manual / fai
 - Decision per row: `pending`, `approved`, `skipped`. A row with an open `needs_category`, `row_error`, `unpaired_transfer`, `amount_differs` or `date_differs` flag cannot be approved while it has no category. Approving several rows is all or nothing.
 - The agent only receives rows that are approved and have no result yet. Results: `posted` is final and locks the row (no edit, decision change or second result); `failed` and `manual` send the row back to pending with the message shown; `skipped` closes it. Approving a row again clears an earlier failed or manual result.
 - Row text comes from bank files and is untrusted: it is stored and returned as JSON and shown as plain text, never as HTML.
+- A batch's `status` is `complete` once every row is posted or skipped (a batch with no rows too), otherwise `open`. It is worked out when read, so undoing a skip or pushing a new row reopens the batch. The Books page lists open batches; **Show completed** adds the rest.
 
 ## Routes
 

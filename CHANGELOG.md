@@ -50,6 +50,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Books batches** — finished batches are marked complete and hidden unless requested.
 - **Retention** — console chats and the AI call archive are now kept indefinitely.
 - **Budget summary** — spending categories only; income and savings stay out of totals.
 - **Attached spreadsheet reading** — reads the whole file, hidden tabs included; **public API:** new inputs, outputs.

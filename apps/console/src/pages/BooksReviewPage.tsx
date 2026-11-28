@@ -4,24 +4,13 @@ import { Sidebar } from '../components/Sidebar.js';
 import { Topbar } from '../components/Topbar.js';
 import { apiFetch } from '../api.js';
 import { useTheme } from '../hooks/useTheme.js';
+import { BatchList, BatchStatusPill } from './books/BatchList.js';
+import { formatDate, type BatchSummary } from './books/batch-types.js';
 
 // Mirrors GET /api/books/batches and /api/books/batches/:id (src/channels/http/routes/books-batches.ts).
 // Row text comes from bank files: it is rendered as plain text by React and never as HTML.
 type Decision = 'pending' | 'approved' | 'skipped';
 type EditableField = 'category' | 'tax_code' | 'location' | 'class' | 'payee';
-
-interface BatchSummary {
-  batch_id: string;
-  created_at: string;
-  status: string;
-  rows: number;
-  pending: number;
-  approved: number;
-  skipped: number;
-  posted: number;
-  failed: number;
-  manual: number;
-}
 
 interface RowResult {
   status: 'posted' | 'manual' | 'failed' | 'skipped';
@@ -63,10 +52,6 @@ async function errorText(res: Response): Promise<string> {
     if (d.error) return d.error;
   } catch { /* fall through */ }
   return `HTTP ${res.status}`;
-}
-
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
 function formatAmount(a: unknown): string {
@@ -161,6 +146,7 @@ function BatchView({ batchId, onBack }: { batchId: string; onBack: () => void })
         <div className="records-toolbar-left">
           <button type="button" className="btn btn-secondary" onClick={onBack}>All batches</button>
           <span className="topbar-meta">Batch {batch.batch_id.slice(0, 8)}, {formatDate(batch.created_at)}, {batch.rows.length} rows</span>
+          <BatchStatusPill status={batch.status} />
         </div>
         <div className="records-toolbar-right" style={{ display: 'flex', gap: 8 }}>
           <button type="button" className="btn btn-primary" disabled={busy || selected.size === 0} onClick={() => void decide('approved')}>Approve selected</button>
@@ -398,6 +384,8 @@ export default function BooksReviewPage() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [batches, setBatches] = useState<BatchSummary[] | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
+  // Held here so it survives opening a batch and coming back.
+  const [showCompleted, setShowCompleted] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -430,31 +418,7 @@ export default function BooksReviewPage() {
             <UploadPanel onChange={() => void load()} />
             <div className="records-table-wrap">
               {loadError && <div style={{ padding: 24, fontSize: 13, color: 'var(--app-destructive)' }}>{loadError}</div>}
-              {batches && batches.length === 0 && (
-                <div style={{ padding: 24, fontSize: 13, color: 'var(--app-fg-muted)' }}>
-                  No batches yet. Upload the week&apos;s RBC download files above; the books run turns them into a batch here.
-                </div>
-              )}
-              {batches && batches.length > 0 && (
-                <table className="records-table">
-                  <thead>
-                    <tr><th>Batch</th><th>Created</th><th style={{ textAlign: 'right' }}>Rows</th><th style={{ textAlign: 'right' }}>To review</th><th style={{ textAlign: 'right' }}>Approved</th><th style={{ textAlign: 'right' }}>Posted</th><th style={{ textAlign: 'right' }}>Failed / by hand</th></tr>
-                  </thead>
-                  <tbody>
-                    {batches.map(b => (
-                      <tr key={b.batch_id} onClick={() => setOpenId(b.batch_id)} style={{ cursor: 'pointer' }}>
-                        <td style={{ fontFamily: 'JetBrains Mono, monospace' }}>{b.batch_id.slice(0, 8)}</td>
-                        <td>{formatDate(b.created_at)}</td>
-                        <td style={{ textAlign: 'right' }}>{b.rows}</td>
-                        <td style={{ textAlign: 'right' }}>{b.pending}</td>
-                        <td style={{ textAlign: 'right' }}>{b.approved}</td>
-                        <td style={{ textAlign: 'right' }}>{b.posted}</td>
-                        <td style={{ textAlign: 'right' }}>{b.failed + b.manual}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+              {batches && <BatchList batches={batches} showCompleted={showCompleted} onShowCompleted={setShowCompleted} onOpen={setOpenId} />}
             </div>
             </>
           )}

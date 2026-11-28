@@ -150,6 +150,36 @@ describeIf('books batches', () => {
     await expect(store.recordResults('ffffffffffffffff', { r1: { status: 'posted' } })).rejects.toMatchObject({ kind: 'not_found' });
   });
 
+  it('is complete once every row is posted or skipped, and reopens when one is undone', async () => {
+    const id = newBatch();
+    await store.upsertBatch(id, {}, [row('r1'), row('r2')]);
+    const status = async () => {
+      const listed = (await store.listBatches()).find(x => x.batch_id === id)!.status;
+      expect((await store.getBatch(id)).status).toBe(listed);
+      return listed;
+    };
+    expect(await status()).toBe('open');
+    await store.decide(id, ['r1'], 'approved');
+    await store.decide(id, ['r2'], 'skipped');
+    expect(await status()).toBe('open');                                // r1 is approved but not yet posted
+    await store.recordResults(id, { r1: { status: 'failed', message: 'no account' } });
+    expect(await status()).toBe('open');                                // back with the owner
+    await store.decide(id, ['r1'], 'approved');
+    await store.recordResults(id, { r1: { status: 'posted', qbo_id: '1' } });
+    expect(await status()).toBe('complete');
+    await store.decide(id, ['r2'], 'pending');
+    expect(await status()).toBe('open');
+    await store.decide(id, ['r2'], 'skipped');
+    await store.upsertBatch(id, {}, [row('r1'), row('r2'), row('r3')]); // a new row arrives
+    expect(await status()).toBe('open');
+  });
+
+  it('counts a batch with no rows as complete', async () => {
+    const id = newBatch();
+    await store.upsertBatch(id, {}, []);
+    expect((await store.listBatches()).find(x => x.batch_id === id)!.status).toBe('complete');
+  });
+
   it('stores hostile text as plain data', async () => {
     const id = newBatch();
     const evil = `'); DROP TABLE books_batches; -- <script>alert(1)</script>`;
