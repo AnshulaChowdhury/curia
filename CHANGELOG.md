@@ -27,6 +27,10 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Total savings** — net worth section shows cash and investments together.
+- **Savings type** — relabelled “Savings & debt paydown”; editable on the proposal card.
+- **Net worth projection** — proposal card shows it live; budget agent reports it (ADR-069).
+- **`budget-net-worth`** — read-only totals and month-by-month projection for the budget agent.
 - **Editable proposal card** — change any proposed amount before approving it.
 - **Spreadsheet dark mode** — the grid follows the console theme.
 - **Chat working status** — Moonray loader with live steps, including a specialist's, and elapsed time.

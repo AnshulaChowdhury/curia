@@ -88,12 +88,14 @@ export function NetWorthSummary({ totals }: { totals: NetWorth['totals'] }) {
         <div className={totals.netCents < 0 ? 'is-over' : undefined}><dt>Net worth</dt><dd>{formatCents(totals.netCents)}</dd></div>
         <div><dt>You own</dt><dd>{formatCents(totals.assetsCents)}</dd></div>
         <div><dt>You owe</dt><dd>{formatCents(totals.debtsCents)}</dd></div>
+        <div><dt>Total savings</dt><dd>{formatCents(totals.savingsCents)}</dd></div>
       </dl>
       {/* The two bars share one scale, so their lengths compare directly. The figures above say the same in words. */}
       <div className="bud-compare" aria-hidden="true">
         <div className="bud-bar bud-bar-under"><div className="bud-bar-fill" style={{ width: width(totals.assetsCents) }} /></div>
         <div className="bud-bar bud-bar-over"><div className="bud-bar-fill" style={{ width: width(totals.debtsCents) }} /></div>
       </div>
+      <p className="bud-hint">Total savings is your cash and investment balances, chequing included. It is part of what you own.</p>
       {totals.leftOut > 0 && (
         <p className="bud-hint">{totals.leftOut} account{totals.leftOut === 1 ? ' is' : 's are'} not in these totals (another currency, or no balance).</p>
       )}

@@ -114,6 +114,14 @@ describeIf('budget proposals', () => {
     }
   });
 
+  it('lets the owner correct a category type before applying', async () => {
+    const made = await proposals.propose(CHAT, [{ name: 'P-Loan', amounts: [500] }], ['2031-03']);
+    expect((await proposals.setType(made.id, CHAT, 'P-Loan', 'savings')).rows[0]).toMatchObject({ kind: 'savings' });
+    await expect(proposals.setType(made.id, CHAT, 'P-Loan', 'other')).rejects.toMatchObject({ kind: 'invalid' });
+    await proposals.apply(made.id, CHAT);
+    expect((await mine()).find(c => c.name === 'P-Loan')).toMatchObject({ kind: 'savings' });
+  });
+
   it('leaves out a month with no amount', async () => {
     const made = await proposals.propose(CHAT, [{ name: 'P-Gap', amounts: [null, 2] }], ['2031-03', '2031-04']);
     expect(made.rows[0]!.amounts).toEqual([{ month: '2031-04', cents: 200, was: null }]);

@@ -14,6 +14,10 @@ export interface ProposedRow {
   amounts: Array<{ month: string; cents: number | null; was: number | null }>;
 }
 export interface Proposal { id: string; rows: ProposedRow[]; expiresAt: string }
+export interface ProjectedMonth { month: string; incomeCents: number; expenseCents: number; changeCents: number; netWorthCents: number | null; empty: boolean }
+/** Where net worth heads if the waiting proposal is approved, worked out by the server. */
+export interface Projection { today: { netWorthCents: number; assetsCents: number; debtsCents: number } | null; leftOut: number; months: ProjectedMonth[] }
+export interface Waiting { proposal: Proposal | null; projection: Projection | null }
 export interface Applied { created: number; updated: number; archived: number }
 
 export function createProposalClient(f: Fetcher = apiFetch) {
@@ -27,11 +31,12 @@ export function createProposalClient(f: Fetcher = apiFetch) {
   }
   const one = (id: string) => `/api/budget/proposals/${encodeURIComponent(id)}`;
   return {
-    pending: async (conversationId: string) =>
-      (await call<{ proposal: Proposal | null }>(`/api/budget/proposals?conversationId=${encodeURIComponent(conversationId)}`)).proposal,
-    /** One edited amount; null clears it. Returns the proposal as now stored. */
-    setAmount: async (id: string, conversationId: string, name: string, month: string, cents: number | null) =>
-      (await call<{ proposal: Proposal }>(one(id), { conversationId, name, month, cents }, 'PATCH')).proposal,
+    pending: (conversationId: string) => call<Waiting>(`/api/budget/proposals?conversationId=${encodeURIComponent(conversationId)}`),
+    /** One edited amount; null clears it. Returns the proposal as now stored, with its figures. */
+    setAmount: (id: string, conversationId: string, name: string, month: string, cents: number | null) =>
+      call<Waiting>(one(id), { conversationId, name, month, cents }, 'PATCH'),
+    setType: (id: string, conversationId: string, name: string, type: CategoryKind) =>
+      call<Waiting>(one(id), { conversationId, name, type }, 'PATCH'),
     apply: (id: string, conversationId: string) => call<Applied>(`${one(id)}/apply`, { conversationId }),
     discard: async (id: string, conversationId: string) => { await call(`${one(id)}/discard`, { conversationId }); },
   };

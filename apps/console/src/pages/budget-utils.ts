@@ -4,7 +4,7 @@
 
 // The shapes below mirror what the server returns (src/budget/budget-store.ts).
 export type CategoryKind = 'expense' | 'income' | 'savings';
-export const KIND_LABEL: Record<CategoryKind, string> = { income: 'Income', expense: 'Expenses', savings: 'Savings' };
+export const KIND_LABEL: Record<CategoryKind, string> = { income: 'Income', expense: 'Expenses', savings: 'Savings & debt paydown' };
 
 export interface BudgetPlan {
   months: string[];
@@ -164,7 +164,7 @@ export interface BudgetAccount {
 
 export interface NetWorth {
   accounts: BudgetAccount[];
-  totals: { assetsCents: number; debtsCents: number; netCents: number; leftOut: number };
+  totals: { assetsCents: number; debtsCents: number; netCents: number; savingsCents: number; leftOut: number };
 }
 
 export interface AccountGroup { type: AccountType; label: string; totalCents: number; accounts: BudgetAccount[] }

@@ -9,7 +9,7 @@ const summary = (categories: CategorySummary[], uncategorised = 0, loose = 0): B
   totals: { budgetedCents: 0, spentCents: 0, uncategorisedSpentCents: loose },
   needsYou: { uncategorised, guesses: 0, overBudget: categories.filter(c => c.state === 'over').length },
 });
-const NOTHING: NetWorth = { accounts: [], totals: { assetsCents: 0, debtsCents: 0, netCents: 0, leftOut: 0 } };
+const NOTHING: NetWorth = { accounts: [], totals: { assetsCents: 0, debtsCents: 0, netCents: 0, savingsCents: 0, leftOut: 0 } };
 
 describe('dashboard figures', () => {
   it('counts only counted cash accounts as cash', () => {

@@ -11,10 +11,11 @@ const auth = { 'x-web-bootstrap-secret': SECRET };
 const ID = '11111111-1111-4111-8111-111111111111';
 
 async function app(over: Record<string, unknown> = {}) {
-  const proposals = { pending: vi.fn(async () => null), apply: vi.fn(async () => ({ created: 1, updated: 0, archived: 0 })), discard: vi.fn(async () => undefined), setAmount: vi.fn(async () => ({ id: ID, rows: [] })), ...over };
+  const proposals = { pending: vi.fn(async () => null), apply: vi.fn(async () => ({ created: 1, updated: 0, archived: 0 })), discard: vi.fn(async () => undefined), setAmount: vi.fn(async () => ({ id: ID, rows: [] })), setType: vi.fn(async () => ({ id: ID, rows: [] })), ...over };
   const a = Fastify();
-  await a.register(budgetProposalRoutes, { logger, proposals: proposals as never, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
-  return { a, proposals };
+  const projector = { forRows: vi.fn(async () => ({ today: null, leftOut: 0, months: [] })) };
+  await a.register(budgetProposalRoutes, { logger, projector, proposals: proposals as never, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
+  return { a, proposals, projector };
 }
 
 describe('/api/budget/proposals', () => {
@@ -28,7 +29,7 @@ describe('/api/budget/proposals', () => {
 
   it('shows, applies and discards for the chat named, and needs one named', async () => {
     const { a, proposals } = await app();
-    expect((await a.inject({ method: 'GET', url: '/api/budget/proposals?conversationId=chat-1', headers: auth })).json()).toEqual({ proposal: null });
+    expect((await a.inject({ method: 'GET', url: '/api/budget/proposals?conversationId=chat-1', headers: auth })).json()).toEqual({ proposal: null, projection: null });
     expect((await a.inject({ method: 'GET', url: '/api/budget/proposals', headers: auth })).statusCode).toBe(400);
     expect((await a.inject({ method: 'POST', url: `/api/budget/proposals/${ID}/apply`, headers: auth, payload: {} })).statusCode).toBe(400);
     expect((await a.inject({ method: 'POST', url: `/api/budget/proposals/${ID}/apply`, headers: auth, payload: { conversationId: 'chat-1' } })).json()).toEqual({ ok: true, created: 1, updated: 0, archived: 0 });
@@ -43,8 +44,16 @@ describe('/api/budget/proposals', () => {
     expect((await a.inject({ method: 'PATCH', url, headers: auth, payload: { name: 'Rent' } })).statusCode).toBe(400);
     expect(proposals.setAmount).not.toHaveBeenCalled();
     const res = await a.inject({ method: 'PATCH', url, headers: auth, payload: { conversationId: 'chat-1', name: 'Rent', month: '2031-03', cents: null } });
-    expect(res.json()).toEqual({ proposal: { id: ID, rows: [] } });
+    expect(res.json()).toEqual({ proposal: { id: ID, rows: [] }, projection: { today: null, leftOut: 0, months: [] } });
     expect(proposals.setAmount).toHaveBeenCalledWith(ID, 'chat-1', 'Rent', '2031-03', null);
+    await a.inject({ method: 'PATCH', url, headers: auth, payload: { conversationId: 'chat-1', name: 'Rent', type: 'savings' } });
+    expect(proposals.setType).toHaveBeenCalledWith(ID, 'chat-1', 'Rent', 'savings');
+  });
+
+  it('still returns the proposal when the figures cannot be worked out', async () => {
+    const { a, projector } = await app({ pending: vi.fn(async () => ({ id: ID, rows: [] })) });
+    projector.forRows.mockRejectedValue(new Error('down'));
+    expect((await a.inject({ method: 'GET', url: '/api/budget/proposals?conversationId=c', headers: auth })).json()).toEqual({ proposal: { id: ID, rows: [] }, projection: null });
   });
 
   it('answers 409 with the reason when nothing was applied', async () => {

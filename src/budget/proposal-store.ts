@@ -6,6 +6,7 @@
 
 import type { DbPool } from '../db/connection.js';
 import { BudgetError, CATEGORY_KINDS, type CategoryKind } from './budget-store.js';
+import type { Projection } from './projection.js';
 
 export const MAX_PROPOSED_CATEGORIES = 100;
 export const MAX_PROPOSED_MONTHS = 24;
@@ -84,6 +85,11 @@ async function amountsNow(db: Queryable, category: CurrentRow, months: string[])
   return new Map(months.map(m => [m, own.get(m) ?? category.monthly_cents]));
 }
 
+/** All the assistant may do with proposals: make one, and see where it would take net worth. It cannot apply one. */
+export interface BudgetProposer {
+  propose(conversationId: string, categories: unknown, months?: unknown): Promise<Proposal & { projection?: Projection }>;
+}
+
 export class ProposalStore {
   constructor(private readonly pool: DbPool) {}
 
@@ -146,6 +152,24 @@ export class ProposalStore {
     if (cents !== null && !(typeof cents === 'number' && Number.isInteger(cents) && cents >= 0 && cents <= MAX_CENTS)) {
       throw new BudgetError('cents must be a whole number of cents, zero or more, or null');
     }
+    return this.edit(id, conversationId, name, async (row, db) => {
+      const entry = row.amounts.find(a => a.month === month);
+      if (entry) { entry.cents = cents; return; }
+      if (cents === null) return;
+      if (row.amounts.length >= MAX_PROPOSED_MONTHS) throw new BudgetError(`At most ${MAX_PROPOSED_MONTHS} months for one category`);
+      let was: number | null = null;
+      if (row.categoryId) {
+        const now = (await openCategories(db)).get((row.renameFrom ?? row.name).toLowerCase());
+        if (!now || now.id !== row.categoryId) throw new BudgetError(`"${row.name}" has changed since this was proposed. Ask for a new proposal.`, 'conflict');
+        was = (await amountsNow(db, now, [month])).get(month) ?? null;
+      }
+      row.amounts.push({ month, cents, was });
+      row.amounts.sort((a, b) => a.month.localeCompare(b.month));
+    });
+  }
+
+  /** Changes one row of the waiting proposal, which stays locked while it is changed. */
+  private async edit(id: string, conversationId: string, name: string, change: (row: ProposedRow, db: Queryable) => Promise<void>): Promise<Proposal> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -155,20 +179,8 @@ export class ProposalStore {
       const proposal = found.rows[0];
       if (!proposal) throw new BudgetError('That proposal is no longer waiting', 'conflict');
       const row = proposal.changes.find(r => r.name === name);
-      if (!row || row.action === 'archive') throw new BudgetError('That proposal has no amounts for that category', 'not_found');
-      const entry = row.amounts.find(a => a.month === month);
-      if (entry) entry.cents = cents;
-      else if (cents !== null) {
-        if (row.amounts.length >= MAX_PROPOSED_MONTHS) throw new BudgetError(`At most ${MAX_PROPOSED_MONTHS} months for one category`);
-        let was: number | null = null;
-        if (row.categoryId) {
-          const now = (await openCategories(client)).get((row.renameFrom ?? row.name).toLowerCase());
-          if (!now || now.id !== row.categoryId) throw new BudgetError(`"${row.name}" has changed since this was proposed. Ask for a new proposal.`, 'conflict');
-          was = (await amountsNow(client, now, [month])).get(month) ?? null;
-        }
-        row.amounts.push({ month, cents, was });
-        row.amounts.sort((a, b) => a.month.localeCompare(b.month));
-      }
+      if (!row || row.action === 'archive') throw new BudgetError('That proposal has nothing to edit for that category', 'not_found');
+      await change(row, client);
       await client.query('UPDATE budget_proposals SET changes = $2 WHERE id = $1', [id, JSON.stringify(proposal.changes)]);
       await client.query('COMMIT');
       return { id, rows: proposal.changes, createdAt: proposal.created_at.toISOString(), expiresAt: proposal.expires_at.toISOString() };
@@ -178,6 +190,12 @@ export class ProposalStore {
     } finally {
       client.release();
     }
+  }
+
+  /** The owner's correction of what kind of category a waiting row is. Changes no budget. */
+  async setType(id: string, conversationId: string, name: unknown, type: unknown): Promise<Proposal> {
+    if (typeof name !== 'string' || !CATEGORY_KINDS.includes(type as CategoryKind)) throw new BudgetError('Name a category, and a type of expense, income or savings');
+    return this.edit(id, conversationId, name, async (row) => { row.kind = type as CategoryKind; });
   }
 
   async discard(id: string, conversationId: string): Promise<void> {

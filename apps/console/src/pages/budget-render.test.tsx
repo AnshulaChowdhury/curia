@@ -79,7 +79,7 @@ describe('dashboard', () => {
       totals: { budgetedCents: 10000, spentCents: 12000, uncategorisedSpentCents: 0 },
       needsYou: { uncategorised: 0, guesses: 0, overBudget: 1 },
     },
-    netWorth: { accounts: [{ id: 'x', source: 'manual', institution: '', name: 'Cash', mask: null, type: 'cash', side: 'asset', currency: 'CAD', balanceCents: 50000, asOf: '' }], totals: { assetsCents: 50000, debtsCents: 20000, netCents: 30000, leftOut: 0 } },
+    netWorth: { accounts: [{ id: 'x', source: 'manual', institution: '', name: 'Cash', mask: null, type: 'cash', side: 'asset', currency: 'CAD', balanceCents: 50000, asOf: '' }], totals: { assetsCents: 50000, debtsCents: 20000, netCents: 30000, savingsCents: 50000, leftOut: 0 } },
     trend: {
       asOf: '2031-03-15', firstDate: '2031-01-02',
       months: [{ month: '2031-01', outCents: 100, inCents: 200 }, { month: '2031-02', outCents: 300, inCents: 100 }],
@@ -145,13 +145,18 @@ describe('net worth', () => {
       { ...base, id: 'a', source: 'bank' as const, name: '<b>Chequing</b>', type: 'cash' as const, side: 'asset' as const, balanceCents: 5000 },
       { ...base, id: 'b', source: 'manual' as const, name: 'Car', type: 'vehicle' as const, side: 'asset' as const, balanceCents: 7000 },
     ],
-    totals: { assetsCents: 12000, debtsCents: 0, netCents: 12000, leftOut: 1 },
+    totals: { assetsCents: 12000, debtsCents: 0, netCents: 12000, savingsCents: 7700, leftOut: 1 },
   };
   it('escapes bank names and offers edits only on hand-kept entries', () => {
     const html = renderToStaticMarkup(<SideCard title="Assets" side="asset" data={data} onEdit={() => {}} onDelete={() => {}} />);
     expect(html).not.toContain('<b>');
     expect(html).toContain('aria-label="Edit Car"');
     expect(html).not.toContain('aria-label="Edit &lt;b&gt;');
+  });
+  it('shows total savings beside what is owned and owed', () => {
+    const html = renderToStaticMarkup(<NetWorthSummary totals={{ ...data.totals, savingsCents: 7700 }} />);
+    expect(html).toContain('<dt>Total savings</dt><dd>$77.00</dd>');
+    expect(html).toContain('chequing included');
   });
   it('says when accounts are left out of the totals', () => {
     expect(renderToStaticMarkup(<NetWorthSummary totals={data.totals} />)).toContain('1 account is not in these totals');

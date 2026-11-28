@@ -28,13 +28,16 @@ export interface BudgetAccount {
 
 export interface NetWorth {
   accounts: BudgetAccount[];
-  totals: { assetsCents: number; debtsCents: number; netCents: number; leftOut: number };
+  /** `savingsCents` is the part of the assets that is money: cash (chequing included) and investments. */
+  totals: { assetsCents: number; debtsCents: number; netCents: number; savingsCents: number; leftOut: number };
 }
 
 /** The largest balance accepted: one trillion dollars, well inside exact integer range. */
 const MAX_BALANCE_CENTS = 100_000_000_000_000;
 
 const isDebt = (t: AccountType): boolean => (DEBT_TYPES as readonly string[]).includes(t);
+/** Assets that are money put by, as opposed to things owned. */
+const SAVINGS_TYPES: readonly AccountType[] = ['cash', 'investment'];
 const isType = (v: unknown): v is AccountType => typeof v === 'string' && ((ASSET_TYPES as readonly string[]).includes(v) || isDebt(v as AccountType));
 
 /** Plaid's type and subtype to ours. An unknown kind of account is listed as an "other" asset. */
@@ -52,12 +55,15 @@ export function netWorth(accounts: BudgetAccount[]): NetWorth {
   let assetsCents = 0;
   let debtsCents = 0;
   let leftOut = 0;
+  let savingsCents = 0;
   for (const a of accounts) {
     if (a.balanceCents === null || a.currency !== 'CAD') leftOut++;
-    else if (a.side === 'asset') assetsCents += a.balanceCents;
-    else debtsCents += a.balanceCents;
+    else if (a.side === 'asset') {
+      assetsCents += a.balanceCents;
+      if (SAVINGS_TYPES.includes(a.type)) savingsCents += a.balanceCents;
+    } else debtsCents += a.balanceCents;
   }
-  return { accounts, totals: { assetsCents, debtsCents, netCents: assetsCents - debtsCents, leftOut } };
+  return { accounts, totals: { assetsCents, debtsCents, netCents: assetsCents - debtsCents, savingsCents, leftOut } };
 }
 
 interface Row {

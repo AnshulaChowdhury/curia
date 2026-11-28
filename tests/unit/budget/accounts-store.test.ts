@@ -19,6 +19,15 @@ describe('typeForPlaid', () => {
   ])('%s / %s is %s', (type, subtype, expected) => {
     expect(typeForPlaid(type, subtype)).toBe(expected);
   });
+
+  it('counts cash and investments as savings, not property or vehicles', () => {
+    const { totals } = netWorth([
+      account({ balanceCents: 100 }), account({ type: 'investment', balanceCents: 2_000 }),
+      account({ type: 'property', balanceCents: 900_000 }), account({ type: 'vehicle', balanceCents: 30_000 }),
+      account({ type: 'investment', currency: 'USD', balanceCents: 5 }),
+    ]);
+    expect(totals.savingsCents).toBe(2_100);
+  });
 });
 
 describe('netWorth', () => {
@@ -30,9 +39,9 @@ describe('netWorth', () => {
       account({ currency: 'USD', balanceCents: 999_999 }),
       account({ balanceCents: null }),
     ]);
-    expect(totals).toEqual({ assetsCents: 99_500, debtsCents: 30_000, netCents: 69_500, leftOut: 2 });
+    expect(totals).toEqual({ assetsCents: 99_500, debtsCents: 30_000, netCents: 69_500, savingsCents: 99_500, leftOut: 2 });
   });
   it('is zero with nothing', () => {
-    expect(netWorth([]).totals).toEqual({ assetsCents: 0, debtsCents: 0, netCents: 0, leftOut: 0 });
+    expect(netWorth([]).totals).toEqual({ assetsCents: 0, debtsCents: 0, netCents: 0, savingsCents: 0, leftOut: 0 });
   });
 });

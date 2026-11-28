@@ -1,7 +1,7 @@
 {
   "name": "budget-propose",
   "description": "Show the owner proposed changes to budget categories and monthly amounts, as a card in the web chat they asked from. CHANGES NOTHING: the owner must reply \"yes\" or press Apply on the card. Replaces any proposal still waiting in that chat, so send every category in one call. Amounts are Canadian dollars.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "sensitivity": "normal",
   "action_risk": "low",
   "inputs": {
@@ -13,7 +13,8 @@
     "status": "string",
     "toCreate": "number",
     "toUpdate": "number",
-    "toArchive": "number"
+    "toArchive": "number",
+    "netWorthIfApproved": "object? (net worth today and at each month end if approved as proposed)"
   },
   "permissions": [],
   "secrets": [],

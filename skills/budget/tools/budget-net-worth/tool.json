@@ -1,0 +1,26 @@
+{
+  "name": "budget-net-worth",
+  "description": "The owner's net worth today (totals from their account balances) and projected month by month if the budget as it stands holds. Use these figures; do not calculate your own. Read-only.",
+  "version": "0.1.0",
+  "sensitivity": "normal",
+  "action_risk": "none",
+  "inputs": {
+    "months": "number? (1 to 24, starting next month; defaults to 6)"
+  },
+  "outputs": {
+    "currency": "CAD",
+    "today": "object? (netWorth, assets, debts; null when there are no balances)",
+    "accountsLeftOut": "number",
+    "months": "array (month, income, expenses, changeFromToday, netWorthAtMonthEnd)",
+    "assumptions": "string"
+  },
+  "permissions": [],
+  "secrets": [],
+  "timeout": 30000,
+  "capabilities": [
+    "budgetReader"
+  ],
+  "allowed_callers": [
+    "budget"
+  ]
+}

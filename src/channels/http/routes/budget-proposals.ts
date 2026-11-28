@@ -1,7 +1,8 @@
 // budget-proposals.ts — the owner's answer to budget changes proposed in a chat (ADR-067).
 //
-//   GET  /api/budget/proposals?conversationId=…  — the proposal waiting in that chat, or null
-//   PATCH /api/budget/proposals/:id             — {conversationId, name, month, cents}: edit one amount (null clears)
+//   GET  /api/budget/proposals?conversationId=…  — the proposal waiting in that chat, or null, and where net worth heads
+//   PATCH /api/budget/proposals/:id             — {conversationId, name, month, cents}: edit one amount (null clears);
+//                                                 or {conversationId, name, type}: correct a category's type
 //   POST /api/budget/proposals/:id/apply         — {conversationId}: make every change, or none
 //   POST /api/budget/proposals/:id/discard       — {conversationId}: drop it
 //
@@ -10,20 +11,23 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import { BudgetError } from '../../../budget/budget-store.js';
-import type { ProposalStore } from '../../../budget/proposal-store.js';
+import type { Proposal, ProposalStore } from '../../../budget/proposal-store.js';
+import type { NetWorthProjector } from '../../../budget/projection.js';
 import { isConversationId } from '../../../budget/sheet-store.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 import { isUuid } from '../../../util/uuid.js';
 
 export interface BudgetProposalRouteOptions {
   logger: Logger;
-  proposals: Pick<ProposalStore, 'pending' | 'apply' | 'discard' | 'setAmount'>;
+  proposals: Pick<ProposalStore, 'pending' | 'apply' | 'discard' | 'setAmount' | 'setType'>;
+  /** Net worth month by month with the waiting changes included. */
+  projector: Pick<NetWorthProjector, 'forRows'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
 
 export async function budgetProposalRoutes(app: FastifyInstance, options: BudgetProposalRouteOptions): Promise<void> {
-  const { logger, proposals, webAppBootstrapSecret, sessions } = options;
+  const { logger, proposals, projector, webAppBootstrapSecret, sessions } = options;
   const RATE = { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } };
   const owner = (request: Parameters<typeof assertSecret>[0], reply: FastifyReply): boolean => assertSecret(request, reply, webAppBootstrapSecret, sessions);
   const noStore = (reply: FastifyReply) => reply.header('Cache-Control', 'no-store');
@@ -35,12 +39,18 @@ export async function budgetProposalRoutes(app: FastifyInstance, options: Budget
     return reply.status(500).send({ error: 'Internal error' });
   };
 
+  // The card still works without the figures, so a failure here costs only them.
+  const shown = async (proposal: Proposal | null) => ({
+    proposal,
+    projection: proposal ? await projector.forRows(proposal.rows).catch((err: unknown) => { logger.error({ err }, 'budget proposals: projection failed'); return null; }) : null,
+  });
+
   app.get<{ Querystring: { conversationId?: string } }>('/api/budget/proposals', RATE, async (request, reply) => {
     if (!owner(request, reply)) return reply;
     const id = request.query.conversationId;
     if (!isConversationId(id)) return reply.status(400).send({ error: 'conversationId is required' });
     try {
-      return noStore(reply).send({ proposal: await proposals.pending(id) });
+      return noStore(reply).send(await shown(await proposals.pending(id)));
     } catch (err) {
       return fail(reply, err);
     }
@@ -48,10 +58,13 @@ export async function budgetProposalRoutes(app: FastifyInstance, options: Budget
 
   app.patch<{ Params: { id: string }; Body: Record<string, unknown> | undefined }>('/api/budget/proposals/:id', RATE, async (request, reply) => {
     if (!owner(request, reply)) return reply;
-    const { conversationId, name, month, cents } = request.body ?? {};
+    const { conversationId, name, month, cents, type } = request.body ?? {};
     if (!isUuid(request.params.id) || !isConversationId(conversationId)) return reply.status(400).send({ error: 'A proposal id and conversationId are required' });
     try {
-      return noStore(reply).send({ proposal: await proposals.setAmount(request.params.id, conversationId, name, month, cents) });
+      const edited = type !== undefined
+        ? await proposals.setType(request.params.id, conversationId, name, type)
+        : await proposals.setAmount(request.params.id, conversationId, name, month, cents);
+      return noStore(reply).send(await shown(edited));
     } catch (err) {
       return fail(reply, err);
     }

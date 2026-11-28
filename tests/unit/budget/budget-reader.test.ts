@@ -68,7 +68,7 @@ describe('BudgetReader', () => {
   it('has no method that changes anything', () => {
     const methods = Object.getOwnPropertyNames(BudgetReader.prototype).filter(m => m !== 'constructor').sort();
     // Adding a method that writes means changing ADR-062: this list is the review point.
-    expect(methods).toEqual(['clamp', 'needsReview', 'plan', 'shape', 'summary', 'transactions']);
+    expect(methods).toEqual(['clamp', 'needsReview', 'netWorth', 'plan', 'shape', 'summary', 'transactions']);
   });
 });
 
