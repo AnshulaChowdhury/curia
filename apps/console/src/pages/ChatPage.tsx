@@ -18,7 +18,7 @@ import { ProposalCard } from './chat/ProposalCard.js';
 export default function ChatPage() {
   const [theme, setTheme] = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { messages, sending, work, hasMore, loadingHistory, send, loadMore, conversationId, ensureConversationId } = useChatSession();
+  const { messages, sending, work, hasMore, loadingHistory, send, loadMore, conversationId, ready, ensureConversationId } = useChatSession();
   const attachment = useChatSheet(conversationId, ensureConversationId);
   const [sheetOpen, setSheetOpen] = useState(true);
   const framing = loadedAsChatPage(performance.getEntriesByType('navigation')[0]?.name);
@@ -64,7 +64,7 @@ export default function ChatPage() {
                 <SheetBar sheet={attachment.sheet} ready={framing} open={sheetOpen} busy={attachment.busy} error={attachment.error}
                   hint={askedToAttach} onToggle={() => setSheetOpen(o => !o)} onDetach={() => void attachment.detach()} />
                 <ChatComposer disabled={sending} onSend={say}
-                  attach={<AttachButton ready={framing} busy={attachment.busy} onFile={f => { setSheetOpen(true); void attachment.add(f); }} />} />
+                  attach={<AttachButton ready={framing} busy={attachment.busy || !ready} onFile={f => { setSheetOpen(true); void attachment.add(f); }} />} />
               </div>
             </div>
             {framing && shown && <SheetSide sheet={shown} hidden={!attachment.sheet || !sheetOpen} />}

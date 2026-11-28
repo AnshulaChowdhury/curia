@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSseEvent, makeMessage, formatTimestamp, linkifyText, pickRecoveredReply, keptInPlaceOf } from './chat-utils.js';
+import { parseSseEvent, makeMessage, formatTimestamp, linkifyText, pickRecoveredReply, keptInPlaceOf, currentChatId } from './chat-utils.js';
 
 describe('parseSseEvent', () => {
   it('starts a step on tool.invoke, naming who a delegation goes to', () => {
@@ -207,5 +207,19 @@ describe('keptInPlaceOf', () => {
     const thread = [makeMessage('agent', 'hi'), makeMessage('user', 'typed'), makeMessage('status', 'later')];
     const note = makeMessage('status', 'removed');
     expect(keptInPlaceOf(thread, thread[1]!.id, 'kept', note).map(m => m.text)).toEqual(['hi', 'kept', 'removed', 'later']);
+  });
+});
+
+describe('currentChatId', () => {
+  const answers = (body: unknown, status = 200) => async () => new Response(JSON.stringify(body), { status });
+
+  it('opens the chat the server names, whatever this browser remembers', async () => {
+    expect(await currentChatId(answers({ conversationId: 'other-laptop' }), 'this-browser')).toBe('other-laptop');
+  });
+
+  it('keeps this browser’s chat when the server has none, refuses or cannot be reached', async () => {
+    expect(await currentChatId(answers({ conversationId: null }), 'mine')).toBe('mine');
+    expect(await currentChatId(answers({ error: 'no' }, 500), 'mine')).toBe('mine');
+    expect(await currentChatId(async () => { throw new Error('offline'); }, null)).toBeNull();
   });
 });

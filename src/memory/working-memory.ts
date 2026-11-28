@@ -121,6 +121,9 @@ interface StorageBackend {
   drainSummarization(timeoutMs: number): Promise<void>;
 }
 
+/** Conversations on this channel never expire: the console chat is the owner's own record (ADR-071). */
+const KEPT_CHANNEL = 'web';
+
 function withoutSecrets<T extends { content: string }>(turn: T): T {
   const content = redactSecrets(turn.content);
   return content === turn.content ? turn : { ...turn, content };
@@ -739,11 +742,18 @@ class PostgresBackend implements StorageBackend {
     // The idx_wm_expires partial index (WHERE expires_at IS NOT NULL) covers this query.
     // Archived rows are excluded: they are retained for audit even after their TTL
     // has passed (the summarization path marks originals archived = true).
+    // Console chats are kept indefinitely (ADR-071), the whole conversation: its summary
+    // rows carry no channel of their own.
     const result = await this.pool.query(
-      `DELETE FROM working_memory
-       WHERE expires_at IS NOT NULL
-         AND expires_at < now()
-         AND archived = false`,
+      `DELETE FROM working_memory expired
+       WHERE expired.expires_at IS NOT NULL
+         AND expired.expires_at < now()
+         AND expired.archived = false
+         AND NOT EXISTS (
+           SELECT 1 FROM working_memory chat
+            WHERE chat.conversation_id = expired.conversation_id AND chat.channel_id = $1
+         )`,
+      [KEPT_CHANNEL],
     );
     return result.rowCount ?? 0;
   }

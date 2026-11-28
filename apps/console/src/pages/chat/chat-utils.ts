@@ -109,6 +109,25 @@ export function makeMessage(
   return { id: crypto.randomUUID(), kind, text, ...opts };
 }
 
+/**
+ * The chat to open: the one last written in on any device. This browser's own memory is used only when the server has
+ * none or cannot be reached.
+ */
+export async function currentChatId(fetcher: (path: string) => Promise<Response>, remembered: string | null): Promise<string | null> {
+  try {
+    const res = await fetcher('/api/chat/current');
+    if (!res.ok) {
+      console.error('[currentChatId] lookup returned non-ok status:', res.status);
+      return remembered;
+    }
+    const { conversationId } = (await res.json()) as { conversationId?: unknown };
+    return typeof conversationId === 'string' && conversationId !== '' ? conversationId : remembered;
+  } catch (err) {
+    console.error('[currentChatId] lookup failed:', err);
+    return remembered;
+  }
+}
+
 /** The thread with one sent message replaced by what the server kept of it, followed by a note saying why. */
 export function keptInPlaceOf(messages: Message[], sentId: string, kept: string, note: Message): Message[] {
   return messages.flatMap(m => m.id === sentId ? [{ ...m, text: kept }, note] : [m]);

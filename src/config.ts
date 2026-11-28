@@ -896,8 +896,8 @@ export interface YamlConfig {
     llmCallArchive?: {
       /** When false, skip archive writes even if llm.call carries archive content. Default true. */
       enabled?: boolean;
-      /** Delete archive rows older than this many days (DreamEngine decay pass). Default 90. */
-      hotRetentionDays?: number;
+      /** Delete archive rows older than this many days (DreamEngine decay pass). Unset or null keeps them (ADR-071). */
+      hotRetentionDays?: number | null;
       /**
        * When false, archive rows omit the reasoning string. Token counts still
        * store, and the rest of the archive still writes. Default true.
@@ -1606,10 +1606,11 @@ export function loadYamlConfig(configDir: string): YamlConfig {
       }
       if (
         llmCallArchive.hotRetentionDays !== undefined &&
+        llmCallArchive.hotRetentionDays !== null &&
         (!Number.isInteger(llmCallArchive.hotRetentionDays) || llmCallArchive.hotRetentionDays < 1)
       ) {
         throw new Error(
-          `audit.llmCallArchive.hotRetentionDays must be a positive integer, got: ${llmCallArchive.hotRetentionDays}`,
+          `audit.llmCallArchive.hotRetentionDays must be a positive integer or null, got: ${llmCallArchive.hotRetentionDays}`,
         );
       }
       if (

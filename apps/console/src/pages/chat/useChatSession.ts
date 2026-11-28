@@ -1,7 +1,7 @@
 // apps/console/src/pages/chat/useChatSession.ts
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { apiFetch } from '../../api.js';
-import { keptInPlaceOf, makeMessage, parseSseEvent, pickRecoveredReply } from './chat-utils.js';
+import { currentChatId, keptInPlaceOf, makeMessage, parseSseEvent, pickRecoveredReply } from './chat-utils.js';
 import { endStep, startStep, trace, type Work } from './activity.js';
 import type { Message, HistoryMessage } from './types.js';
 
@@ -46,8 +46,10 @@ interface ChatSession {
   loadingHistory: boolean;
   send: (text: string) => Promise<void>;
   loadMore: () => Promise<void>;
-  /** This chat's id, or null before the first message or attachment. */
+  /** This chat's id, or null before the first message or attachment, and while it is being looked up. */
   conversationId: string | null;
+  /** False until the server has said which chat to open. Nothing can be attached before then. */
+  ready: boolean;
   /** The id, creating it first if need be: a file can be attached before anything is said. */
   ensureConversationId: () => string;
 }
@@ -73,9 +75,13 @@ function ensureId(held: { current: string | null }, announce: (id: string) => vo
   const newId = crypto.randomUUID();
   held.current = newId;
   announce(newId);
-  // Guarded for restricted browsing contexts (e.g. Safari private mode).
-  try { localStorage.setItem(CONV_ID_KEY, newId); } catch { /* best-effort */ }
+  rememberId(newId);
   return newId;
+}
+
+function rememberId(id: string): void {
+  // Guarded for restricted browsing contexts (e.g. Safari private mode).
+  try { localStorage.setItem(CONV_ID_KEY, id); } catch { /* best-effort */ }
 }
 
 export function useChatSession(): ChatSession {
@@ -99,7 +105,7 @@ export function useChatSession(): ChatSession {
   // (otherwise a turn that unmounts mid-flight leaves a up-to-5-minute timer that
   // later fires a post-unmount /history fetch + setState). See send() below.
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // One conversationId per chat thread — persisted in localStorage.
+  // One conversationId per chat thread. The server says which (see currentChatId); localStorage is the fallback.
   // localStorage.getItem can throw SecurityError in restricted browsing contexts
   // (e.g. Safari private mode with strict settings), so we guard the read.
   const conversationId = useRef<string | null>(
@@ -108,7 +114,16 @@ export function useChatSession(): ChatSession {
       try { return localStorage.getItem(CONV_ID_KEY); } catch { return null; }
     })(),
   );
-  const [knownConversationId, setKnownConversationId] = useState(conversationId.current);
+  // Null until the lookup finishes, so nothing is fetched for a chat that is about to be replaced.
+  const [knownConversationId, setKnownConversationId] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
+  // Resolves when the id is settled; a message typed before then waits for it.
+  const settledId = useRef<{ promise: Promise<void>; resolve: () => void } | null>(null);
+  if (!settledId.current) {
+    let resolve = () => {};
+    const promise = new Promise<void>((done) => { resolve = done; });
+    settledId.current = { promise, resolve };
+  }
   const ensureConversationId = useCallback(() => ensureId(conversationId, setKnownConversationId), []);
   // One-shot kickoff: read and clear the onboarding flag synchronously so a
   // React strict-mode double-mount cannot fire a second auto-send.
@@ -145,14 +160,20 @@ export function useChatSession(): ChatSession {
     if (watchdogRef.current) clearTimeout(watchdogRef.current);
   }, []);
 
-  // On mount, if we have a stored conversationId, load the most recent history page.
+  // On mount, find the chat to open and load its most recent history page.
   useEffect(() => {
-    const convId = conversationId.current;
-    if (!convId) return;
-
     // Using an inner async function inside useEffect so we can await cleanly
     // while still returning a synchronous cleanup function from the effect.
     const load = async () => {
+      const convId = await currentChatId(apiFetch, conversationId.current);
+      if (convId) {
+        conversationId.current = convId;
+        rememberId(convId);
+      }
+      setKnownConversationId(convId);
+      setReady(true);
+      settledId.current!.resolve();
+      if (!convId) return;
       setLoadingHistory(true);
       try {
         const res = await apiFetch(
@@ -235,6 +256,10 @@ export function useChatSession(): ChatSession {
 
   async function send(text: string): Promise<void> {
     if (isSending.current || text.trim().length === 0) return;
+    // Claimed before waiting, so a second send cannot slip in meanwhile.
+    isSending.current = true;
+    setSending(true);
+    await settledId.current!.promise;
 
     const convId = ensureId(conversationId, setKnownConversationId);
 
@@ -247,8 +272,6 @@ export function useChatSession(): ChatSession {
     // Optimistic append so the user sees their message immediately.
     const sent = makeMessage('user', text, { timestamp: new Date() });
     setMessages((prev) => [...prev, sent]);
-    isSending.current = true;
-    setSending(true);
     const showWork = (next: Work | null) => { workRef.current = next; setWork(next); };
     showWork({ startedAt: Date.now(), steps: [] });
     /** What was done stays in the thread, above whatever ends the turn. */
@@ -445,5 +468,5 @@ export function useChatSession(): ChatSession {
     // finished by the SSE terminal event, the watchdog, or an error path above.
   }
 
-  return { messages, sending, work, hasMore, loadingHistory, send, loadMore, conversationId: knownConversationId, ensureConversationId };
+  return { messages, sending, work, hasMore, loadingHistory, send, loadMore, conversationId: knownConversationId, ready, ensureConversationId };
 }

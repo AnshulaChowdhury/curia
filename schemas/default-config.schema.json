@@ -272,7 +272,7 @@
           "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean" },
-            "hotRetentionDays": { "type": "integer", "minimum": 1 },
+            "hotRetentionDays": { "type": ["integer", "null"], "minimum": 1 },
             "includeReasoning": { "type": "boolean" }
           }
         }

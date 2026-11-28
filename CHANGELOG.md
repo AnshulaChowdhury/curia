@@ -28,6 +28,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Chat on every device** — the console opens your latest chat and shows its history.
 - **Total savings** — net worth section shows cash and investments together.
 - **Savings type** — relabelled “Savings & debt paydown”; editable on the proposal card.
 - **Net worth projection** — proposal card shows it live; budget agent reports it (ADR-069).
@@ -47,6 +48,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Changed
 
+- **Retention** — console chats and the AI call archive are now kept indefinitely.
 - **Budget summary** — spending categories only; income and savings stay out of totals.
 - **Attached spreadsheet reading** — reads the whole file, hidden tabs included; **public API:** new inputs, outputs.
 - **Budget categories** — used ones archive and keep history; only empty ones delete (migration 133).

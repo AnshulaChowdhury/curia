@@ -98,8 +98,8 @@ function MemorySection() {
             <div className="retention-row">
               <dt>Conversation turns</dt>
               <dd>
-                Kept for <strong>{policy.workingMemoryTtlDays} days</strong>, then purged by the
-                nightly dream pass.
+                Chats in this console are kept indefinitely. Other conversations are kept for{' '}
+                <strong>{policy.workingMemoryTtlDays} days</strong>, then purged by the nightly dream pass.
               </dd>
             </div>
             <div className="retention-row">

@@ -149,6 +149,31 @@ export async function chatRoutes(
   });
 
   /**
+   * GET /api/chat/current — the chat this console should open: the one the owner wrote in last, on any device.
+   *
+   * Response: { conversationId: string | null }. Only the owner can use the web channel, so every web chat is theirs.
+   * Turns Curia wrote to itself do not count: they must not pull the screen to an older chat.
+   */
+  app.get('/api/chat/current', CONSOLE_RATE, async (request, reply) => {
+    if (!assertSecret(request, reply, webAppBootstrapSecret, sessions)) return;
+
+    try {
+      const result = await pool.query<{ conversation_id: string }>(
+        `SELECT conversation_id
+           FROM working_memory
+          WHERE channel_id = $1 AND role = 'user' AND synthetic = false
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1`,
+        [WEB_CHANNEL_ID],
+      );
+      return reply.send({ conversationId: result.rows[0]?.conversation_id ?? null });
+    } catch (err) {
+      logger.error({ err }, 'current chat lookup failed');
+      return reply.status(500).send({ error: 'Failed to find the current chat' });
+    }
+  });
+
+  /**
    * GET /api/chat/history — fetch paginated chat history from working_memory.
    *
    * Query params:
@@ -160,6 +185,9 @@ export async function chatRoutes(
    * Returns messages in chronological order (oldest first) so the client can
    * prepend them to the thread. Pages fill to `limit` *display* messages;
    * `hasMore` reflects displayable turns, not raw rows (#1775).
+   *
+   * Turns that have since been summarised (archived) are included: the assistant reads the summary, the owner can
+   * still scroll back to what was said.
    *
    * Only user/assistant turns are returned — system turns (synthetic summaries
    * inserted by the summarisation pass) are excluded since they are internal
@@ -216,7 +244,6 @@ export async function chatRoutes(
                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso
              FROM working_memory
              WHERE conversation_id = $1
-               AND archived = false
                AND role IN ('user', 'assistant')
                AND ($2::timestamptz IS NULL
                     OR (created_at, id) < ($2::timestamptz, COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)))

@@ -2435,7 +2435,8 @@ async function main(): Promise<void> {
     logger,
   });
 
-  const llmCallArchiveRetentionDays = llmCallArchiveCfg?.hotRetentionDays ?? 90;
+  // Unset keeps the archive indefinitely (ADR-071).
+  const llmCallArchiveRetentionDays = llmCallArchiveCfg?.hotRetentionDays ?? undefined;
   const dreamEngine = new DreamEngine(
     pool,
     bus,
