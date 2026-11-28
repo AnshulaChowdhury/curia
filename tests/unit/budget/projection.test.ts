@@ -42,10 +42,20 @@ describe('project', () => {
 
 describe('NetWorthProjector', () => {
   const build = () => {
-    const budget = { plan: vi.fn(async () => plan) };
+    const budget = { plan: vi.fn(async () => plan), planRange: vi.fn(async () => plan) };
     const projector = new NetWorthProjector(budget, { summary: async () => worth }, 'America/Toronto', () => new Date('2031-04-01T02:00:00Z'));
     return { budget, projector };
   };
+
+  it('projects the budget as it stands from next month through a month, however far, and nothing for the past', async () => {
+    const { budget, projector } = build();
+    expect((await projector.through('2035-06')).months).toHaveLength(2);
+    expect(budget.planRange).toHaveBeenLastCalledWith('2031-04', '2035-06');
+    const past = await projector.through('2031-03');
+    expect(past.months).toEqual([]);
+    expect(past.today).not.toBeNull();
+    expect(budget.planRange).toHaveBeenCalledTimes(1);
+  });
 
   it('starts next month in the owner timezone and runs to the last month proposed', async () => {
     const { budget, projector } = build();

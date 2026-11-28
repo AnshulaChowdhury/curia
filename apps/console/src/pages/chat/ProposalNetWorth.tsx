@@ -1,10 +1,15 @@
-// Where net worth heads if the proposal on the card is approved: a line above it and two rows pinned under it. All
-// the figures come from the server, which works them out again each time an edit is saved.
+// Where net worth heads, under a table of months: if the proposal on the card is approved, or, on the Budgets page, if
+// the budget holds. A line above the table and two rows pinned under it. All the figures come from the server, which
+// works them out again each time an edit is saved.
 
 import { formatCents, formatMonth } from '../budget-utils.js';
 import type { Projection } from './proposal-client.js';
 
-export function NetWorthNote({ projection }: { projection: Projection | null }) {
+export function NetWorthNote({ projection, asBudgeted = false }: {
+  projection: Projection | null;
+  /** The figures are for the budget as it stands, not for changes waiting to be approved. */
+  asBudgeted?: boolean;
+}) {
   if (!projection) return null;
   const { today, leftOut, months } = projection;
   const end = months.at(-1);
@@ -16,7 +21,7 @@ export function NetWorthNote({ projection }: { projection: Projection | null }) 
           : end ? <>Add balances on the budget Overview to see net worth. This budget changes it by <strong>{formatCents(end.changeCents)}</strong> by the end of {formatMonth(end.month)}.</> : null}
       </p>
       <p className="bud-hint">
-        If approved: today’s balances plus income minus expenses. Savings and debt paydown are kept. No interest or growth.
+        {asBudgeted ? 'If the budget holds' : 'If approved'}: today’s balances plus income minus expenses. Savings and debt paydown are kept. No interest or growth.
         {today && leftOut > 0 ? ` ${leftOut} account${leftOut === 1 ? '' : 's'} with no CAD balance left out.` : ''}
       </p>
     </div>

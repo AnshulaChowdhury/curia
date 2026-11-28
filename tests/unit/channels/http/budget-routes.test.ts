@@ -10,14 +10,14 @@ const SECRET = 'a-long-bootstrap-secret-for-tests-0123456789';
 const auth = { 'x-web-bootstrap-secret': SECRET };
 const ID = '11111111-1111-4111-8111-111111111111';
 
-async function app(over: Record<string, unknown> = {}) {
+async function app(over: Record<string, unknown> = {}, projector?: { through: (last: string) => Promise<unknown> }) {
   const store = {
     listCategories: vi.fn(async () => []), createCategory: vi.fn(async () => ({ id: ID })), updateCategory: vi.fn(async () => ({ id: ID })),
-    deleteCategory: vi.fn(async () => undefined), setMonthAmount: vi.fn(async () => undefined), plan: vi.fn(async (from: string, months?: number) => ({ from, months })), archiveCategory: vi.fn(async () => ({ id: ID })), trend: vi.fn(async (asOf: string) => ({ asOf })), summary: vi.fn(async (month: string) => ({ month })), listTransactions: vi.fn(async () => []),
+    deleteCategory: vi.fn(async () => undefined), setMonthAmount: vi.fn(async () => undefined), setMonthAmounts: vi.fn(async () => undefined), planAll: vi.fn(async () => ({ months: ['2031-03', '2031-04'], categories: [], truncated: false })), plan: vi.fn(async (from: string, months?: number) => ({ from, months })), archiveCategory: vi.fn(async () => ({ id: ID })), trend: vi.fn(async (asOf: string) => ({ asOf })), summary: vi.fn(async (month: string) => ({ month })), listTransactions: vi.fn(async () => []),
     categorise: vi.fn(async () => 1), getRules: vi.fn(async () => ({ yaml: '', updatedAt: null })), putRules: vi.fn(async () => ({ updatedAt: 'x' })), addTransactions: vi.fn(async (items: unknown[]) => ({ added: items.length, duplicates: 0 })), ...over,
   };
   const a = Fastify();
-  await a.register(budgetRoutes, { logger, store: store as never, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
+  await a.register(budgetRoutes, { logger, store: store as never, projector: projector as never, webAppBootstrapSecret: SECRET, sessions: { verify: () => null } as unknown as SessionStore });
   return { a, store };
 }
 
@@ -29,7 +29,7 @@ describe('/api/budget', () => {
       ['DELETE', `/api/budget/categories/${ID}`], ['POST', `/api/budget/categories/${ID}/archive`], ['GET', '/api/budget/summary'], ['GET', '/api/budget/trend'], ['GET', '/api/budget/transactions'],
       ['PATCH', `/api/budget/transactions/${ID}`], ['POST', '/api/budget/transactions/bulk-categorise'],
       ['GET', '/api/budget/rules'], ['PUT', '/api/budget/rules'], ['POST', '/api/budget/imports'],
-      ['GET', '/api/budget/plan'], ['PUT', `/api/budget/categories/${ID}/months/2031-03`],
+      ['GET', '/api/budget/plan'], ['GET', '/api/budget/plan?all=1'], ['PUT', `/api/budget/categories/${ID}/months/2031-03`], ['PUT', `/api/budget/categories/${ID}/months`],
     ] as const) {
       expect((await a.inject({ method, url, payload: {} })).statusCode, `${method} ${url}`).toBe(401);
     }
@@ -55,6 +55,30 @@ describe('/api/budget', () => {
     expect(store.setMonthAmount).not.toHaveBeenCalled();
     expect((await a.inject({ method: 'PUT', url, headers: auth, payload: { cents: null } })).statusCode).toBe(200);
     expect(store.setMonthAmount).toHaveBeenCalledWith(ID, '2031-04', null);
+  });
+
+  it('returns the whole budget with net worth through its last month, and without it when that fails', async () => {
+    const through = vi.fn(async (last: string) => ({ upTo: last }));
+    const { a, store } = await app({}, { through });
+    const res = await a.inject({ method: 'GET', url: '/api/budget/plan?all=1&from=2031-03&through=2031-04', headers: auth });
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(res.json()).toMatchObject({ months: ['2031-03', '2031-04'], truncated: false, projection: { upTo: '2031-04' } });
+    expect(store.planAll).toHaveBeenCalledWith('2031-03', '2031-04');
+    expect(store.plan).not.toHaveBeenCalled();
+
+    const broken = await app({}, { through: async () => { throw new Error('no balances'); } });
+    const still = await broken.a.inject({ method: 'GET', url: '/api/budget/plan?all=1&from=2031-03', headers: auth });
+    expect(still.statusCode).toBe(200);
+    expect(still.json()).toMatchObject({ months: ['2031-03', '2031-04'], projection: null });
+  });
+
+  it('sets several months at once, refusing a request with no amount', async () => {
+    const { a, store } = await app();
+    const url = `/api/budget/categories/${ID}/months`;
+    expect((await a.inject({ method: 'PUT', url, headers: auth, payload: { months: ['2031-04'] } })).statusCode).toBe(400);
+    expect(store.setMonthAmounts).not.toHaveBeenCalled();
+    expect((await a.inject({ method: 'PUT', url, headers: auth, payload: { months: ['2031-04', '2031-05'], cents: 5 } })).statusCode).toBe(200);
+    expect(store.setMonthAmounts).toHaveBeenCalledWith(ID, ['2031-04', '2031-05'], 5);
   });
 
   it('returns the history as of the date asked', async () => {

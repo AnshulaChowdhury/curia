@@ -4415,6 +4415,29 @@ table.records-table tbody tr.active td { background: transparent; }
 .bud-plan .bud-plan-total th, .bud-plan .bud-plan-total td { font-weight: 600; padding-top: 6px; padding-bottom: 6px; border-top: 1px solid var(--app-border); }
 .bud-plan td { padding-top: 4px; padding-bottom: 4px; }
 .bud-plan .bud-plan-input { width: 104px; text-align: right; }
+.bud-plan td { white-space: nowrap; }
+.bud-plan thead th.is-current { color: var(--app-primary); box-shadow: inset 0 -2px 0 var(--app-primary); }
+.bud-plan tbody th .chat-proposal-type { display: block; margin-top: 2px; font-weight: 400; }
+/* One height whether it is a hint or a button, so choosing an amount does not move the table under the pointer. */
+.bud-body .bud-fill { margin: 0; min-height: 32px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bud-plan-scroll { min-width: 0; max-height: 70vh; overflow: auto; scroll-padding: 32px 0 64px 210px; /* a box tabbed to is not left under the pinned names */ }
+/* Month headings, category names and net worth stay put while the amounts scroll under them. */
+.bud-plan thead th { position: sticky; top: 0; z-index: 2; background: var(--app-card); padding-right: 10px; }
+.bud-plan tbody th, .bud-plan tfoot th { position: sticky; left: 0; z-index: 1; background: var(--app-card); min-width: 180px; max-width: 240px; }
+.bud-plan thead th:first-child { left: 0; z-index: 3; }
+/* A group heading spans the table, so its words are pinned rather than the cell. */
+.bud-plan .bud-plan-group th { position: static; max-width: none; }
+.bud-plan .bud-plan-group th span { position: sticky; left: 0; }
+.bud-plan tfoot { position: sticky; bottom: 0; z-index: 4; background: var(--app-card); box-shadow: 0 -1px 0 var(--app-primary); }
+.bud-plan tfoot th, .bud-plan tfoot td { height: 24px; padding: 2px 10px 2px 0; background: var(--app-card); border: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.bud-plan tfoot th { text-align: left; text-transform: none; letter-spacing: 0; font-size: 12px; color: var(--app-fg); white-space: nowrap; }
+/* On a phone the pinned names give up width to the months. */
+@media (max-width: 600px) {
+  .bud-plan tbody th, .bud-plan tfoot th { min-width: 110px; max-width: 130px; white-space: normal; }
+  .bud-plan .chat-proposal-type { max-width: 112px; }
+  .bud-plan .bud-plan-input { width: 88px; }
+  .bud-plan-scroll { scroll-padding-left: 140px; }
+}
 
 /* Proposed budget changes, above the message box */
 .chat-proposal { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; padding: 10px 14px; background: var(--app-card); border: 1px solid var(--app-border); border-radius: 8px; font-size: 13px; }
@@ -4423,11 +4446,11 @@ table.records-table tbody tr.active td { background: transparent; }
 .chat-proposal h2, .chat-proposal p { margin: 0; }
 .chat-proposal-scroll { min-width: 0; max-height: 48vh; overflow: auto; scroll-padding: 28px 0 60px 150px; /* a box tabbed to is not left under the pinned names */ }
 /* Scrollbars that stay visible: macOS otherwise hides them, and nothing shows there are more months to the right. */
-.chat-proposal-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
-.chat-proposal-scroll::-webkit-scrollbar-track, .chat-proposal-scroll::-webkit-scrollbar-corner { background: var(--app-bg-sunken); border-radius: 6px; }
-.chat-proposal-scroll::-webkit-scrollbar-thumb { min-width: 40px; min-height: 40px; background: var(--app-fg-subtle); border: 2px solid var(--app-bg-sunken); border-radius: 6px; }
-.chat-proposal-scroll::-webkit-scrollbar-thumb:hover { background: var(--app-fg-muted); }
-@supports not selector(::-webkit-scrollbar) { .chat-proposal-scroll { scrollbar-width: auto; scrollbar-color: var(--app-fg-subtle) var(--app-bg-sunken); } }
+.chat-proposal-scroll::-webkit-scrollbar, .bud-plan-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
+.chat-proposal-scroll::-webkit-scrollbar-track, .chat-proposal-scroll::-webkit-scrollbar-corner, .bud-plan-scroll::-webkit-scrollbar-track, .bud-plan-scroll::-webkit-scrollbar-corner { background: var(--app-bg-sunken); border-radius: 6px; }
+.chat-proposal-scroll::-webkit-scrollbar-thumb, .bud-plan-scroll::-webkit-scrollbar-thumb { min-width: 40px; min-height: 40px; background: var(--app-fg-subtle); border: 2px solid var(--app-bg-sunken); border-radius: 6px; }
+.chat-proposal-scroll::-webkit-scrollbar-thumb:hover, .bud-plan-scroll::-webkit-scrollbar-thumb:hover { background: var(--app-fg-muted); }
+@supports not selector(::-webkit-scrollbar) { .chat-proposal-scroll, .bud-plan-scroll { scrollbar-width: auto; scrollbar-color: var(--app-fg-subtle) var(--app-bg-sunken); } }
 /* Solid, not the chat's glass: figures must not show through the pinned headings and names. */
 [data-theme="dark"] .chat-page .chat-proposal { --app-card: var(--mr-surface-solid); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .chat-page .chat-proposal { --app-card: var(--mr-surface-solid); } }

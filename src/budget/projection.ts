@@ -71,7 +71,7 @@ export function project(netWorth: NetWorth, plan: BudgetPlan, rows: ProposedRow[
 
 export class NetWorthProjector {
   constructor(
-    private readonly budget: Pick<BudgetStore, 'plan'>,
+    private readonly budget: Pick<BudgetStore, 'plan' | 'planRange'>,
     private readonly accounts: Pick<AccountStore, 'summary'>,
     private readonly timezone: string,
     private readonly now: () => Date = () => new Date(),
@@ -92,6 +92,16 @@ export class NetWorthProjector {
   /** The budget as it stands, for the next `months` months. */
   current(months = 6): Promise<Projection> {
     return this.run(Number.isFinite(months) ? months : 6, []);
+  }
+
+  /** The budget as it stands, from next month through `last`. No months when `last` is not ahead. */
+  async through(last: string): Promise<Projection> {
+    const first = this.nextMonth();
+    const [plan, netWorth] = await Promise.all([
+      last < first ? { months: [], categories: [] } : this.budget.planRange(first, last),
+      this.accounts.summary(),
+    ]);
+    return project(netWorth, plan);
   }
 
   /** The budget with these changes, through the last month they name (six months when they name none ahead). */

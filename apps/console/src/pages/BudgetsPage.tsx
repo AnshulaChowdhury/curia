@@ -4,7 +4,7 @@ import { ReconcileSection } from './ReconcilePanel.js';
 import { PlanGrid } from './PlanGrid.js';
 import { budgetClient, type BudgetLoad, type ReconcileData } from './budget-data.js';
 import {
-  currentMonth, isMonth, formatCents, centsToDollarInput, validateDraft, KIND_LABEL,
+  currentMonth, isMonth, formatCents, centsToDollarInput, shiftMonth, validateDraft, KIND_LABEL,
   type BudgetCategory, type CategoryDraft, type CategoryKind,
 } from './budget-utils.js';
 
@@ -46,24 +46,36 @@ export default function BudgetsPage() {
   const [month, setMonth] = useState(() => monthFromSearch(window.location.search));
   const [busy, setBusy] = useState(false);
   const [reviewError, setReviewError] = useState<string | null>(null);
-  const wanted = useRef(month);
+  /** The last month asked for in the grid, when later than the budget already reaches. */
+  const [through, setThrough] = useState<string | null>(null);
+  /** Grid edits not yet saved. */
+  const [saving, setSaving] = useState(0);
+  const wanted = useRef({ month, through });
+  wanted.current = { month, through };
+  const asked = useRef(0);
+  // Grid edits are saved one after another, in the order made.
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const reconcile = useRef<HTMLDivElement>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<CategoryDraft>(EMPTY);
   const [errors, setErrors] = useState<{ name?: string; amount?: string }>({});
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
 
-  // Only the answer for the month on screen is applied. The budgets stay put while another month loads.
+  // Only the latest answer is applied. The budgets stay put while another month loads.
   const refresh = useCallback(async () => {
-    const m = wanted.current;
-    const result = await budgetClient.loadBudgets(m);
-    if (wanted.current === m) setLoad(result);
+    const mine = ++asked.current;
+    const result = await budgetClient.loadBudgets(wanted.current.month, currentMonth(), wanted.current.through);
+    if (asked.current === mine) setLoad(result);
   }, []);
+  useEffect(() => { setReviewError(null); }, [month]);
+  useEffect(() => { void refresh(); }, [month, through, refresh]);
+
+  // A link naming a month is about categorising it, which sits below the budget grid.
+  const loaded = load?.state === 'ok';
   useEffect(() => {
-    wanted.current = month;
-    setReviewError(null);
-    void refresh();
-  }, [month, refresh]);
+    if (loaded && new URLSearchParams(window.location.search).has('month')) reconcile.current?.scrollIntoView({ block: 'start' });
+  }, [loaded]);
 
   const data = load?.state === 'ok' ? load.data : null;
   const all: BudgetCategory[] = data?.categories ?? [];
@@ -128,28 +140,39 @@ export default function BudgetsPage() {
     setBusy(false);
   }
 
-  async function setAmount(categoryId: string, m: string, cents: number | null) {
-    try {
-      await budgetClient.setMonthAmount(categoryId, m, cents);
-      setMessage(null);
-    } catch (err) {
-      console.error('budget month amount failed', err);
-      setMessage(`Could not save that amount. ${err instanceof Error ? err.message : ''}`);
-    }
-    await refresh();
+  /** Saves one grid edit after those before it, then shows what the server now holds. */
+  function save(what: string, change: () => Promise<void>) {
+    setSaving(n => n + 1);
+    queue.current = queue.current.then(async () => {
+      try {
+        await change();
+        setMessage(null);
+      } catch (err) {
+        console.error(`budget ${what} failed`, err);
+        setMessage(`Could not save ${what}. ${err instanceof Error ? err.message : ''}`);
+      }
+      await refresh();
+      setSaving(n => n - 1);
+    });
   }
 
   return (
-    <BudgetShell active="/budget/budgets">
+    <BudgetShell active="/budget/budgets" wide>
       <BudgetGate load={load} />
       {data && (
         <>
-          <ReconcileSection month={month} data={data.month === month ? data : null} busy={busy} error={reviewError}
-            onMonth={setMonth} onCategorise={(id, c) => void categorise(id, c)} />
-
-          {data.month === month && <PlanGrid plan={data.plan} onSet={(id, m, cents) => void setAmount(id, m, cents)} />}
+          <PlanGrid plan={data.plan} current={currentMonth()} saving={saving > 0}
+            onSet={(id, m, cents) => save('that amount', () => budgetClient.setMonthAmount(id, m, cents))}
+            onType={(id, kind) => save('that type', () => budgetClient.setKind(id, kind))}
+            onFill={(id, months, cents) => save('those amounts', () => budgetClient.setMonthAmounts(id, months, cents))}
+            onAddMonths={count => setThrough(shiftMonth(data.plan.months[data.plan.months.length - 1]!, count))} />
 
           {message && <p className="bud-hint" role="status">{message}</p>}
+
+          <div ref={reconcile}>
+            <ReconcileSection month={month} data={data.month === month ? data : null} busy={busy} error={reviewError}
+              onMonth={setMonth} onCategorise={(id, c) => void categorise(id, c)} />
+          </div>
 
           <form className="dash-card" onSubmit={e => void submit(e)} noValidate aria-labelledby="bud-form-h">
             <h2 id="bud-form-h" className="dash-card-title">{editingId ? 'Edit budget' : 'Add a budget'}</h2>

@@ -860,10 +860,10 @@ export class HttpAdapter implements Channel {
           sessions,
         });
       }
-      await this.app.register(budgetRoutes, { logger, store: new BudgetStore(pool), webAppBootstrapSecret, sessions });
+      const projector = new NetWorthProjector(new BudgetStore(pool), new AccountStore(pool), this.config.timezone ?? 'UTC');
+      await this.app.register(budgetRoutes, { logger, store: new BudgetStore(pool), projector, webAppBootstrapSecret, sessions });
       await this.app.register(budgetAccountsRoutes, { logger, accounts: new AccountStore(pool), webAppBootstrapSecret, sessions });
       await this.app.register(budgetSheetsRoutes, { logger, sheets: new SheetStore(pool), webAppBootstrapSecret, sessions });
-      const projector = new NetWorthProjector(new BudgetStore(pool), new AccountStore(pool), this.config.timezone ?? 'UTC');
       await this.app.register(budgetProposalRoutes, { logger, proposals: new ProposalStore(pool), projector, webAppBootstrapSecret, sessions });
       if (this.config.budgetBanks) {
         await this.app.register(budgetBanksRoutes, { logger, ...this.config.budgetBanks, webAppBootstrapSecret, sessions });

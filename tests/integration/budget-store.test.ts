@@ -179,4 +179,51 @@ describeIf('budget store', () => {
     await expect(store.putRules('rules: [unclosed')).rejects.toBeInstanceOf(BudgetError);
     await expect(store.putRules('x'.repeat(70 * 1024))).rejects.toBeInstanceOf(BudgetError);
   });
+
+  it('returns the whole budget: the first budgeted month through the last, the current month and any asked for', async () => {
+    const rent = await store.createCategory({ name: 'T-Rent' });
+    const gone = await store.createCategory({ name: 'T-Gone' });
+    await store.setMonthAmount(rent.id, '2031-02', 100);
+    await store.setMonthAmount(rent.id, '2033-05', 200);            // 28 months: past what a plain plan allows
+    await store.setMonthAmount(gone.id, '2029-01', 1);
+    await store.archiveCategory(gone.id);                           // a closed category does not stretch the span
+
+    const all = await store.planAll('2031-04');
+    expect([all.months[0], all.months.at(-1), all.months.length, all.truncated]).toEqual(['2031-02', '2033-05', 28, false]);
+    const row = all.categories.find(c => c.categoryId === rent.id)!;
+    expect([row.amounts[0]!.cents, row.amounts.at(-1)!.cents, row.amounts[1]!.cents]).toEqual([100, 200, null]);
+
+    expect((await store.planAll('2031-04', '2033-08')).months.at(-1)).toBe('2033-08');
+    expect((await store.planAll('2030-11')).months[0]).toBe('2030-11');
+    expect((await store.planAll('2034-01')).months.at(-1)).toBe('2034-01');
+    await expect(store.planAll('2031-13')).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(store.planAll('2031-04', 'soon')).rejects.toMatchObject({ kind: 'invalid' });
+  });
+
+  it('keeps the current month in sight when the budget is longer than ten years', async () => {
+    const rent = await store.createCategory({ name: 'T-Rent' });
+    await store.setMonthAmount(rent.id, '2001-01', 1);
+    await store.setMonthAmount(rent.id, '2099-12', 2);
+    const all = await store.planAll('2031-04');
+    expect([all.months[0], all.months.at(-1), all.months.length, all.truncated]).toEqual(['2029-04', '2039-03', 120, true]);
+  });
+
+  it('sets one amount on several months at once, all or none', async () => {
+    const rent = await store.createCategory({ name: 'T-Rent' });
+    await store.setMonthAmount(rent.id, '2031-04', 1);
+    await store.setMonthAmounts(rent.id, ['2031-04', '2031-05', '2031-06', '2031-06'], 90000);
+    const cents = async () => (await store.plan('2031-03', 4)).categories.find(c => c.categoryId === rent.id)!.amounts.map(a => a.cents);
+    expect(await cents()).toEqual([null, 90000, 90000, 90000]);
+
+    await expect(store.setMonthAmounts(rent.id, ['2031-03', '2031-13'], 5)).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(store.setMonthAmounts(rent.id, [], 5)).rejects.toMatchObject({ kind: 'invalid' });
+    await expect(store.setMonthAmounts(rent.id, ['2031-03'], -1)).rejects.toMatchObject({ kind: 'invalid' });
+    expect(await cents()).toEqual([null, 90000, 90000, 90000]);
+
+    await store.setMonthAmounts(rent.id, ['2031-04', '2031-05'], null);
+    expect(await cents()).toEqual([null, null, null, 90000]);
+    await store.archiveCategory(rent.id);
+    await expect(store.setMonthAmounts(rent.id, ['2031-03'], 5)).rejects.toMatchObject({ kind: 'not_found' });
+  });
 });
+

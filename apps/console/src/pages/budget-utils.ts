@@ -1,4 +1,5 @@
 // Pure logic for the personal budget pages. No React, no fetching.
+import type { Projection } from './chat/proposal-client.js';
 // Money is integer cents (CAD by default); negative = money out. Dates are YYYY-MM-DD.
 // Bank text (payee, description) is untrusted: callers render it as text only.
 
@@ -10,6 +11,15 @@ export interface BudgetPlan {
   months: string[];
   categories: Array<{ categoryId: string; name: string; kind: CategoryKind; amounts: Array<{ cents: number | null; own: boolean }> }>;
 }
+
+/** The whole budget as the Budgets page shows it, with net worth by month if it holds. */
+export interface FullPlan extends BudgetPlan {
+  truncated: boolean;
+  projection: Projection | null;
+}
+
+/** The longest span the grid shows; the server holds to the same. */
+export const MAX_GRID_MONTHS = 120;
 
 export interface BudgetCategory {
   id: string;
