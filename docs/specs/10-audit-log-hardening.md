@@ -180,7 +180,7 @@ CREATE TABLE llm_call_archive (
 
 **Reasoning:** OpenRouter responses may include the model's reasoning. The archive response records that text, the reasoning-token count, and `reasoningOmitted` (`empty` or `encrypted`) when the token count is non-zero but no readable reasoning came back. `audit.llmCallArchive.includeReasoning` (default `true`) drops the reasoning string from new rows when `false`; token counts and the rest of the archive still write. The text is redacted with the rest of the row and is not encrypted at rest. Null bytes are stripped from prompt, response, and tool definitions before insert so one U+0000 cannot roll back the `llm.call` audit row.
 
-**Retention:** The `llm_call_archive` is large (prompts and responses can be several KB each). Hot retention is `audit.llmCallArchive.hotRetentionDays` (default 90); DreamEngine's decay pass DELETEs older rows. Cold archive to compressed JSONL on disk remains a later-phase job. The `audit_log` row (with hashes) is retained per the standard audit retention schedule.
+**Retention:** The `llm_call_archive` is large (prompts and responses can be several KB each). Rows are kept indefinitely by default (ADR-071); setting `audit.llmCallArchive.hotRetentionDays` has DreamEngine's decay pass DELETE older rows. Cold archive to compressed JSONL on disk remains a later-phase job. The `audit_log` row (with hashes) is retained per the standard audit retention schedule.
 
 **Encryption-at-rest:** Phase 1 stores redacted JSONB in Postgres plaintext (same class as other sensitive tables). Application-level or column encryption for the archive is an explicit follow-up — until then treat the table as a plaintext concentration of conversational content with best-effort redaction.
 
@@ -359,7 +359,7 @@ This section supersedes the retention strategy in [spec 08](08-operations.md). T
 |---|---|---|---|---|
 | **Critical** | `audit_log` rows with `action` in (`approve`, `deny`, `authenticate`, `configure`, `escalate`) | 12 months | 12-36 months | 3+ years |
 | **Standard** | All other `audit_log` rows | 6 months | 6-18 months | 18 months - 3 years |
-| **Bulk** | `llm_call_archive` (prompts/responses) | 90 days | 90 days - 12 months | 12 months - 3 years |
+| **Bulk** | `llm_call_archive` (prompts/responses) | Indefinite (ADR-071) | — | — |
 
 **Implementation:** Postgres declarative partitioning by month on `audit_log.timestamp`. The partition promotion/demotion is a scheduled job (manual for launch, automated later). Cold storage archival writes partitions to compressed JSONL files in the `ceo-deploy` data volume.
 

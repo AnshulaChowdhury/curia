@@ -104,6 +104,7 @@ workingMemory:
   # pass (DELETE WHERE expires_at < now()). The idx_wm_expires partial index makes
   # this efficient. 30 days is long enough that re-opening a conversation after a
   # week still has full context; tune downward for high-volume deployments.
+  # Console (web) chats are exempt and kept indefinitely (ADR-071).
   ttlDays: 30
 
   # Rolling context summarization (spec §01-memory-system.md).
@@ -373,14 +374,15 @@ escalation:
 
 # Audit log hardening (spec 10 / #1383).
 # llm_call_archive stores redacted full prompts/responses keyed to llm.call rows.
-# Kill-switch (`enabled: false`) stops new archive writes immediately; hot
-# retention TTL is enforced by DreamEngine's nightly decay pass (DELETE older rows).
+# Kill-switch (`enabled: false`) stops new archive writes immediately. Rows are kept
+# indefinitely (ADR-071); set hotRetentionDays to a number of days to have DreamEngine's
+# nightly decay pass delete older rows. The table grows with every model call.
 # Encryption-at-rest for this table is a tracked follow-up — treat the store as
 # plaintext JSONB with best-effort redaction until then.
 audit:
   llmCallArchive:
     enabled: true
-    hotRetentionDays: 90
+    hotRetentionDays: null
     # Reasoning text can be most of a row (one production call spent ~4k output
     # tokens on reasoning for a single tool call, #2033). false keeps the token
     # count and drops the text, without turning the archive off.

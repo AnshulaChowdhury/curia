@@ -10,7 +10,7 @@ Four memory tiers + inter-agent discussion, all backed by PostgreSQL + pgvector.
 
 ## Tier 1: Working Memory (per-conversation ephemeral)
 
-Short-lived context for active agent conversations. Stored in the `working_memory` table, scoped to a `conversation_id` (the deterministic, reversible channel-scoped key described in [spec 04](04-channels.md); stored as TEXT — see ADR-025). Holds conversation turns as `role`/`content`. Auto-expires via a configurable TTL (`expires_at`); summarized turns are marked `archived` and excluded from active context loading. Lives in Postgres — survives restarts.
+Short-lived context for active agent conversations. Stored in the `working_memory` table, scoped to a `conversation_id` (the deterministic, reversible channel-scoped key described in [spec 04](04-channels.md); stored as TEXT — see ADR-025). Holds conversation turns as `role`/`content`. Auto-expires via a configurable TTL (`expires_at`), except console chats, which are kept (ADR-071); summarized turns are marked `archived` and excluded from active context loading. Lives in Postgres — survives restarts.
 
 **Table:** `working_memory`
 - `id` UUID
