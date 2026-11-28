@@ -31,6 +31,8 @@ export class TelemetryLlmProvider implements LLMProvider {
     /** Identifier for the system service (e.g. 'scoring-pass', 'drift-detector'). */
     private readonly serviceId: string,
     private readonly modelRegistry: ModelRegistry,
+    /** The conversation these calls serve, when there is one; background work is filed under 'system'. */
+    private readonly conversationId: string = 'system',
   ) {
     this.id = inner.id;
     this.estimateCost = createEstimateCostUsd(modelRegistry);
@@ -64,7 +66,7 @@ export class TelemetryLlmProvider implements LLMProvider {
 
       const event = createLlmCall({
         agentId: `system:${this.serviceId}`,
-        conversationId: 'system',
+        conversationId: this.conversationId,
         requestedModel: response.provenance.requestedModel,
         actualModel: response.provenance.actualModel,
         provider: this.inner.id,
@@ -104,7 +106,7 @@ export class TelemetryLlmProvider implements LLMProvider {
     try {
       const event = createLlmError({
         agentId: `system:${this.serviceId}`,
-        conversationId: 'system',
+        conversationId: this.conversationId,
         // Fall back to the inner provider's id when params.model is absent —
         // 'unknown' would break the HealthService tier reverse-map lookup.
         requestedModel: params.model ?? this.inner.id,
@@ -146,7 +148,7 @@ export class TelemetryLlmProvider implements LLMProvider {
       try {
         await this.bus.publish('agent', createLlmError({
           agentId: `system:${this.serviceId}`,
-          conversationId: 'system',
+          conversationId: this.conversationId,
           // params.model identifies the tier model; fall back to this.inner.id (provider
           // slug) when absent. System services always pass params.model, so the fallback
           // is a don't-care in practice, but the health tracker will miss it if reached.

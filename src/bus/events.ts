@@ -459,6 +459,20 @@ interface ToolResultPayload {
   routingTaskId?: string;
 }
 
+/**
+ * A tool Curia ran outside an agent's turn (an approved action run again, memory extraction, a follow-up task), with
+ * what it was given and what came back (ADR-072). Nothing subscribes: it is a record, not a step anything reacts to.
+ */
+interface ToolRecordedPayload {
+  /** What ran it, e.g. 'system:approval', or the agent whose work caused it. */
+  agentId: string;
+  conversationId?: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  result: ToolResultPayload['result'];
+  durationMs: number;
+}
+
 // Agent error payload — published by the agent runtime when an error occurs
 // that the user needs to know about (budget exceeded, unrecoverable failure, etc.)
 interface AgentErrorPayload {
@@ -1417,6 +1431,12 @@ export interface ToolInvokeEvent extends BaseEvent {
   payload: ToolInvokePayload;
 }
 
+export interface ToolRecordedEvent extends BaseEvent {
+  type: 'tool.recorded';
+  sourceLayer: 'execution';
+  payload: ToolRecordedPayload;
+}
+
 export interface ToolResultEvent extends BaseEvent {
   type: 'tool.result';
   // sourceLayer is 'execution' because the result logically comes from the execution layer,
@@ -2113,6 +2133,7 @@ export type BusEvent =
   | OutboundMessageEvent
   | ToolInvokeEvent
   | ToolResultEvent
+  | ToolRecordedEvent        // A tool run outside an agent turn (ADR-072)
   | AgentErrorEvent          // Error recovery: structured error events for audit and user notification
   | AgentDiscussEvent        // Bullpen: inter-agent discussion message
   | MemoryStoreEvent      // Phase 6: knowledge graph write audit
@@ -2439,6 +2460,18 @@ export function createToolResult(
     sourceLayer: 'execution',
     payload: rest,
     parentEventId,
+  };
+}
+
+export function createToolRecorded(payload: ToolRecordedPayload & { parentEventId?: string }): ToolRecordedEvent {
+  const { parentEventId, ...rest } = payload;
+  return {
+    id: randomUUID(),
+    timestamp: new Date(),
+    type: 'tool.recorded',
+    sourceLayer: 'execution',
+    payload: rest,
+    ...(parentEventId !== undefined && { parentEventId }),
   };
 }
 

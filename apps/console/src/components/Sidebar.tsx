@@ -51,6 +51,7 @@ const ROUTES: Record<string, string> = {
   'mcp-skills': '/mcp-skills',
   system:     '/system',
   settings:   '/settings',
+  history:    '/settings/history',
 };
 
 const THEME_OPTIONS: Array<{ v: Theme; label: string }> = [
@@ -164,7 +165,7 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
   // Expand the Settings group when on any of its pages (Skills/Agents are now
   // standalone pages but still live under the sidebar's Settings group).
   const [settingsOpen, setSettingsOpen] = useState(
-    activeView === 'settings' || activeView === 'tools' || activeView === 'agents' || activeView === 'channels' || activeView === 'connections' || activeView === 'mcp-skills' || activeView === 'system',
+    activeView === 'settings' || activeView === 'tools' || activeView === 'agents' || activeView === 'channels' || activeView === 'connections' || activeView === 'mcp-skills' || activeView === 'system' || activeView === 'history',
   );
   const [principalName, setPrincipalName] = useState<string | null>(null);
   // Real Curia release version from GET /api/system. The build-time __APP_VERSION__
@@ -276,6 +277,7 @@ export function Sidebar({ activeView, theme, onThemeChange }: SidebarProps) {
     item('connections', 'API connections', <IconLink />, true),
     item('mcp-skills', 'MCP Skills', <IconPlug />, true),
     item('settings', 'Personality', <IconBrain />, true),
+    item('history', 'History', <IconClock />, true),
     item('system', 'System', <IconServer />, true),
   ];
   const toggleLabel = collapsed ? 'Expand sidebar (⌘\\)' : 'Collapse sidebar (⌘\\)';

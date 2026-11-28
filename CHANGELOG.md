@@ -28,6 +28,8 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **History** — Settings now shows every agent action with its inputs and outputs.
+- **`tool.recorded` event** — new bus event type records tools run outside agent turns.
 - **Chat on every device** — the console opens your latest chat and shows its history.
 - **Total savings** — net worth section shows cash and investments together.
 - **Savings type** — relabelled “Savings & debt paydown”; editable on the proposal card.

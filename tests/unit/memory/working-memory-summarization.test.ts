@@ -166,6 +166,20 @@ describe('WorkingMemory — context summarization', () => {
     expect(callArg.options).toEqual({ reasoning: NO_REASONING });
   });
 
+  it('summarises through the provider for that conversation, so the call is recorded against it', async () => {
+    const { pool, mockProvider } = buildPool(21, 11);
+    const recorded = buildMockProvider();
+    const providerFor = vi.fn().mockReturnValue(recorded);
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+    const memory = WorkingMemory.createWithPostgres(pool, logger, { threshold: 20, keepWindow: 10, provider: mockProvider, providerFor, model: 'm' });
+
+    await memory.addTurn(CONV, AGENT, { role: 'user', content: 'Trigger turn' });
+
+    expect(providerFor).toHaveBeenCalledWith(CONV);
+    expect(recorded.chat).toHaveBeenCalledOnce();
+    expect(mockProvider.chat).not.toHaveBeenCalled();
+  });
+
   it('rewrites LLM failure markers in the summarization transcript (#1767)', async () => {
     const now = new Date('2026-01-01T12:00:00Z');
     const archivedRows = [
