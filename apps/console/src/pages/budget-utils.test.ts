@@ -99,10 +99,10 @@ describe('budget client', () => {
   it('loads the budgets with what needs a category that month', async () => {
     const seen: Seen[] = [];
     const client = fake(seen, path => reply(path, json({ links: [] })));
-    expect(await client.loadBudgets('2031-03')).toMatchObject({ state: 'ok', data: { month: '2031-03', categories: CATEGORIES, review: [] } });
+    expect(await client.loadBudgets('2031-03', '2031-05')).toMatchObject({ state: 'ok', data: { month: '2031-03', categories: CATEGORIES, review: [] } });
     expect(seen.map(s => s.path).sort()).toEqual([
       '/api/budget/categories?archived=1',
-      '/api/budget/plan?from=2031-03&months=6',
+      '/api/budget/plan?all=1&from=2031-05',
       '/api/budget/transactions?month=2031-03&needsReview=true&limit=500',
     ]);
   });

@@ -4,7 +4,11 @@
 //   POST   /api/budget/categories                   — add one
 //   PATCH  /api/budget/categories/:id               — rename, change the type, usual budget or rollover
 //   PUT    /api/budget/categories/:id/months/:month — one month's own budget ({cents}); null returns to the usual one
+//   PUT    /api/budget/categories/:id/months        — the same amount on several months ({months, cents}), all or none
 //   GET    /api/budget/plan?from=YYYY-MM&months=N   — what each open category is budgeted, month by month
+//   GET    /api/budget/plan?all=1&from=YYYY-MM[&through=YYYY-MM]
+//                                                   — every budgeted month, with `from` (the current month) and on to
+//                                                     `through`; `projection` is net worth by month if the budget holds
 //   POST   /api/budget/categories/:id/archive       — close it to new transactions; the ones it has keep it
 //   DELETE /api/budget/categories/:id               — remove it, only when it has no transactions (409 otherwise)
 //   GET    /api/budget/summary?month=YYYY-MM        — spent against budget per category, and what needs the owner
@@ -21,6 +25,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import type { Logger } from '../../../logger.js';
 import { BudgetError, type BudgetStore } from '../../../budget/budget-store.js';
+import type { NetWorthProjector } from '../../../budget/projection.js';
 import { assertSecret, type SessionStore } from '../session-auth.js';
 import { isUuid } from '../../../util/uuid.js';
 import { BankFileError, MAX_UPLOAD_BYTES, validateBankFile } from '../../../books/bank-file.js';
@@ -28,7 +33,9 @@ import { ImportError, parseBankFile } from '../../../budget/import-parser.js';
 
 export interface BudgetRouteOptions {
   logger: Logger;
-  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'archiveCategory' | 'setMonthAmount' | 'plan' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
+  store: Pick<BudgetStore, 'listCategories' | 'createCategory' | 'updateCategory' | 'deleteCategory' | 'archiveCategory' | 'setMonthAmount' | 'setMonthAmounts' | 'plan' | 'planAll' | 'summary' | 'trend' | 'listTransactions' | 'categorise' | 'getRules' | 'putRules' | 'addTransactions'>;
+  /** Net worth month by month under the budget as it stands, shown beneath the whole-budget grid. */
+  projector?: Pick<NetWorthProjector, 'through'>;
   webAppBootstrapSecret: string | undefined;
   sessions: SessionStore;
 }
@@ -36,7 +43,7 @@ export interface BudgetRouteOptions {
 type Body = Record<string, unknown>;
 
 export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOptions): Promise<void> {
-  const { logger, store, webAppBootstrapSecret, sessions } = options;
+  const { logger, store, projector, webAppBootstrapSecret, sessions } = options;
   const RATE = { config: { rateLimit: { max: 120, timeWindow: '1 minute' } } };
   const RULES = { bodyLimit: 80 * 1024, config: { rateLimit: { max: 20, timeWindow: '1 minute' } } };
   const owner = (request: Parameters<typeof assertSecret>[0], reply: FastifyReply): boolean => assertSecret(request, reply, webAppBootstrapSecret, sessions);
@@ -113,10 +120,31 @@ export async function budgetRoutes(app: FastifyInstance, options: BudgetRouteOpt
     }
   });
 
-  app.get<{ Querystring: { from?: string; months?: string } }>('/api/budget/plan', RATE, async (request, reply) => {
+  app.put<{ Params: { id: string }; Body: Body }>('/api/budget/categories/:id/months', RATE, async (request, reply) => {
+    if (!owner(request, reply) || !goodId(reply, request.params.id)) return reply;
+    const cents = request.body?.['cents'];
+    if (cents === undefined) return reply.status(400).send({ error: 'cents must be a whole number of cents, or null' });
+    try {
+      await store.setMonthAmounts(request.params.id, request.body?.['months'], cents);
+      return noStore(reply).send({ ok: true });
+    } catch (err) {
+      return fail(reply, err);
+    }
+  });
+
+  app.get<{ Querystring: { from?: string; months?: string; all?: string; through?: string } }>('/api/budget/plan', RATE, async (request, reply) => {
     if (!owner(request, reply)) return reply;
     try {
       const from = request.query.from ?? new Date().toISOString().slice(0, 7);
+      if (request.query.all === '1') {
+        const plan = await store.planAll(from, request.query.through);
+        // The budget is still shown and edited without the figures, so a failure here costs only them.
+        const projection = projector ? await projector.through(plan.months[plan.months.length - 1]!).catch((err: unknown) => {
+          logger.error({ err }, 'budget: projection failed');
+          return null;
+        }) : null;
+        return noStore(reply).send({ ...plan, projection });
+      }
       return noStore(reply).send(await store.plan(from, request.query.months === undefined ? undefined : Number(request.query.months)));
     } catch (err) {
       return fail(reply, err);

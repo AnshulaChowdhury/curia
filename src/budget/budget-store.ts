@@ -26,6 +26,15 @@ export interface BudgetPlan {
 }
 
 export const MAX_PLAN_MONTHS = 24;
+/** The longest span the Budgets page shows at once: ten years. */
+export const MAX_GRID_MONTHS = 120;
+/** Past months kept in sight when the whole budget is longer than the page can show. */
+const GRID_MONTHS_BEHIND = 24;
+
+export interface FullPlan extends BudgetPlan {
+  /** True when some months with their own amounts fall outside the span returned. */
+  truncated: boolean;
+}
 
 export interface BudgetCategory {
   id: string;
@@ -176,6 +185,20 @@ export function monthsFrom(from: string, count: number): string[] {
   return Array.from({ length: count }, (_, i) => isoDay(y, m - 1 + i, 1).slice(0, 7));
 }
 
+/** The month `by` months after this one (negative: before). */
+function shiftMonths(month: string, by: number): string {
+  const [y, m] = month.split('-').map(Number) as [number, number];
+  return isoDay(y, m - 1 + by, 1).slice(0, 7);
+}
+
+/** How many months `from` through `to` covers; zero or less when `to` is earlier. */
+function monthSpan(from: string, to: string): number {
+  if (!MONTH.test(from) || !MONTH.test(to)) throw new BudgetError('month must be YYYY-MM');
+  const [fy, fm] = from.split('-').map(Number) as [number, number];
+  const [ty, tm] = to.split('-').map(Number) as [number, number];
+  return (ty - fy) * 12 + (tm - fm) + 1;
+}
+
 function kindOf(v: unknown): CategoryKind {
   if (!CATEGORY_KINDS.includes(v as CategoryKind)) throw new BudgetError('The type must be expense, income or savings');
   return v as CategoryKind;
@@ -290,9 +313,58 @@ export class BudgetStore {
     }
   }
 
+  /** Sets the same amount on several months of an open category at once: all of them, or none. null clears them. */
+  async setMonthAmounts(id: string, months: unknown, cents: unknown): Promise<void> {
+    if (!Array.isArray(months) || months.length === 0 || months.length > MAX_GRID_MONTHS
+      || !months.every((m): m is string => typeof m === 'string' && MONTH.test(m))) {
+      throw new BudgetError(`months must be 1 to ${MAX_GRID_MONTHS} months, each YYYY-MM`);
+    }
+    const value = this.cents(cents);
+    const open = await this.pool.query('SELECT 1 FROM budget_categories WHERE id = $1 AND archived_at IS NULL', [id]);
+    if (!open.rowCount) throw new BudgetError('No such category', 'not_found');
+    if (value === null) await this.pool.query('DELETE FROM budget_month_amounts WHERE category_id = $1 AND month = ANY($2::text[])', [id, months]);
+    else {
+      await this.pool.query(
+        `INSERT INTO budget_month_amounts (category_id, month, cents) SELECT $1, m, $3 FROM unnest($2::text[]) AS m
+         ON CONFLICT (category_id, month) DO UPDATE SET cents = EXCLUDED.cents`,
+        [id, [...new Set(months)], value],
+      );
+    }
+  }
+
   async plan(from: string, count = 6): Promise<BudgetPlan> {
     if (!Number.isInteger(count) || count < 1 || count > MAX_PLAN_MONTHS) throw new BudgetError(`Choose between 1 and ${MAX_PLAN_MONTHS} months`);
-    const months = monthsFrom(from, count);
+    return this.planFor(monthsFrom(from, count));
+  }
+
+  /** The plan from one month through another, inclusive. */
+  async planRange(from: string, to: string): Promise<BudgetPlan> {
+    const count = monthSpan(from, to);
+    if (count < 1 || count > MAX_GRID_MONTHS) throw new BudgetError(`Choose between 1 and ${MAX_GRID_MONTHS} months`);
+    return this.planFor(monthsFrom(from, count));
+  }
+
+  /**
+   * The whole budget: from the first month any open category has its own amount (or `current`, if earlier) through the
+   * last (or `current` or `through`, if later). Longer than the page can show, it starts two years back.
+   */
+  async planAll(current: string, through?: string): Promise<FullPlan> {
+    for (const m of [current, through ?? current]) if (!MONTH.test(m)) throw new BudgetError('month must be YYYY-MM');
+    const { rows } = await this.pool.query<{ first: string | null; last: string | null }>(
+      `SELECT min(m.month) AS first, max(m.month) AS last FROM budget_month_amounts m
+       JOIN budget_categories c ON c.id = m.category_id AND c.archived_at IS NULL`);
+    const earliest = [current, rows[0]?.first ?? current].sort()[0]!;
+    const latest = [current, rows[0]?.last ?? current, through ?? current].sort()[2]!;
+    let from = earliest;
+    let to = latest;
+    if (monthSpan(from, to) > MAX_GRID_MONTHS) {
+      from = [earliest, shiftMonths(current, -GRID_MONTHS_BEHIND)].sort()[1]!;
+      to = [latest, shiftMonths(from, MAX_GRID_MONTHS - 1)].sort()[0]!;
+    }
+    return { ...(await this.planRange(from, to)), truncated: from !== earliest || to !== latest };
+  }
+
+  private async planFor(months: string[]): Promise<BudgetPlan> {
     const [categories, own] = await Promise.all([
       this.listCategories(),
       this.pool.query<{ category_id: string; month: string; cents: number }>(

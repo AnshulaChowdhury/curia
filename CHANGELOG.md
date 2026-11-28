@@ -30,6 +30,7 @@ bus event types) are noted explicitly even in the `0.x` range.
 
 ### Added
 
+- **Budget grid** — all months, pinned headings, type changes, net worth and copy-forward.
 - **History** — Settings now shows every agent action with its inputs and outputs.
 - **`tool.recorded` event** — new bus event type records tools run outside agent turns.
 - **Chat on every device** — the console opens your latest chat and shows its history.
